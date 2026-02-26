@@ -18,10 +18,3 @@ npm run docs:dev
 ```
 
 Open `http://localhost:4173`.
-
-
-## Deployment
-
-- GitHub Pages: workflow at `.github/workflows/docs-gh-pages.yml` (set Pages source to GitHub Actions).
-- Netlify: config at `netlify.toml` (auto-detected in most setups).
-- Full instructions: `docs/guide/deployment.md`.

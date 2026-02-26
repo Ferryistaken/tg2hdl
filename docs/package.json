@@ -6,7 +6,6 @@
   "scripts": {
     "docs:dev": "vitepress dev . --host 0.0.0.0 --port 4173",
     "docs:build": "vitepress build .",
-    "docs:build:gh": "DOCS_BASE=/$npm_package_name/ vitepress build .",
     "docs:preview": "vitepress preview . --host 0.0.0.0 --port 4173"
   },
   "devDependencies": {
