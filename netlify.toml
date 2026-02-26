@@ -1,0 +1,3 @@
+[build]
+  command = "uv sync && uv run mkdocs build"
+  publish = "site"
