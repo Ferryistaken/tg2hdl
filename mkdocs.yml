@@ -1,0 +1,72 @@
+site_name: tg2hdl
+site_description: tinygrad to HDL experiments for INT8 GEMV acceleration
+site_url: https://example.com/
+repo_url: https://github.com/
+repo_name: tg2hdl
+
+docs_dir: docs
+site_dir: site
+
+exclude_docs: |
+  node_modules/
+  node_modules/**
+  .vitepress/
+  .vitepress/**
+
+extra_css:
+  - stylesheets/extra.css
+
+theme:
+  name: material
+  icon:
+    logo: material/cpu-64-bit
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - search.suggest
+    - search.highlight
+  palette:
+    - scheme: slate
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+      primary: black
+      accent: cyan
+    - scheme: default
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+      primary: indigo
+      accent: deep purple
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths:
+            - .
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - pymdownx.superfences
+  - pymdownx.highlight
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+
+nav:
+  - Home: index.md
+  - Guide:
+      - Introduction: guide/introduction.md
+      - Getting Started: guide/getting-started.md
+      - Architecture: guide/architecture.md
+      - Verification: guide/verification.md
+      - Deployment: guide/deployment.md
+      - API Reference: guide/api-reference.md

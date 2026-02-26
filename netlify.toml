@@ -1,0 +1,7 @@
+[build]
+  base = "."
+  command = "python -m pip install --upgrade uv && python -m uv sync --frozen && python -m uv run mkdocs build"
+  publish = "site"
+
+[build.environment]
+  PYTHON_VERSION = "3.14"

@@ -1,0 +1,3 @@
+site/
+.vitepress/
+node_modules/
