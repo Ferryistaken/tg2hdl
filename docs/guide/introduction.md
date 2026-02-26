@@ -60,9 +60,9 @@ In short, this repo is the bridge between model-kernel understanding and hardwar
 
 ## Are these docs auto-generated from Python docstrings?
 
-Partially. Guides are hand-written, and API reference pages are auto-generated with **mkdocstrings**.
+Partially. Guides are hand-written, and API reference pages are auto-generated with **Sphinx autodoc**.
 
 - Narrative pages in `docs/guide/*.md` are written manually.
-- `docs/guide/api-reference.md` renders API docs from Python modules/docstrings automatically.
+- `docs/guide/api-reference.md` renders API docs from Python modules/docstrings automatically via `automodule`.
 - This gives both high-level explainers and synchronized code-level reference.
 

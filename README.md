@@ -4,24 +4,22 @@ A tinygrad-to-hardware exploration centered on an INT8 GEMV unit in Amaranth.
 
 ## Documentation
 
-Docs use **MkDocs Material** with automatic API reference generation from Python docstrings (`mkdocstrings`).
+Docs use **Sphinx + Furo** with automatic API reference generation from Python docstrings (`autodoc`).
 
-### Run locally
+### Build locally
 
 ```bash
 uv sync
-uv run mkdocs serve -a 0.0.0.0:4173
+uv run sphinx-build -b dirhtml docs docs/_build/dirhtml
+```
+
+### Preview locally
+
+```bash
+python -m http.server 4173 -d docs/_build/dirhtml
 ```
 
 Open `http://localhost:4173`.
-
-### Build static docs
-
-```bash
-uv run mkdocs build
-```
-
-Output is in `site/`.
 
 ### Deployment
 

@@ -24,7 +24,8 @@ uv sync
 uv run pytest tests/test_gemv.py -k "not slow"
 
 # run docs locally
-uv run mkdocs serve -a 0.0.0.0:4173
+uv run sphinx-build -b dirhtml docs docs/_build/dirhtml
+python -m http.server 4173 -d docs/_build/dirhtml
 ```
 
 Then open `http://localhost:4173`.

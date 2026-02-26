@@ -1,11 +1,15 @@
 # API Reference
 
-This section is generated automatically from Python modules and their docstrings.
+```{eval-rst}
+.. automodule:: hdl.gemv
+   :members:
+   :undoc-members:
+   :show-inheritance:
+```
 
-## `hdl.gemv`
-
-::: hdl.gemv
-
-## `hdl.relu`
-
-::: hdl.relu
+```{eval-rst}
+.. automodule:: hdl.relu
+   :members:
+   :undoc-members:
+   :show-inheritance:
+```
