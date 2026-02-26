@@ -1,26 +1,26 @@
----
-layout: home
+# tg2hdl
 
-hero:
-  name: "tg2hdl"
-  text: "tinygrad kernels to hardware, one verified step at a time"
-  tagline: "A simulation-first INT8 GEMV prototype in Amaranth, with a path to auto-generation."
-  actions:
-    - theme: brand
-      text: Read introduction
-      link: /guide/introduction
-    - theme: alt
-      text: Get started
-      link: /guide/getting-started
+Tinygrad-to-hardware exploration focused on an INT8 GEMV accelerator in Amaranth.
 
-features:
-  - icon: 🧭
-    title: Project-first docs
-    details: Start with a full introduction that explains scope, goals, and current limitations.
-  - icon: ⚙️
-    title: Hardware in Python
-    details: Amaranth modules are authored in Python and validated with cycle-accurate simulation.
-  - icon: 🔜
-    title: Auto-generation roadmap
-    details: Clear separation of what is manual now and what is planned from tinygrad kernel IR.
----
+## Documentation map
+
+```{toctree}
+:maxdepth: 2
+:caption: Guide
+
+guide/introduction
+guide/getting-started
+guide/architecture
+guide/verification
+guide/deployment
+guide/api-reference
+```
+
+## Quickstart
+
+```bash
+uv sync
+uv run sphinx-build -b dirhtml docs docs/_build/dirhtml
+```
+
+Then open `docs/_build/dirhtml/index.html`.

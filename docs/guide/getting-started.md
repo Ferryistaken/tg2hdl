@@ -2,7 +2,7 @@
 
 ## Start here
 
-If you want the project-level context first, read [Introduction](/guide/introduction).
+If you want the project-level context first, read [Introduction](introduction.md).
 
 ## Repository map
 
@@ -12,18 +12,20 @@ If you want the project-level context first, read [Introduction](/guide/introduc
 - `tests/test_gemv.py` – simulation tests and cycle-count checks.
 - `inspect_kernels.py` – tinygrad kernel inspection workflow.
 - `train_mnist.py` – training script that exports MNIST weights.
+- `docs/guide/api-reference.md` – auto-generated API docs from Python docstrings.
 
 ## Quickstart
 
 ```bash
-# Python environment and tests
+# install dependencies
 uv sync
+
+# run tests
 uv run pytest tests/test_gemv.py -k "not slow"
 
-# docs site
-cd docs
-npm install
-npm run docs:dev
+# run docs locally
+uv run sphinx-build -b dirhtml docs docs/_build/dirhtml
+python -m http.server 4173 -d docs/_build/dirhtml
 ```
 
 Then open `http://localhost:4173`.

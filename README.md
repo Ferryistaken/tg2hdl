@@ -4,17 +4,25 @@ A tinygrad-to-hardware exploration centered on an INT8 GEMV unit in Amaranth.
 
 ## Documentation
 
-A modern VitePress docs site is included under [`docs/`](docs), with an extensive project introduction first:
+Docs use **Sphinx + Furo** with automatic API reference generation from Python docstrings (`autodoc`).
 
-- Introduction: `docs/guide/introduction.md`
-- Getting Started: `docs/guide/getting-started.md`
-- Architecture: `docs/guide/architecture.md`
-- Verification: `docs/guide/verification.md`
+### Build locally
 
 ```bash
-cd docs
-npm install
-npm run docs:dev
+uv sync
+uv run sphinx-build -b dirhtml docs docs/_build/dirhtml
+```
+
+### Preview locally
+
+```bash
+python -m http.server 4173 -d docs/_build/dirhtml
 ```
 
 Open `http://localhost:4173`.
+
+### Deployment
+
+- GitHub Pages: `.github/workflows/docs-gh-pages.yml`
+- Netlify: `netlify.toml`
+- Detailed guide: `docs/guide/deployment.md`

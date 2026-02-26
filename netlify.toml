@@ -1,4 +1,7 @@
 [build]
-  base = "docs"
-  command = "npm ci && npm run docs:build"
-  publish = ".vitepress/dist"
+  base = "."
+  command = "python -m pip install --upgrade uv && python -m uv sync --frozen && python -m uv run sphinx-build -b dirhtml docs docs/_build/dirhtml"
+  publish = "docs/_build/dirhtml"
+
+[build.environment]
+  PYTHON_VERSION = "3.14"
