@@ -28,6 +28,7 @@ master_doc = 'index'
 html_theme = 'furo'
 html_title = 'tg2hdl docs'
 html_static_path = ['_static']
+html_favicon = '_static/favicon.ico'
 
 myst_enable_extensions = [
     'colon_fence',
