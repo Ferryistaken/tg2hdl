@@ -1,57 +1,51 @@
 # Deployment
 
-This site now uses **Sphinx + Furo theme + autodoc**.
+## Documentation Build System
 
-## Local build
+The documentation uses Sphinx with Furo theme and autodoc for API reference generation.
+
+### Local Build
 
 ```bash
 uv sync
 uv run sphinx-build -b dirhtml docs docs/_build/dirhtml
 ```
 
-Built files are emitted to `docs/_build/dirhtml`.
+Output: `docs/_build/dirhtml/`
 
-## Local preview
+### Local Preview
 
 ```bash
 python -m http.server 4173 -d docs/_build/dirhtml
 ```
 
+Access: `http://localhost:4173`
+
 ## GitHub Pages
 
-A workflow is included at `.github/workflows/docs-gh-pages.yml`.
+Workflow: `.github/workflows/docs-gh-pages.yml`
 
-### One-time setup
+### Configuration
 
-1. In GitHub, open **Settings → Pages**.
-2. Set **Source** to **GitHub Actions**.
-3. Push to `main`.
+1. Repository Settings → Pages
+2. Source: **GitHub Actions**
+3. Push to main branch
 
-The workflow runs `uv sync`, then `uv run sphinx-build -b dirhtml docs docs/_build/dirhtml`, then deploys `docs/_build/dirhtml`.
+The workflow automatically builds and deploys on each push.
 
 ## Netlify
 
-`netlify.toml` is configured to:
+Configuration: `netlify.toml`
 
-- install tooling with `python -m uv sync --frozen`
-- build with `python -m uv run sphinx-build -b dirhtml docs docs/_build/dirhtml`
-- publish `docs/_build/dirhtml`
+### Setup
 
-Just connect this repo in Netlify and deploy.
+1. Connect repository in Netlify dashboard
+2. Deploy (build command and publish directory auto-detected)
 
+### Build Configuration
 
-## Troubleshooting local build warnings
-
-If you previously used npm/VitePress in this repo, remove stale `docs/node_modules` and `docs/.vitepress` directories.
-These can confuse docs tooling during migration.
-
-```bash
-python - <<'P'
-import shutil, pathlib
-for p in ['docs/node_modules', 'docs/.vitepress']:
-    q = pathlib.Path(p)
-    if q.exists():
-        shutil.rmtree(q)
-print('cleaned stale frontend artifacts')
-P
+```toml
+[build]
+  command = "python -m uv run sphinx-build -b dirhtml docs docs/_build/dirhtml"
+  publish = "docs/_build/dirhtml"
 ```

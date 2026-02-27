@@ -1,39 +1,65 @@
 # Getting Started
 
-## Start here
+## Repository Structure
 
-If you want the project-level context first, read [Introduction](introduction.md).
+```
+tg2hdl/
+├── hdl/
+│   ├── gemv.py          # INT8 GEMV hardware unit
+│   └── relu.py          # ReLU activation unit
+├── tests/
+│   └── test_gemv.py     # Simulation testbench
+├── compiler/            # IR-to-HDL compilation (WIP)
+├── docs/
+│   └── guide/           # Documentation source
+├── benchmark.py         # Performance benchmarks
+├── train_mnist.py       # Model training script
+├── inspect_kernels.py   # Kernel analysis utility
+└── ARCHITECTURE.md      # Technical specification
+```
 
-## Repository map
-
-- `ARCHITECTURE.md` – deep technical walkthrough from model math to FSM behavior.
-- `hdl/gemv.py` – sequential INT8 GEMV hardware block.
-- `hdl/relu.py` – combinational ReLU block.
-- `tests/test_gemv.py` – simulation tests and cycle-count checks.
-- `inspect_kernels.py` – tinygrad kernel inspection workflow.
-- `train_mnist.py` – training script that exports MNIST weights.
-- `docs/guide/api-reference.md` – auto-generated API docs from Python docstrings.
-
-## Quickstart
+## Installation
 
 ```bash
-# install dependencies
+# Install dependencies
 uv sync
+```
 
-# run tests
+## Running Tests
+
+```bash
+# Full test suite
+uv run pytest
+
+# Exclude slow tests (MNIST-sized kernels)
 uv run pytest tests/test_gemv.py -k "not slow"
+```
 
-# run docs locally
+## Building Documentation
+
+```bash
+# Build Sphinx documentation
 uv run sphinx-build -b dirhtml docs docs/_build/dirhtml
+
+# Serve locally
 python -m http.server 4173 -d docs/_build/dirhtml
 ```
 
-Then open `http://localhost:4173`.
+Open `http://localhost:4173`.
 
-## Current scope
+## Running Benchmarks
 
-The current implementation is a correctness-first prototype:
+```bash
+# CPU vs FPGA vs GPU comparison
+uv run python benchmark.py
+```
 
-- hand-authored Amaranth GEMV module,
-- simulation-based verification,
-- and documented path toward automatic generation from tinygrad kernel IR.
+## Quick Validation
+
+```bash
+# Train MNIST model and export weights
+uv run python train_mnist.py
+
+# Inspect kernel shapes
+uv run python inspect_kernels.py
+```
