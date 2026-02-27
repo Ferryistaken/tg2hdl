@@ -8,7 +8,7 @@ combinational datapath, and FSM for sequencing.
 from amaranth.hdl import Elaboratable, Module, Signal, signed, unsigned, Mux, Const, Cat
 from amaranth.lib.memory import Memory
 
-from tinygrad.uop.ops import Ops
+from tinygrad.uop.ops import Ops, AxisType
 from tinygrad.dtype import AddrSpace
 
 
@@ -35,7 +35,7 @@ class CompiledKernel(Elaboratable):
         # External write ports for loading data into input buffers
         # and read port for reading output buffer
         self.buf_write_ports = {}  # buf_idx → (wen, waddr, wdata)
-        self.buf_read_ports = {}   # buf_idx → (raddr, rdata)
+        self.buf_read_ports = {}  # buf_idx → (raddr, rdata)
 
         for info in buf_infos:
             idx = info["idx"]
@@ -64,9 +64,9 @@ class CompiledKernel(Elaboratable):
         buf_infos = self.buf_infos
 
         # --- Phase 1: Create memories ---
-        memories = {}   # buf_idx → Memory submodule
-        int_rports = {} # buf_idx → internal read port (comb)
-        int_wports = {} # buf_idx → internal write port (sync, for output)
+        memories = {}  # buf_idx → Memory submodule
+        int_rports = {}  # buf_idx → internal read port (comb)
+        int_wports = {}  # buf_idx → internal write port (sync, for output)
 
         for info in buf_infos:
             idx = info["idx"]
@@ -97,69 +97,86 @@ class CompiledKernel(Elaboratable):
 
         # --- Phase 2: Analyze UOp structure ---
         # Find loops (RANGE/END pairs)
-        outer_range = None  # UOp for outer RANGE (LOOP)
-        inner_range = None  # UOp for inner RANGE (REDUCE)
-        outer_bound = 0
-        inner_bound = 0
-
-        # Find DEFINE_REG (accumulator)
-        reg_uop = None
-
-        # Categorize UOps by their position relative to RANGE/END
-        # Phase: SETUP | INIT_ROW | COMPUTE | POST | DONE
+        loops = []  # List of (axis_id, axis_type, bound) for each RANGE
         phases = {}  # UOp → phase string
 
-        range_stack = []
-        for u in uops:
-            if u.op == Ops.DEFINE_REG:
-                reg_uop = u
-            elif u.op == Ops.RANGE:
-                axis_id, axis_type = u.arg
-                from tinygrad.uop.ops import AxisType
-                if axis_type == AxisType.LOOP:
-                    outer_range = u
-                    outer_bound = u.src[0].arg if len(u.src) == 1 else u.src[0].arg
-                    range_stack.append("outer")
-                elif axis_type == AxisType.REDUCE:
-                    inner_range = u
-                    # Inner RANGE has src[0]=bound and optionally src[1]=outer_range
-                    inner_bound = u.src[0].arg
-                    range_stack.append("inner")
-
-        # Now walk again and assign phases
-        current_phase = "SETUP"
         for u in uops:
             if u.op == Ops.RANGE:
-                _, axis_type = u.arg
+                axis_id, axis_type = u.arg
                 from tinygrad.uop.ops import AxisType
-                if axis_type == AxisType.LOOP:
-                    current_phase = "INIT_ROW"
-                elif axis_type == AxisType.REDUCE:
-                    current_phase = "COMPUTE"
+
+                bound = u.src[0].arg
+                loops.append((axis_id, axis_type, bound))
+
+        # Determine kernel type
+        from tinygrad.uop.ops import AxisType
+
+        has_reduce = any(at == AxisType.REDUCE for _, at, _ in loops)
+        loop_bound = loops[0][2] if loops else 0  # bound for simple loop
+
+        # For GEMV-style kernels
+        outer_bound = 0
+        inner_bound = 0
+        if has_reduce and len(loops) >= 2:
+            outer_bound = loops[0][2]
+            inner_bound = loops[1][2]
+
+        # Assign phases based on kernel type
+        if has_reduce:
+            # GEMV-style: INIT_ROW | COMPUTE | POST
+            current_phase = "SETUP"
+            for u in uops:
+                if u.op == Ops.RANGE:
+                    _, axis_type = u.arg
+                    from tinygrad.uop.ops import AxisType
+
+                    if axis_type == AxisType.LOOP:
+                        current_phase = "INIT_ROW"
+                    elif axis_type == AxisType.REDUCE:
+                        current_phase = "COMPUTE"
+                    phases[id(u)] = current_phase
+                    continue
+                elif u.op == Ops.END:
+                    phases[id(u)] = current_phase
+                    end_range = u.src[-1]
+                    _, axis_type = end_range.arg
+                    from tinygrad.uop.ops import AxisType
+
+                    if axis_type == AxisType.REDUCE:
+                        current_phase = "POST"
+                    elif axis_type == AxisType.LOOP:
+                        current_phase = "DONE"
+                    continue
+                elif u.op == Ops.SINK:
+                    phases[id(u)] = "DONE"
+                    continue
                 phases[id(u)] = current_phase
-                continue
-            elif u.op == Ops.END:
-                phases[id(u)] = current_phase
-                # Check which RANGE this END closes
-                end_range = u.src[-1]  # last src is the RANGE
-                _, axis_type = end_range.arg
-                from tinygrad.uop.ops import AxisType
-                if axis_type == AxisType.REDUCE:
-                    current_phase = "POST"
-                elif axis_type == AxisType.LOOP:
-                    current_phase = "DONE"
-                continue
-            elif u.op == Ops.SINK:
-                phases[id(u)] = "DONE"
-                continue
-            phases[id(u)] = current_phase
+        else:
+            # Simple element-wise loop: COMPUTE only
+            in_loop = False
+            for u in uops:
+                if u.op == Ops.RANGE:
+                    in_loop = True
+                    phases[id(u)] = "COMPUTE"
+                    continue
+                elif u.op == Ops.END:
+                    phases[id(u)] = "COMPUTE"
+                    in_loop = False
+                    continue
+                elif u.op == Ops.SINK:
+                    phases[id(u)] = "DONE"
+                    continue
+                phases[id(u)] = "COMPUTE" if in_loop else "SETUP"
 
         # --- Phase 3: Create signals ---
-        # Counter signals for loops
+        # Counter signal for loop
+        loop_ctr = Signal(range(max(loop_bound, 1)), name="loop_ctr")
+
+        # For GEMV-style kernels
         outer_ctr = Signal(range(max(outer_bound, 1)), name="outer_ctr")
         inner_ctr = Signal(range(max(inner_bound, 1)), name="inner_ctr")
 
-        # Accumulator
+        # Accumulator (only needed for reductions)
         acc = Signal(signed(32), name="acc")
 
         # Signal map: UOp → Amaranth Signal/Value
@@ -186,7 +203,11 @@ class CompiledKernel(Elaboratable):
                 # Loop variable — maps to counter
                 _, axis_type = u.arg
                 from tinygrad.uop.ops import AxisType
-                if axis_type == AxisType.LOOP:
+
+                if not has_reduce:
+                    # Simple loop
+                    sig[id(u)] = loop_ctr
+                elif axis_type == AxisType.LOOP:
                     sig[id(u)] = outer_ctr
                 else:
                     sig[id(u)] = inner_ctr
@@ -203,7 +224,7 @@ class CompiledKernel(Elaboratable):
                 offset = u.src[1]
 
                 # Check if this indexes into a REG
-                if hasattr(u.dtype, 'addrspace') and u.dtype.addrspace == AddrSpace.REG:
+                if hasattr(u.dtype, "addrspace") and u.dtype.addrspace == AddrSpace.REG:
                     # Register index — just reference the accumulator
                     sig[id(u)] = acc
                     continue
@@ -218,7 +239,9 @@ class CompiledKernel(Elaboratable):
                     if info["idx"] == buf_idx:
                         depth = info["depth"]
                         break
-                addr_sig = Signal(range(max(depth, 1)), name=f"addr_b{buf_idx}_{id(u) % 10000}")
+                addr_sig = Signal(
+                    range(max(depth, 1)), name=f"addr_b{buf_idx}_{id(u) % 10000}"
+                )
                 m.d.comb += addr_sig.eq(offset_sig)
 
                 # Store (buf_idx, addr_sig) tuple
@@ -307,7 +330,9 @@ class CompiledKernel(Elaboratable):
             elif u.op == Ops.WHERE:
                 cond = self._to_signal(m, sig, u.src[0], f"where_c_{id(u) % 10000}")
                 true_val = self._to_signal(m, sig, u.src[1], f"where_t_{id(u) % 10000}")
-                false_val = self._to_signal(m, sig, u.src[2], f"where_f_{id(u) % 10000}")
+                false_val = self._to_signal(
+                    m, sig, u.src[2], f"where_f_{id(u) % 10000}"
+                )
                 w, is_s = self._dtype_to_width(u.dtype)
                 shape = signed(w) if is_s else unsigned(w)
                 result = Signal(shape, name=f"where_{id(u) % 10000}")
@@ -337,8 +362,9 @@ class CompiledKernel(Elaboratable):
         # --- Phase 5: Build FSM ---
         # Collect stores by phase
         init_row_stores = []  # (target, value) for accumulator resets
-        compute_stores = []   # (target, value) for MAC updates
-        post_stores = []      # (buf_idx, addr, value) for output writes
+        compute_stores = []  # (target, value) for MAC updates
+        post_stores = []  # (buf_idx, addr, value) for output writes
+        loop_stores = []  # (buf_idx, addr, value) for simple loop stores
 
         for u in uops:
             if u.op != Ops.STORE:
@@ -358,6 +384,9 @@ class CompiledKernel(Elaboratable):
                 _, buf_idx, addr_sig, value = store_info
                 if phase == "POST":
                     post_stores.append((buf_idx, addr_sig, value))
+                elif phase == "COMPUTE" and not has_reduce:
+                    # Simple element-wise loop: store happens in COMPUTE phase
+                    loop_stores.append((buf_idx, addr_sig, value))
 
         # Default: wire external write ports when not computing
         # During computation, output memory write is controlled by FSM
@@ -386,56 +415,83 @@ class CompiledKernel(Elaboratable):
                 ]
 
         # Build FSM
-        with m.FSM(init="IDLE"):
-            with m.State("IDLE"):
-                with m.If(self.start):
-                    m.d.sync += [
-                        outer_ctr.eq(0),
-                        inner_ctr.eq(0),
-                        acc.eq(0),
-                    ]
-                    m.next = "INIT_ROW"
+        if not has_reduce:
+            # Simple element-wise loop FSM
+            with m.FSM(init="IDLE"):
+                with m.State("IDLE"):
+                    with m.If(self.start):
+                        m.d.sync += loop_ctr.eq(0)
+                        m.next = "COMPUTE"
 
-            with m.State("INIT_ROW"):
-                m.d.comb += self.busy.eq(1)
-                # Reset accumulator
-                m.d.sync += acc.eq(0)
-                m.d.sync += inner_ctr.eq(0)
-                m.next = "COMPUTE"
+                with m.State("COMPUTE"):
+                    m.d.comb += self.busy.eq(1)
 
-            with m.State("COMPUTE"):
-                m.d.comb += self.busy.eq(1)
+                    # Write results to output memory
+                    for buf_idx, addr_sig, value in loop_stores:
+                        wp = int_wports[buf_idx]
+                        m.d.comb += [
+                            wp.en.eq(1),
+                            wp.addr.eq(addr_sig),
+                            wp.data.eq(value),
+                        ]
 
-                # Update accumulator with MAC result
-                if compute_stores:
-                    m.d.sync += acc.eq(compute_stores[-1])
+                    with m.If(loop_ctr == loop_bound - 1):
+                        m.next = "DONE"
+                    with m.Else():
+                        m.d.sync += loop_ctr.eq(loop_ctr + 1)
 
-                with m.If(inner_ctr == inner_bound - 1):
-                    m.next = "POST"
-                with m.Else():
-                    m.d.sync += inner_ctr.eq(inner_ctr + 1)
+                with m.State("DONE"):
+                    m.d.comb += self.done.eq(1)
+                    m.next = "IDLE"
+        else:
+            # GEMV-style kernel FSM
+            with m.FSM(init="IDLE"):
+                with m.State("IDLE"):
+                    with m.If(self.start):
+                        m.d.sync += [
+                            outer_ctr.eq(0),
+                            inner_ctr.eq(0),
+                            acc.eq(0),
+                        ]
+                        m.next = "INIT_ROW"
 
-            with m.State("POST"):
-                m.d.comb += self.busy.eq(1)
+                with m.State("INIT_ROW"):
+                    m.d.comb += self.busy.eq(1)
+                    m.d.sync += acc.eq(0)
+                    m.d.sync += inner_ctr.eq(0)
+                    m.next = "COMPUTE"
 
-                # Write results to output memory
-                for buf_idx, addr_sig, value in post_stores:
-                    wp = int_wports[buf_idx]
-                    m.d.comb += [
-                        wp.en.eq(1),
-                        wp.addr.eq(addr_sig),
-                        wp.data.eq(value),
-                    ]
+                with m.State("COMPUTE"):
+                    m.d.comb += self.busy.eq(1)
 
-                with m.If(outer_ctr == outer_bound - 1):
-                    m.next = "DONE"
-                with m.Else():
-                    m.d.sync += outer_ctr.eq(outer_ctr + 1)
-                    m.next = "INIT_ROW"
+                    if compute_stores:
+                        m.d.sync += acc.eq(compute_stores[-1])
 
-            with m.State("DONE"):
-                m.d.comb += self.done.eq(1)
-                m.next = "IDLE"
+                    with m.If(inner_ctr == inner_bound - 1):
+                        m.next = "POST"
+                    with m.Else():
+                        m.d.sync += inner_ctr.eq(inner_ctr + 1)
+
+                with m.State("POST"):
+                    m.d.comb += self.busy.eq(1)
+
+                    for buf_idx, addr_sig, value in post_stores:
+                        wp = int_wports[buf_idx]
+                        m.d.comb += [
+                            wp.en.eq(1),
+                            wp.addr.eq(addr_sig),
+                            wp.data.eq(value),
+                        ]
+
+                    with m.If(outer_ctr == outer_bound - 1):
+                        m.next = "DONE"
+                    with m.Else():
+                        m.d.sync += outer_ctr.eq(outer_ctr + 1)
+                        m.next = "INIT_ROW"
+
+                with m.State("DONE"):
+                    m.d.comb += self.done.eq(1)
+                    m.next = "IDLE"
 
         return m
 
@@ -470,6 +526,7 @@ class CompiledKernel(Elaboratable):
     def _dtype_to_width(self, dtype):
         """Return (bit_width, is_signed) for a tinygrad dtype."""
         from tinygrad import dtypes
+
         if dtype == dtypes.char or dtype == dtypes.int8:
             return 8, True
         if dtype == dtypes.uchar or dtype == dtypes.uint8:
