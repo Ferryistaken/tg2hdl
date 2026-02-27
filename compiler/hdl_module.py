@@ -8,7 +8,7 @@ combinational datapath, and FSM for sequencing.
 from amaranth.hdl import Elaboratable, Module, Signal, signed, unsigned, Mux, Const, Cat
 from amaranth.lib.memory import Memory
 
-from tinygrad.uop.ops import Ops, AxisType
+from tinygrad.uop.ops import Ops, AxisType  # noqa: F401
 from tinygrad.dtype import AddrSpace
 
 
@@ -103,14 +103,10 @@ class CompiledKernel(Elaboratable):
         for u in uops:
             if u.op == Ops.RANGE:
                 axis_id, axis_type = u.arg
-                from tinygrad.uop.ops import AxisType
-
                 bound = u.src[0].arg
                 loops.append((axis_id, axis_type, bound))
 
         # Determine kernel type
-        from tinygrad.uop.ops import AxisType
-
         has_reduce = any(at == AxisType.REDUCE for _, at, _ in loops)
         loop_bound = loops[0][2] if loops else 0  # bound for simple loop
 
@@ -128,8 +124,6 @@ class CompiledKernel(Elaboratable):
             for u in uops:
                 if u.op == Ops.RANGE:
                     _, axis_type = u.arg
-                    from tinygrad.uop.ops import AxisType
-
                     if axis_type == AxisType.LOOP:
                         current_phase = "INIT_ROW"
                     elif axis_type == AxisType.REDUCE:
@@ -140,8 +134,6 @@ class CompiledKernel(Elaboratable):
                     phases[id(u)] = current_phase
                     end_range = u.src[-1]
                     _, axis_type = end_range.arg
-                    from tinygrad.uop.ops import AxisType
-
                     if axis_type == AxisType.REDUCE:
                         current_phase = "POST"
                     elif axis_type == AxisType.LOOP:
@@ -151,7 +143,7 @@ class CompiledKernel(Elaboratable):
                     phases[id(u)] = "DONE"
                     continue
                 phases[id(u)] = current_phase
-        else:
+        elif loops:
             # Simple element-wise loop: COMPUTE only
             in_loop = False
             for u in uops:
@@ -167,6 +159,13 @@ class CompiledKernel(Elaboratable):
                     phases[id(u)] = "DONE"
                     continue
                 phases[id(u)] = "COMPUTE" if in_loop else "SETUP"
+        else:
+            # Scalar kernel (no loops at all): everything is COMPUTE
+            for u in uops:
+                if u.op == Ops.SINK:
+                    phases[id(u)] = "DONE"
+                else:
+                    phases[id(u)] = "COMPUTE"
 
         # --- Phase 3: Create signals ---
         # Counter signal for loop
@@ -202,8 +201,6 @@ class CompiledKernel(Elaboratable):
             elif u.op == Ops.RANGE:
                 # Loop variable — maps to counter
                 _, axis_type = u.arg
-                from tinygrad.uop.ops import AxisType
-
                 if not has_reduce:
                     # Simple loop
                     sig[id(u)] = loop_ctr
@@ -385,12 +382,12 @@ class CompiledKernel(Elaboratable):
                 if phase == "POST":
                     post_stores.append((buf_idx, addr_sig, value))
                 elif phase == "COMPUTE" and not has_reduce:
-                    # Simple element-wise loop: store happens in COMPUTE phase
+                    # Element-wise (looped or scalar): store in COMPUTE phase
                     loop_stores.append((buf_idx, addr_sig, value))
 
         # Default: wire external write ports when not computing
         # During computation, output memory write is controlled by FSM
-        output_buf_idxs = {s[0] for s in post_stores}
+        output_buf_idxs = {s[0] for s in post_stores} | {s[0] for s in loop_stores}
 
         for info in buf_infos:
             idx = info["idx"]
@@ -415,7 +412,31 @@ class CompiledKernel(Elaboratable):
                 ]
 
         # Build FSM
-        if not has_reduce:
+        if not loops:
+            # Scalar kernel (no loops): single-cycle compute
+            with m.FSM(init="IDLE"):
+                with m.State("IDLE"):
+                    with m.If(self.start):
+                        m.next = "COMPUTE"
+
+                with m.State("COMPUTE"):
+                    m.d.comb += self.busy.eq(1)
+
+                    for buf_idx, addr_sig, value in loop_stores:
+                        wp = int_wports[buf_idx]
+                        m.d.comb += [
+                            wp.en.eq(1),
+                            wp.addr.eq(addr_sig),
+                            wp.data.eq(value),
+                        ]
+
+                    m.next = "DONE"
+
+                with m.State("DONE"):
+                    m.d.comb += self.done.eq(1)
+                    m.next = "IDLE"
+
+        elif not has_reduce:
             # Simple element-wise loop FSM
             with m.FSM(init="IDLE"):
                 with m.State("IDLE"):

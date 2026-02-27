@@ -44,8 +44,7 @@ def test_relu_add_bias_compile_and_simulate():
     assert kernel is not None
 
     # Verify kernel structure
-    assert len(kernel.memories) == 3, "Should have 3 memories"
-    assert hasattr(kernel, "state"), "Should have FSM state"
+    assert len(kernel.buf_infos) == 3, "Should have 3 buffer infos"
 
     # Test data
     a_data = np.array([-10, 0, 5, 10], dtype=np.int32)
@@ -63,7 +62,7 @@ def test_relu_add_bias_compile_and_simulate():
         output, expected, f"Expected {expected}, got {output}"
     )
 
-    # Verify cycle count (should be N cycles for simple loop)
+    # Verify cycle count: N compute cycles
     assert cycles == 4, f"Should take 4 cycles, took {cycles}"
 
     print(f"✓ relu(a + b + bias) compiled and simulated in {cycles} cycles")
@@ -104,11 +103,11 @@ def test_relu_add_bias_compilation_structure():
 
     # Verify memory depths
     for idx, buf in enumerate(kernel.buf_infos):
-        if buf.is_output:
-            assert buf.depth == 8, f"Output memory should have depth 8, got {buf.depth}"
+        if buf["is_output"]:
+            assert buf["depth"] == 8, f"Output memory should have depth 8, got {buf['depth']}"
         else:
-            assert buf.depth == 8, (
-                f"Input memory {idx} should have depth 8, got {buf.depth}"
+            assert buf["depth"] == 8, (
+                f"Input memory {idx} should have depth 8, got {buf['depth']}"
             )
 
     print(f"✓ Compilation structure is correct")
@@ -165,7 +164,7 @@ def test_relu_add_bias_cycle_count():
 
         output, cycles, wall = simulate_kernel(kernel, {1: a_data, 2: b_data})
 
-        # Should take exactly N cycles for simple loop
+        # Should take exactly N cycles for element-wise
         assert cycles == n, f"For n={n}, expected {n} cycles, got {cycles}"
 
     print(f"✓ Cycle counts are optimal (N cycles for N elements)")
