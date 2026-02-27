@@ -3,6 +3,9 @@
 
 #!! ERROR: pyproject is undefined. Use list command to see defined gitignore types !!#
 
+notes/
+books/
+
 ### Python ###
 # Byte-compiled / optimized / DLL files
 __pycache__/
