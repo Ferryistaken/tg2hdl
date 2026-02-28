@@ -1,17 +1,13 @@
-tg2hdl Documentation
-====================
+tg2hdl
+======
 
-Neural network inference accelerators for FPGA deployment.
+INT8 GEMV accelerators for FPGA-based neural network inference.
 
 .. toctree::
-   :maxdepth: 2
-   :caption: Guide
+   :maxdepth: 1
 
    guide/introduction.md
-   guide/getting-started.md
    guide/architecture.md
    guide/verification.md
-   guide/deployment.md
-   guide/roadmap.md
    guide/benchmarks.md
    guide/api-reference.md
