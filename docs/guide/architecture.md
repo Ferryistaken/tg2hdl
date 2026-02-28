@@ -1,99 +1,111 @@
 # System Architecture
 
-## GEMV Operation
+## Compiler pipeline
 
-$$y_i = \sum_{j=0}^{K-1} W_{i,j} \cdot x_j, \quad i = 0, \dots, M-1$$
-
-**Types:** W ∈ ℤ^(M×K) [INT8], x ∈ ℤ^K [INT8], y ∈ ℤ^M [INT32]
-
-**Target:** MNIST MLP (101,632 total MACs)
-
-## Hardware Unit (`hdl/gemv.py`)
+tinygrad's `schedule()` splits a model into compute kernels. Each kernel is a `list[UOp]` — tinygrad's linearized IR. `compile_kernel()` (`backend.py:102`) takes that list and returns a `CompiledKernel`: an Amaranth `Elaboratable` built in three passes.
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                      GEMVUnit                               │
-│  ┌──────────────┐     ┌──────────────┐     ┌─────────────┐ │
-│  │  vec_mem     │────►│  MUL 8×8→16  │────►│  ACC INT32  │ │
-│  │  [K] INT8    │     │              │     │  += product │ │
-│  └──────────────┘     └──────┬───────┘     └─────────────┘ │
-│  ┌──────────────┐           │              ▲              │
-│  │  w_mem       │───────────┘              │              │
-│  │  [M×K] INT8  │                          │              │
-│  └──────────────┘                          │              │
-│         ▲                                  │              │
-│         └────────►│      FSM Control     │◄──────────────┘
-│                   │  IDLE/COMPUTE/EMIT/DONE           │
-│                   └──────────────────────┘
-│                              │
-│         ┌────────────────────┼────────────────────┐
-│  result_idx            result_data         result_valid
-└─────────────────────────────────────────────────────────────┘
+tinygrad UOps
+    │
+    ├─ Pass 0: _create_memories()   — one Memory per DEFINE_GLOBAL
+    ├─ Pass 1: _parse_loop_structure() — UOps → LoopLevel tree
+    ├─ Pass 2: _build_datapath()    — combinational signal map
+    └─ Pass 3: _build_fsm()         — FSM sequencing stores
 ```
 
-## Interface
+## Pass 0 — Memories (`hdl_module.py:88`)
 
-**Control:** `start` (in), `done` (out), `busy` (out)
+Every `DEFINE_GLOBAL` buffer in the UOps becomes an Amaranth `Memory`:
 
-**Vector Load:** `vec_wen`, `vec_waddr`, `vec_wdata` (8-bit)
+- **Depth**: element count from `dtype.size`
+- **Width**: 8 bits for INT8 buffers, 32 bits for INT32
+- **Ports**: two combinational read ports (one internal for the datapath, one external for inspection via `buf_read_ports`), one synchronous write port shared between external loading and FSM writes
 
-**Weight Load:** `w_wen`, `w_waddr`, `w_wdata` (8-bit)
+Default write port wiring routes `buf{N}_wen/waddr/wdata` inputs to the internal write port. FSM states override this with `m.d.comb` when they need to write output.
 
-**Output:** `result_valid`, `result_idx`, `result_data` (32-bit)
+## Pass 1 — Loop structure (`hdl_module.py:152`)
 
-## FSM
+`_parse_loop_structure()` walks the UOp list and builds a `LoopLevel` tree:
+
+```python
+@dataclass
+class LoopLevel:
+    axis_type: AxisType | None  # LOOP, REDUCE, or None (root)
+    bound: int                  # iteration count
+    counter: UOp | None         # the RANGE uop
+    prologue: list[UOp]         # ops before inner RANGE (or all ops if innermost)
+    body: LoopLevel | None      # nested level
+    epilogue: list[UOp]         # ops after inner END
+```
+
+The root is always returned (axis_type=None). Its body is the outermost RANGE, or None for scalar kernels with no loops.
+
+**Why:** the tree separates *what* to compute from *when* to compute it. Prologue ops (e.g. accumulator reset) belong to the outer level; body ops (MAC) belong to the inner level; epilogue ops (output write) belong back to the outer level.
+
+**LOOP vs REDUCE:** tinygrad tags each RANGE with an `AxisType`. `LOOP` axes are independent iterations (one output element per iteration — parallelizable in principle). `REDUCE` axes are dependent — each iteration reads and updates the accumulator. In hardware today both execute sequentially; the distinction is preserved for future parallelism.
+
+## Pass 2 — Combinational datapath (`hdl_module.py:190`)
+
+`_build_datapath()` walks all UOps and builds a `sig` dict mapping `id(uop) → Signal/value`:
+
+| UOp | Signal |
+|-----|--------|
+| `DEFINE_GLOBAL` | `None` (handled by memories) |
+| `DEFINE_REG` | `acc` Signal (signed 32-bit accumulator) |
+| `CONST` | Python int (used directly in `eq()`) |
+| `RANGE` | counter Signal from `counter_map` |
+| `AFTER` | pass through `sig[src[0]]` (ordering barrier, no new value) |
+| `INDEX` into reg | `acc` |
+| `INDEX` into buffer | `("index", buf_idx, addr_sig)` — comb address wired to read port |
+| `LOAD` from memory | new Signal wired to read port `.data` |
+| `MUL/ADD/CAST/CMPLT/WHERE/MAX` | new Signal wired combinationally |
+| `STORE` | `None` — resolved at FSM build time |
+
+The datapath is always live. Signals for loop addresses always reflect the current counter values, so when the FSM advances a counter, addresses and loaded data update automatically the next cycle.
+
+## Pass 3 — FSM (`hdl_module.py:280`)
+
+`_build_fsm()` flattens the LoopLevel tree to a list of `(level, depth)` pairs and creates states:
 
 ```
-     start         col==K-1         last_row
-┌───────┐       ┌─────────┐      ┌────────┐      ┌────────┐
-│  IDLE │──────►│ COMPUTE │─────►│  EMIT  │─────►│  DONE  │
-└───┬───┘       └───┬─────┘      └───┬────┘      └───┬────┘
-    │               │                │               │
-    └───────────────┴────────────────┴───────────────┘
+IDLE
+  └─ on start: reset outermost counter → first state
+
+L{d}_PRO  (non-innermost levels)
+  └─ emit prologue STOREs (e.g. acc = 0)
+     reset child counter → child's first state
+
+L{d}_BODY  (innermost level)
+  └─ emit body STOREs (e.g. acc += MAC result)
+     if counter == bound-1: → parent EPI (or set done, → IDLE)
+     else: counter++, → self
+
+L{d}_EPI  (non-innermost levels)
+  └─ emit epilogue STOREs (e.g. output[i] = cast(acc))
+     if counter == bound-1: → parent EPI (or set done, → IDLE)
+     else: counter++, → L{d}_PRO
 ```
 
-**COMPUTE:** K cycles/row (MAC per cycle)  
-**EMIT:** 1 cycle/row (output result, reset acc)  
-**DONE:** 1 cycle (total)
+**Store resolution** (`_emit_stores`, `hdl_module.py:345`): each `STORE` UOp is resolved at emit time by looking up `sig[id(store.src[0])]`:
+- If it's `acc` → `m.d.sync += acc.eq(value)` (register write)
+- If it's `("index", buf_idx, addr_sig)` → `m.d.comb += [wp.addr.eq(addr), wp.data.eq(value), wp.en.eq(1)]` (memory write, overrides default external wiring)
 
-## Timing
+**Done signal:** set synchronously (`m.d.sync += done.eq(1)`) in the last compute state when the outermost counter reaches its bound, then cleared in IDLE. This means done is valid for exactly one cycle after the final store.
 
-$$T_{\text{cycles}} = M \times (K + 1) + 1$$
+## Timing model
 
-| Kernel | Dimensions | Cycles | @100 MHz | @200 MHz |
-|--------|------------|--------|----------|----------|
-| Layer 1 | 128×784 | 100,480 | 1.00 ms | 0.50 ms |
-| Layer 2 | 10×128 | 1,290 | 12.9 μs | 6.45 μs |
-| **Total** | - | **101,770** | **1.02 ms** | **0.51 ms** |
+| Pattern | States | Cycle count |
+|---------|--------|-------------|
+| Scalar (no RANGE) | IDLE → SCALAR → IDLE | 1 |
+| Elementwise (single LOOP, bound N) | IDLE → L0_BODY × N → IDLE | N |
+| GEMV (LOOP M, REDUCE K) | IDLE → (L0_PRO + L1_BODY×K + L0_EPI) × M → IDLE | M×(K+2) |
 
-**Parallelization** (N MACs):
+## Reference implementation (`hdl/gemv.py`)
 
-$$T_{\text{cycles}}(N) = M \times (\lceil K/N \rceil + 1) + 1$$
+The manual `GEMVUnit` predates the compiler and uses a fixed FSM (IDLE → COMPUTE → EMIT → DONE) hardcoded for the GEMV pattern. Its cycle count is M×(K+1)+1. The compiler generates a comparable structure generically from UOps.
 
-| MACs | Cycles | @200 MHz |
-|------|--------|----------|
-| 1 | 101,770 | 0.51 ms |
-| 64 | 1,822 | 9.1 μs |
-| 128 | 1,044 | 5.2 μs |
+## Overflow analysis
 
-## ReLU (`hdl/relu.py`)
+$$\max(\text{acc}) = K \times 127^2 = K \times 16{,}129$$
 
-Combinational: `out = max(0, inp)` [INT32]
-
-**Latency:** 0 cycles (combinational)
-
-## Overflow Analysis
-
-$$\max(\text{acc}) = K \times 127^2 = K \times 16,129$$
-
-For K=784: 12,645,136 < 2³¹-1 ✓
-
-## Resources (Xilinx 7-series)
-
-| Component | Resource | Qty (1 MAC) |
-|-----------|----------|-------------|
-| Multiplier | DSP48 | 1 |
-| Adder | LUTs | ~10 |
-| Accumulator | FFs | 32 |
-
-**BRAM:** ~4 blocks (36Kb) for 128×784 weights
+For K=784: 12,645,136 < 2³¹−1 ✓

@@ -10,8 +10,11 @@ import pytest
 from tinygrad import Tensor, dtypes
 from tinygrad.uop.ops import Ops, KernelInfo
 
+from tinygrad.uop.ops import AxisType
+
 from compiler import HDLRenderer, compile_kernel, simulate_kernel
 from compiler.backend import _get_uops, analyze_buffers
+from compiler.hdl_module import LoopLevel
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +240,250 @@ class TestSingleKernel:
         assert abs(cycles - expected_cycles) <= 2, (
             f"Expected ~{expected_cycles} cycles, got {cycles}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Loop structure parser tests
+# ---------------------------------------------------------------------------
+
+class TestParseLoopStructure:
+    def _parse(self, uops):
+        """Helper: call _parse_loop_structure via a kernel instance."""
+        kernel = compile_kernel(uops)
+        return kernel._parse_loop_structure(uops)
+
+    def test_scalar_returns_root_no_body(self):
+        """Kernel with no loops (n=1 elementwise) returns root with body=None."""
+        renderer = HDLRenderer()
+        a = Tensor.empty(1, dtype=dtypes.int32)
+        b = Tensor.empty(1, dtype=dtypes.int32)
+        c = (a + b).relu()
+        uops = _get_uops(c.schedule()[-1].ast, renderer)
+        result = self._parse(uops)
+        assert result is not None          # always returns root
+        assert result.axis_type is None    # root level
+        assert result.body is None         # no loops
+
+    def test_elementwise_one_loop(self):
+        """Simple elementwise op produces root with one LOOP level, no body."""
+        renderer = HDLRenderer()
+        a = Tensor.empty(4, dtype=dtypes.int32)
+        b = Tensor.empty(4, dtype=dtypes.int32)
+        c = a + b
+        uops = _get_uops(c.schedule()[-1].ast, renderer)
+        result = self._parse(uops)
+
+        assert result is not None
+        assert result.axis_type is None    # root
+        assert result.body is not None     # has a loop
+        assert result.body.axis_type == AxisType.LOOP
+        assert result.body.bound == 4
+        assert result.body.body is None
+        assert len(result.body.prologue) > 0   # loads, add, store
+        assert len(result.body.epilogue) == 0
+
+    def test_gemv_two_levels(self):
+        """Matmul produces root → outer LOOP → inner REDUCE."""
+        renderer = HDLRenderer()
+        x = Tensor.empty(3, dtype=dtypes.int8)
+        w = Tensor.empty(4, 3, dtype=dtypes.int8)
+        out = x @ w.T
+        uops = _get_uops(out.schedule()[-1].ast, renderer)
+        result = self._parse(uops)
+
+        assert result is not None
+        assert result.axis_type is None    # root
+        outer = result.body
+        assert outer is not None
+        assert outer.axis_type == AxisType.LOOP
+        assert outer.bound == 4
+        assert outer.body is not None
+        assert outer.body.axis_type == AxisType.REDUCE
+        assert outer.body.bound == 3
+        assert outer.body.body is None
+
+    def test_gemv_prologue_epilogue_split(self):
+        """Outer level prologue has acc reset, epilogue has output store."""
+        renderer = HDLRenderer()
+        x = Tensor.empty(3, dtype=dtypes.int8)
+        w = Tensor.empty(4, 3, dtype=dtypes.int8)
+        out = x @ w.T
+        uops = _get_uops(out.schedule()[-1].ast, renderer)
+        result = self._parse(uops)
+        outer = result.body
+
+        # prologue: ops before inner RANGE (acc reset)
+        assert len(outer.prologue) > 0
+        prologue_ops = {u.op for u in outer.prologue}
+        assert Ops.STORE in prologue_ops   # accumulator reset
+
+        # epilogue: ops after inner END (read acc, store to output)
+        assert len(outer.epilogue) > 0
+        epilogue_ops = {u.op for u in outer.epilogue}
+        assert Ops.STORE in epilogue_ops   # output write
+        assert Ops.LOAD in epilogue_ops    # read final acc
+
+
+# ---------------------------------------------------------------------------
+# Multi-kernel chaining tests
+# ---------------------------------------------------------------------------
+
+class TestMultiKernel:
+    def test_two_layer_mlp_simulation(self):
+        """Simulate a 2-layer MLP: (1,4)→(1,3)→(1,2) with real data.
+
+        Compiles two kernels from one tinygrad graph, chains them by
+        feeding kernel 0's output as kernel 1's input, and compares
+        the final result to a numpy reference.
+        """
+        renderer = HDLRenderer()
+
+        # Build tinygrad graph: 2-layer MLP with bias + relu
+        x_sym = Tensor.empty(1, 4, dtype=dtypes.int8)
+        w1_sym = Tensor.empty(4, 3, dtype=dtypes.int8)
+        b1_sym = Tensor.empty(1, 3, dtype=dtypes.int32)
+        w2_sym = Tensor.empty(3, 2, dtype=dtypes.int8)
+        b2_sym = Tensor.empty(1, 2, dtype=dtypes.int32)
+
+        h_sym = ((x_sym @ w1_sym).cast(dtypes.int32) + b1_sym).relu()
+        h_i8 = h_sym.cast(dtypes.int8)
+        logits_sym = (h_i8 @ w2_sym).cast(dtypes.int32) + b2_sym
+        sched = logits_sym.schedule()
+
+        # Should produce 2 compute kernels
+        compute_items = [si for si in sched if si.ast.op == Ops.SINK]
+        assert len(compute_items) == 2
+
+        # Compile both kernels
+        uops0 = _get_uops(compute_items[0].ast, renderer)
+        uops1 = _get_uops(compute_items[1].ast, renderer)
+        kernel0 = compile_kernel(uops0)
+        kernel1 = compile_kernel(uops1)
+
+        # Test data
+        x_np = np.array([1, 2, 3, 4], dtype=np.int8)
+        w1_np = np.array([
+            [1,  0, -1],
+            [0,  1,  0],
+            [1,  1,  1],
+            [0,  0,  1],
+        ], dtype=np.int8)  # (4, 3)
+        b1_np = np.array([5, -10, 0], dtype=np.int32)
+
+        w2_np = np.array([
+            [ 1, -1],
+            [ 2,  0],
+            [ 0,  1],
+        ], dtype=np.int8)  # (3, 2)
+        b2_np = np.array([3, -3], dtype=np.int32)
+
+        # --- Numpy reference (matching UOp INT8 truncation semantics) ---
+        # Layer 1: GEMV + bias + relu with int8 truncation
+        h_ref = np.zeros(3, dtype=np.int32)
+        for i in range(3):
+            acc = np.int32(0)
+            for j in range(4):
+                product = np.int8(np.int8(x_np[j]) * np.int8(w1_np[j, i]))
+                acc += np.int32(product)
+            trunc = np.int32(np.int8(acc))
+            with_bias = trunc + b1_np[i]
+            if with_bias > 0:
+                h_ref[i] = np.int32(np.int8(with_bias))
+            else:
+                h_ref[i] = 0
+
+        # Layer 2: kernel reads int32, casts to int8 internally, then GEMV + bias
+        logits_ref = np.zeros(2, dtype=np.int32)
+        for i in range(2):
+            acc = np.int32(0)
+            for j in range(3):
+                h_val = np.int8(h_ref[j])  # cast fused in kernel 1
+                product = np.int8(h_val * np.int8(w2_np[j, i]))
+                acc += np.int32(product)
+            trunc = np.int32(np.int8(acc))
+            logits_ref[i] = trunc + b2_np[i]
+
+        # --- Simulate kernel 0 ---
+        out0, cycles0, _ = simulate_kernel(
+            kernel0, {1: x_np, 2: w1_np.flatten(), 3: b1_np}
+        )
+        np.testing.assert_array_equal(out0, h_ref,
+            err_msg="Kernel 0 (layer 1) output mismatch")
+
+        # --- Chain: feed kernel 0 output into kernel 1 ---
+        out1, cycles1, _ = simulate_kernel(
+            kernel1, {1: out0, 2: w2_np.flatten(), 3: b2_np}
+        )
+        np.testing.assert_array_equal(out1, logits_ref,
+            err_msg="Kernel 1 (layer 2) output mismatch")
+
+    def test_two_layer_mlp_prediction(self):
+        """2-layer MLP should produce a valid argmax prediction."""
+        renderer = HDLRenderer()
+
+        # Slightly larger: (1,8) → (1,4) → (1,3)
+        x_sym = Tensor.empty(1, 8, dtype=dtypes.int8)
+        w1_sym = Tensor.empty(8, 4, dtype=dtypes.int8)
+        b1_sym = Tensor.empty(1, 4, dtype=dtypes.int32)
+        w2_sym = Tensor.empty(4, 3, dtype=dtypes.int8)
+        b2_sym = Tensor.empty(1, 3, dtype=dtypes.int32)
+
+        h_sym = ((x_sym @ w1_sym).cast(dtypes.int32) + b1_sym).relu()
+        h_i8 = h_sym.cast(dtypes.int8)
+        logits_sym = (h_i8 @ w2_sym).cast(dtypes.int32) + b2_sym
+        sched = logits_sym.schedule()
+
+        compute_items = [si for si in sched if si.ast.op == Ops.SINK]
+        assert len(compute_items) == 2
+
+        uops0 = _get_uops(compute_items[0].ast, renderer)
+        uops1 = _get_uops(compute_items[1].ast, renderer)
+        kernel0 = compile_kernel(uops0)
+        kernel1 = compile_kernel(uops1)
+
+        # Random but deterministic test data
+        rng = np.random.RandomState(42)
+        x_np = rng.randint(-10, 10, size=8).astype(np.int8)
+        w1_np = rng.randint(-5, 5, size=(8, 4)).astype(np.int8)
+        b1_np = rng.randint(-20, 20, size=4).astype(np.int32)
+        w2_np = rng.randint(-5, 5, size=(4, 3)).astype(np.int8)
+        b2_np = rng.randint(-20, 20, size=3).astype(np.int32)
+
+        # Numpy reference
+        h_ref = np.zeros(4, dtype=np.int32)
+        for i in range(4):
+            acc = np.int32(0)
+            for j in range(8):
+                product = np.int8(np.int8(x_np[j]) * np.int8(w1_np[j, i]))
+                acc += np.int32(product)
+            trunc = np.int32(np.int8(acc))
+            with_bias = trunc + b1_np[i]
+            if with_bias > 0:
+                h_ref[i] = np.int32(np.int8(with_bias))
+            else:
+                h_ref[i] = 0
+
+        logits_ref = np.zeros(3, dtype=np.int32)
+        for i in range(3):
+            acc = np.int32(0)
+            for j in range(4):
+                h_val = np.int8(h_ref[j])
+                product = np.int8(h_val * np.int8(w2_np[j, i]))
+                acc += np.int32(product)
+            trunc = np.int32(np.int8(acc))
+            logits_ref[i] = trunc + b2_np[i]
+
+        # Simulate both kernels
+        out0, _, _ = simulate_kernel(
+            kernel0, {1: x_np, 2: w1_np.flatten(), 3: b1_np}
+        )
+        out1, _, _ = simulate_kernel(
+            kernel1, {1: out0, 2: w2_np.flatten(), 3: b2_np}
+        )
+
+        np.testing.assert_array_equal(out1, logits_ref)
+        # Verify we get a valid prediction
+        assert out1.argmax() == logits_ref.argmax()
 
 
 # ---------------------------------------------------------------------------

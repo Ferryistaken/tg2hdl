@@ -1,42 +1,34 @@
 # tg2hdl
 
-Neural network inference accelerators for FPGA deployment.
+A compiler from tinygrad's IR to synthesizable FPGA hardware.
 
-## Overview
+## What it does
 
-Hardware implementation of INT8 GEMV (matrix-vector multiplication) primitives targeting MNIST MLP inference. Uses Amaranth HDL for synthesizable circuit description with bit-accurate NumPy validation.
+You write a neural network in tinygrad. tg2hdl compiles it to an Amaranth HDL module — memories for buffers, an FSM for loop control, and combinational logic for arithmetic. The result simulates cycle-accurately and is ready for synthesis.
 
-## Architecture
+```python
+from compiler import HDLRenderer, compile_kernel, simulate_kernel
+from compiler.backend import _get_uops
 
-**GEMV Unit** (`hdl/gemv.py`)
-- INT8×INT8→INT32 multiply-accumulate
-- FSM control: IDLE → COMPUTE → EMIT → DONE
-- Cycle complexity: O(M×K)
+renderer = HDLRenderer()
+x = Tensor.empty(1, 3, dtype=dtypes.int8)
+w = Tensor.empty(3, 4, dtype=dtypes.int8)
+out = (x @ w).cast(dtypes.int32)
 
-**Target Network**
-- Layer 1: 784→128 (ReLU)
-- Layer 2: 128→10
-- Total MACs: 101,632
+uops = _get_uops(out.schedule()[0].ast, renderer)
+kernel = compile_kernel(uops)
+output, cycles, wall = simulate_kernel(kernel, {1: x_data, 2: w_data})
+```
+
+Multi-kernel models chain by passing each kernel's output as the next kernel's input — a complete 2-layer MLP compiles and simulates correctly today.
 
 ## Quick Start
 
 ```bash
-# Tests
-uv run pytest
-
-# Benchmarks
-uv run python benchmark.py
+uv run pytest                      # 39 tests
+uv run python compare_inference.py # CPU vs HDL MNIST comparison
 ```
-
-## Performance
-
-| Platform | Latency | Efficiency |
-|----------|---------|------------|
-| CPU (NumPy) | 9.6 μs | 1.42 GOPS/W |
-| FPGA 64-MAC @200MHz | 9.1 μs | 14.87 GOPS/W |
-
-FPGA achieves 10× better energy efficiency.
 
 ## Documentation
 
-See [`docs/`](docs/index.rst) for detailed architecture and verification.
+See [`docs/`](docs/index.rst) for architecture, verification, and benchmarks.

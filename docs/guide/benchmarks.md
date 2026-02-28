@@ -1,29 +1,32 @@
 # Benchmarks
 
-**Model:** MNIST MLP (101,632 MACs)
+**Model:** MNIST MLP, 2 layers (784→128 ReLU, 128→10), 101,632 total MACs.
 
-## Key Results
+## Compiler-generated hardware (single-MAC, simulated)
 
-| Platform | Latency | Efficiency |
-|----------|---------|------------|
-| CPU (NumPy) | 9.6 μs | 1.42 GOPS/W |
-| FPGA 64-MAC @200MHz | 9.1 μs | 14.87 GOPS/W |
+The cycle count formula for a compiled GEMV kernel is M×(K+2) — one cycle for acc reset, K cycles for MACs, one cycle for output write — repeated M times.
 
-FPGA achieves 10× better energy efficiency than CPU.
+| Kernel | Dimensions | Cycles | @100 MHz |
+|--------|------------|--------|----------|
+| Layer 1 | 128×784 | 101,504 | ~1.0 ms |
+| Layer 2 | 10×128 | 1,300 | ~13 μs |
+| **Total** | | **~102,800** | **~1.0 ms** |
 
-## Cycle Model
+## Parallelism potential (not yet implemented)
 
-$$T_{\text{cycles}}(N) = M \times (\lceil K/N \rceil + 1) + 1$$
+Enabling tinygrad's `UNROLL` optimization would expose N-wide SIMD in the UOps, allowing N parallel MACs. The cycle count scales as M×(⌈K/N⌉+2).
 
-| MACs | Cycles | @200 MHz |
-|------|--------|----------|
-| 1 | 101,770 | 0.51 ms |
-| 8 | 12,842 | 64.2 μs |
-| 64 | 1,822 | 9.1 μs |
-| 128 | 1,044 | 5.2 μs |
+| MACs | Layer 1 cycles | Layer 2 cycles | Total @200 MHz |
+|------|----------------|----------------|----------------|
+| 1 | 101,504 | 1,300 | ~0.51 ms |
+| 8 | 12,928 | 170 | ~65 μs |
+| 64 | 1,664 | 30 | ~8.5 μs |
+| 128 | 896 | 20 | ~4.6 μs |
 
-## Execution
+## End-to-end comparison
 
 ```bash
-uv run python benchmark.py
+uv run python compare_inference.py
 ```
+
+Runs a single MNIST test image through tinygrad float32 (CPU reference) and through the two compiled kernels (Amaranth simulation, INT8 quantized). Prints predictions, cycle counts, and wall-clock simulation time.

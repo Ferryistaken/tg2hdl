@@ -3,14 +3,32 @@
 CompiledKernel takes analyzed UOp data and builds an FSM-based
 Amaranth module: memories for buffers, counters for loops,
 combinational datapath, and FSM for sequencing.
+
+Three-pass architecture:
+  Pass 0: Create memories (one per DEFINE_GLOBAL buffer)
+  Pass 1: Parse loop structure (UOps → LoopLevel tree)
+  Pass 2: Create counters + build combinational datapath
+  Pass 3: Wire default write ports + build FSM from loop tree
 """
 
 from amaranth.hdl import Elaboratable, Module, Signal, signed, unsigned, Mux, Const, Cat
 from amaranth.lib.memory import Memory
 
-from tinygrad.uop.ops import Ops, AxisType  # noqa: F401
+from typing import List
+from dataclasses import dataclass, field
+
+from tinygrad import UOp
+from tinygrad.uop.ops import Ops, AxisType
 from tinygrad.dtype import AddrSpace
 
+@dataclass
+class LoopLevel:
+  axis_type: AxisType | None  # LOOP, REDUCE, or None (root)
+  bound: int                   # how many iterations (0 for root)
+  counter: UOp | None          # the RANGE uop itself (None for root)
+  prologue: list[UOp]          # ops before inner RANGE (or all ops if innermost)
+  body: LoopLevel | None       # nested level, None if innermost
+  epilogue: list[UOp]          # ops after inner END
 
 class CompiledKernel(Elaboratable):
     """Hardware module generated from tinygrad UOps.
@@ -44,14 +62,12 @@ class CompiledKernel(Elaboratable):
             is_signed = info["is_signed"]
             shape = signed(w) if is_signed else unsigned(w)
 
-            # Every buffer gets an external write port for loading
             self.buf_write_ports[idx] = {
                 "wen": Signal(name=f"buf{idx}_wen"),
                 "waddr": Signal(range(max(depth, 1)), name=f"buf{idx}_waddr"),
                 "wdata": Signal(shape, name=f"buf{idx}_wdata"),
             }
 
-            # Every buffer gets an external read port for inspection
             self.buf_read_ports[idx] = {
                 "raddr": Signal(range(max(depth, 1)), name=f"buf{idx}_raddr"),
                 "rdata": Signal(shape, name=f"buf{idx}_rdata"),
@@ -60,15 +76,34 @@ class CompiledKernel(Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
-        uops = self.uops
-        buf_infos = self.buf_infos
+        # --- Pass 0: Create memories ---
+        memories, int_rports, int_wports = self._create_memories(m)
 
-        # --- Phase 1: Create memories ---
-        memories = {}  # buf_idx → Memory submodule
-        int_rports = {}  # buf_idx → internal read port (comb)
-        int_wports = {}  # buf_idx → internal write port (sync, for output)
+        # --- Pass 1: Parse loop structure ---
+        root = self._parse_loop_structure(self.uops)
 
-        for info in buf_infos:
+        # --- Pass 2: Create counters + build combinational datapath ---
+        counter_map = {}
+        acc = Signal(signed(32), name="acc")
+        self._create_counters(root, counter_map)
+        sig = self._build_datapath(m, self.uops, counter_map, acc, int_rports)
+
+        # --- Pass 3: Wire default write ports + build FSM ---
+        self._wire_default_write_ports(m, int_wports)
+        self._build_fsm(m, root, sig, acc, counter_map, int_wports)
+
+        return m
+
+    # ------------------------------------------------------------------
+    # Pass 0: Memory creation
+    # ------------------------------------------------------------------
+
+    def _create_memories(self, m):
+        memories = {}
+        int_rports = {}
+        int_wports = {}
+
+        for info in self.buf_infos:
             idx = info["idx"]
             depth = info["depth"]
             w = info["elem_width"]
@@ -95,102 +130,100 @@ class CompiledKernel(Elaboratable):
                 ext["rdata"].eq(ext_rp.data),
             ]
 
-        # --- Phase 2: Analyze UOp structure ---
-        # Find loops (RANGE/END pairs)
-        loops = []  # List of (axis_id, axis_type, bound) for each RANGE
-        phases = {}  # UOp → phase string
+        return memories, int_rports, int_wports
+
+    # ------------------------------------------------------------------
+    # Pass 1: Parse loop structure
+    # ------------------------------------------------------------------
+
+    def _parse_loop_structure(self, uops: List[UOp]) -> LoopLevel:
+        """Parse UOps into a LoopLevel tree.
+
+        Returns the root level (axis_type=None). Root's body is the outermost
+        loop, or None for scalar kernels. Pre-loop and post-loop ops are
+        captured in root's prologue/epilogue.
+        """
+        root = LoopLevel(axis_type=None, bound=0, counter=None, prologue=[], body=None,
+  epilogue=[])
+
+        stack = [root]
+        mode_stack = ["before"]
+
+        to_skip = set([
+                Ops.DEFINE_GLOBAL,
+                Ops.DEFINE_REG,
+                Ops.CONST,
+                Ops.SINK,
+                Ops.INDEX
+                ])
 
         for u in uops:
+            if u.op in to_skip:
+                continue
             if u.op == Ops.RANGE:
-                axis_id, axis_type = u.arg
-                bound = u.src[0].arg
-                loops.append((axis_id, axis_type, bound))
+                to_skip -= set([Ops.INDEX])
+                parent = stack[-1]
+                child = LoopLevel(
+                        axis_type = u.arg[1],
+                        bound = u.src[0].arg,
+                        body = None,
+                        counter = u,
+                        epilogue=[],
+                        prologue=[]
+                        )
 
-        # Determine kernel type
-        has_reduce = any(at == AxisType.REDUCE for _, at, _ in loops)
-        loop_bound = loops[0][2] if loops else 0  # bound for simple loop
+                parent.body = child
+                stack.append(child)
 
-        # For GEMV-style kernels
-        outer_bound = 0
-        inner_bound = 0
-        if has_reduce and len(loops) >= 2:
-            outer_bound = loops[0][2]
-            inner_bound = loops[1][2]
-
-        # Assign phases based on kernel type
-        if has_reduce:
-            # GEMV-style: INIT_ROW | COMPUTE | POST
-            current_phase = "SETUP"
-            for u in uops:
-                if u.op == Ops.RANGE:
-                    _, axis_type = u.arg
-                    if axis_type == AxisType.LOOP:
-                        current_phase = "INIT_ROW"
-                    elif axis_type == AxisType.REDUCE:
-                        current_phase = "COMPUTE"
-                    phases[id(u)] = current_phase
-                    continue
-                elif u.op == Ops.END:
-                    phases[id(u)] = current_phase
-                    end_range = u.src[-1]
-                    _, axis_type = end_range.arg
-                    if axis_type == AxisType.REDUCE:
-                        current_phase = "POST"
-                    elif axis_type == AxisType.LOOP:
-                        current_phase = "DONE"
-                    continue
-                elif u.op == Ops.SINK:
-                    phases[id(u)] = "DONE"
-                    continue
-                phases[id(u)] = current_phase
-        elif loops:
-            # Simple element-wise loop: COMPUTE only
-            in_loop = False
-            for u in uops:
-                if u.op == Ops.RANGE:
-                    in_loop = True
-                    phases[id(u)] = "COMPUTE"
-                    continue
-                elif u.op == Ops.END:
-                    phases[id(u)] = "COMPUTE"
-                    in_loop = False
-                    continue
-                elif u.op == Ops.SINK:
-                    phases[id(u)] = "DONE"
-                    continue
-                phases[id(u)] = "COMPUTE" if in_loop else "SETUP"
-        else:
-            # Scalar kernel (no loops at all): everything is COMPUTE
-            for u in uops:
-                if u.op == Ops.SINK:
-                    phases[id(u)] = "DONE"
+                mode_stack.append("before")
+            elif u.op == Ops.END:
+                stack.pop()
+                mode_stack.pop()
+                if mode_stack:
+                    mode_stack[-1] = "after"
+            else:
+                cur = stack[-1]
+                mode = mode_stack[-1]
+                if mode == "before":
+                    cur.prologue.append(u)
                 else:
-                    phases[id(u)] = "COMPUTE"
+                    cur.epilogue.append(u)
 
-        # --- Phase 3: Create signals ---
-        # Counter signal for loop
-        loop_ctr = Signal(range(max(loop_bound, 1)), name="loop_ctr")
+        return root
 
-        # For GEMV-style kernels
-        outer_ctr = Signal(range(max(outer_bound, 1)), name="outer_ctr")
-        inner_ctr = Signal(range(max(inner_bound, 1)), name="inner_ctr")
+    # ------------------------------------------------------------------
+    # Pass 2a: Create counter signals from loop tree
+    # ------------------------------------------------------------------
 
-        # Accumulator (only needed for reductions)
-        acc = Signal(signed(32), name="acc")
+    def _create_counters(self, root, counter_map):
+        """Walk loop tree, create a counter Signal for each RANGE level."""
+        level = root.body
+        d = 0
+        while level is not None:
+            ctr = Signal(range(max(level.bound, 1)), name=f"ctr_L{d}")
+            counter_map[id(level.counter)] = ctr
+            level = level.body
+            d += 1
 
-        # Signal map: UOp → Amaranth Signal/Value
+    # ------------------------------------------------------------------
+    # Pass 2b: Build combinational datapath
+    # ------------------------------------------------------------------
+
+    def _build_datapath(self, m, uops, counter_map, acc, int_rports):
+        """Build combinational datapath from UOps.
+
+        Returns sig dict mapping id(uop) → Amaranth Signal/Value.
+        STORE ops map to None — they are resolved at FSM build time.
+        """
         sig = {}
+        buf_infos = self.buf_infos
 
-        # --- Phase 4: Build combinational datapath ---
-        # Walk all UOps and create their signal equivalents
         for u in uops:
             if u.op == Ops.DEFINE_GLOBAL:
-                # Buffer pointer — no signal needed, handled by memory
                 sig[id(u)] = None
                 continue
 
             elif u.op == Ops.DEFINE_REG:
-                # Register file — maps to accumulator
                 sig[id(u)] = acc
                 continue
 
@@ -199,30 +232,19 @@ class CompiledKernel(Elaboratable):
                 continue
 
             elif u.op == Ops.RANGE:
-                # Loop variable — maps to counter
-                _, axis_type = u.arg
-                if not has_reduce:
-                    # Simple loop
-                    sig[id(u)] = loop_ctr
-                elif axis_type == AxisType.LOOP:
-                    sig[id(u)] = outer_ctr
-                else:
-                    sig[id(u)] = inner_ctr
+                sig[id(u)] = counter_map[id(u)]
                 continue
 
             elif u.op == Ops.AFTER:
-                # Ordering barrier — pass through first src
                 sig[id(u)] = sig.get(id(u.src[0]))
                 continue
 
             elif u.op == Ops.INDEX:
-                # Address computation
                 buf_ptr = u.src[0]
                 offset = u.src[1]
 
-                # Check if this indexes into a REG
+                # Register index
                 if hasattr(u.dtype, "addrspace") and u.dtype.addrspace == AddrSpace.REG:
-                    # Register index — just reference the accumulator
                     sig[id(u)] = acc
                     continue
 
@@ -230,7 +252,6 @@ class CompiledKernel(Elaboratable):
                 buf_idx = self._find_buf_idx(buf_ptr, uops)
                 offset_sig = self._to_signal(m, sig, offset, f"idx_{buf_idx}")
 
-                # Create a signal for the computed address
                 depth = 1
                 for info in buf_infos:
                     if info["idx"] == buf_idx:
@@ -241,7 +262,6 @@ class CompiledKernel(Elaboratable):
                 )
                 m.d.comb += addr_sig.eq(offset_sig)
 
-                # Store (buf_idx, addr_sig) tuple
                 sig[id(u)] = ("index", buf_idx, addr_sig)
                 continue
 
@@ -249,7 +269,6 @@ class CompiledKernel(Elaboratable):
                 index_info = sig.get(id(u.src[0]))
 
                 if index_info is acc or (not isinstance(index_info, tuple)):
-                    # Load from register → just use accumulator value
                     sig[id(u)] = acc
                     continue
 
@@ -257,11 +276,8 @@ class CompiledKernel(Elaboratable):
                 _, buf_idx, addr_sig = index_info
                 rp = int_rports[buf_idx]
 
-                # Wire address (will be overwritten if multiple loads use same port,
-                # but Amaranth handles last-writer-wins in comb domain)
                 m.d.comb += rp.addr.eq(addr_sig)
 
-                # Create a signal for the loaded value
                 info = next(i for i in buf_infos if i["idx"] == buf_idx)
                 w = info["elem_width"]
                 is_signed = info["is_signed"]
@@ -272,24 +288,13 @@ class CompiledKernel(Elaboratable):
                 continue
 
             elif u.op == Ops.STORE:
-                # Stores are handled by the FSM (sequential)
-                # Just record what value goes where
-                index_info = sig.get(id(u.src[0]))
-                value = self._to_signal(m, sig, u.src[1], f"store_val_{id(u) % 10000}")
-
-                if index_info is acc or (not isinstance(index_info, tuple)):
-                    # Store to register (accumulator)
-                    sig[id(u)] = ("store_reg", value)
-                else:
-                    # Store to memory
-                    _, buf_idx, addr_sig = index_info
-                    sig[id(u)] = ("store_mem", buf_idx, addr_sig, value)
+                # Stores are resolved at FSM build time
+                sig[id(u)] = None
                 continue
 
             elif u.op == Ops.MUL:
                 a = self._to_signal(m, sig, u.src[0], f"mul_a_{id(u) % 10000}")
                 b = self._to_signal(m, sig, u.src[1], f"mul_b_{id(u) % 10000}")
-                # Determine result width from dtype
                 w, is_s = self._dtype_to_width(u.dtype)
                 shape = signed(w) if is_s else unsigned(w)
                 result = Signal(shape, name=f"mul_{id(u) % 10000}")
@@ -352,169 +357,166 @@ class CompiledKernel(Elaboratable):
                 continue
 
             else:
-                # Unknown op — skip with a warning
                 sig[id(u)] = None
                 continue
 
-        # --- Phase 5: Build FSM ---
-        # Collect stores by phase
-        init_row_stores = []  # (target, value) for accumulator resets
-        compute_stores = []  # (target, value) for MAC updates
-        post_stores = []  # (buf_idx, addr, value) for output writes
-        loop_stores = []  # (buf_idx, addr, value) for simple loop stores
+        return sig
 
-        for u in uops:
-            if u.op != Ops.STORE:
-                continue
-            phase = phases.get(id(u), "SETUP")
-            store_info = sig.get(id(u))
-            if store_info is None:
-                continue
+    # ------------------------------------------------------------------
+    # Pass 3a: Wire default write ports (external loading)
+    # ------------------------------------------------------------------
 
-            if isinstance(store_info, tuple) and store_info[0] == "store_reg":
-                _, value = store_info
-                if phase == "INIT_ROW":
-                    init_row_stores.append(value)
-                elif phase == "COMPUTE":
-                    compute_stores.append(value)
-            elif isinstance(store_info, tuple) and store_info[0] == "store_mem":
-                _, buf_idx, addr_sig, value = store_info
-                if phase == "POST":
-                    post_stores.append((buf_idx, addr_sig, value))
-                elif phase == "COMPUTE" and not has_reduce:
-                    # Element-wise (looped or scalar): store in COMPUTE phase
-                    loop_stores.append((buf_idx, addr_sig, value))
+    def _wire_default_write_ports(self, m, int_wports):
+        """Wire external write ports as default drivers for memory write ports.
 
-        # Default: wire external write ports when not computing
-        # During computation, output memory write is controlled by FSM
-        output_buf_idxs = {s[0] for s in post_stores} | {s[0] for s in loop_stores}
-
-        for info in buf_infos:
+        FSM states override these with m.d.comb assignments when writing output.
+        """
+        for info in self.buf_infos:
             idx = info["idx"]
             wp = int_wports[idx]
             ext = self.buf_write_ports[idx]
+            m.d.comb += [
+                wp.addr.eq(ext["waddr"]),
+                wp.data.eq(ext["wdata"]),
+                wp.en.eq(ext["wen"]),
+            ]
 
-            if idx in output_buf_idxs:
-                # Output buffer: FSM controls writes during POST,
-                # external port controls during IDLE
-                # Default to external (overridden in FSM states)
-                m.d.comb += [
-                    wp.addr.eq(ext["waddr"]),
-                    wp.data.eq(ext["wdata"]),
-                    wp.en.eq(ext["wen"]),
-                ]
-            else:
-                # Input buffer: always externally controlled
-                m.d.comb += [
-                    wp.addr.eq(ext["waddr"]),
-                    wp.data.eq(ext["wdata"]),
-                    wp.en.eq(ext["wen"]),
-                ]
+    # ------------------------------------------------------------------
+    # Pass 3b: Build FSM from loop tree
+    # ------------------------------------------------------------------
 
-        # Build FSM
-        if not loops:
-            # Scalar kernel (no loops): single-cycle compute
-            with m.FSM(init="IDLE"):
-                with m.State("IDLE"):
-                    with m.If(self.start):
-                        m.next = "COMPUTE"
+    def _build_fsm(self, m, root, sig, acc, counter_map, int_wports):
+        """Build FSM that sequences stores according to the loop structure.
 
-                with m.State("COMPUTE"):
-                    m.d.comb += self.busy.eq(1)
+        State naming:
+          IDLE         — wait for start
+          L{d}_PRO     — non-innermost level prologue (e.g. acc reset)
+          L{d}_BODY    — innermost level body (e.g. MAC)
+          L{d}_EPI     — non-innermost level epilogue (e.g. output write)
 
-                    for buf_idx, addr_sig, value in loop_stores:
-                        wp = int_wports[buf_idx]
-                        m.d.comb += [
-                            wp.en.eq(1),
-                            wp.addr.eq(addr_sig),
-                            wp.data.eq(value),
-                        ]
+        Done signal is registered (m.d.sync) and set in the last compute
+        state when the outermost counter reaches its bound.
+        """
+        # Flatten loop levels
+        levels = []  # [(LoopLevel, depth)]
+        level = root.body
+        d = 0
+        while level is not None:
+            levels.append((level, d))
+            level = level.body
+            d += 1
 
-                    m.next = "DONE"
+        # Root-level stores (for scalar kernels with no loops)
+        root_stores = [u for u in root.prologue + root.epilogue if u.op == Ops.STORE]
 
-                with m.State("DONE"):
-                    m.d.comb += self.done.eq(1)
-                    m.next = "IDLE"
+        if not levels:
+            self._build_scalar_fsm(m, root_stores, sig, acc, int_wports)
+            return
 
-        elif not has_reduce:
-            # Simple element-wise loop FSM
-            with m.FSM(init="IDLE"):
-                with m.State("IDLE"):
-                    with m.If(self.start):
-                        m.d.sync += loop_ctr.eq(0)
-                        m.next = "COMPUTE"
-
-                with m.State("COMPUTE"):
-                    m.d.comb += self.busy.eq(1)
-
-                    # Write results to output memory
-                    for buf_idx, addr_sig, value in loop_stores:
-                        wp = int_wports[buf_idx]
-                        m.d.comb += [
-                            wp.en.eq(1),
-                            wp.addr.eq(addr_sig),
-                            wp.data.eq(value),
-                        ]
-
-                    with m.If(loop_ctr == loop_bound - 1):
-                        m.next = "DONE"
-                    with m.Else():
-                        m.d.sync += loop_ctr.eq(loop_ctr + 1)
-
-                with m.State("DONE"):
-                    m.d.comb += self.done.eq(1)
-                    m.next = "IDLE"
+        # Determine first state after IDLE
+        if levels[0][0].body is None:
+            first_state = "L0_BODY"
         else:
-            # GEMV-style kernel FSM
-            with m.FSM(init="IDLE"):
-                with m.State("IDLE"):
-                    with m.If(self.start):
-                        m.d.sync += [
-                            outer_ctr.eq(0),
-                            inner_ctr.eq(0),
-                            acc.eq(0),
-                        ]
-                        m.next = "INIT_ROW"
+            first_state = "L0_PRO"
 
-                with m.State("INIT_ROW"):
-                    m.d.comb += self.busy.eq(1)
-                    m.d.sync += acc.eq(0)
-                    m.d.sync += inner_ctr.eq(0)
-                    m.next = "COMPUTE"
+        with m.FSM(init="IDLE"):
+            with m.State("IDLE"):
+                m.d.sync += self.done.eq(0)
+                with m.If(self.start):
+                    ctr = counter_map[id(levels[0][0].counter)]
+                    m.d.sync += ctr.eq(0)
+                    m.next = first_state
 
-                with m.State("COMPUTE"):
-                    m.d.comb += self.busy.eq(1)
+            for i, (level, d) in enumerate(levels):
+                is_innermost = (level.body is None)
+                pro_stores = [u for u in level.prologue if u.op == Ops.STORE]
+                epi_stores = [u for u in level.epilogue if u.op == Ops.STORE]
+                ctr = counter_map[id(level.counter)]
 
-                    if compute_stores:
-                        m.d.sync += acc.eq(compute_stores[-1])
+                if is_innermost:
+                    with m.State(f"L{d}_BODY"):
+                        self._emit_stores(m, sig, pro_stores, acc, int_wports)
+                        with m.If(ctr == level.bound - 1):
+                            if d > 0:
+                                m.next = f"L{d-1}_EPI"
+                            else:
+                                # Single-level loop, outermost is innermost
+                                m.d.sync += self.done.eq(1)
+                                m.next = "IDLE"
+                        with m.Else():
+                            m.d.sync += ctr.eq(ctr + 1)
+                            m.next = f"L{d}_BODY"
+                else:
+                    # Non-innermost: PRO and EPI states
+                    child_level, child_d = levels[i + 1]
+                    if child_level.body is None:
+                        child_first = f"L{child_d}_BODY"
+                    else:
+                        child_first = f"L{child_d}_PRO"
 
-                    with m.If(inner_ctr == inner_bound - 1):
-                        m.next = "POST"
-                    with m.Else():
-                        m.d.sync += inner_ctr.eq(inner_ctr + 1)
+                    with m.State(f"L{d}_PRO"):
+                        self._emit_stores(m, sig, pro_stores, acc, int_wports)
+                        child_ctr = counter_map[id(child_level.counter)]
+                        m.d.sync += child_ctr.eq(0)
+                        m.next = child_first
 
-                with m.State("POST"):
-                    m.d.comb += self.busy.eq(1)
+                    with m.State(f"L{d}_EPI"):
+                        self._emit_stores(m, sig, epi_stores, acc, int_wports)
+                        with m.If(ctr == level.bound - 1):
+                            if d > 0:
+                                m.next = f"L{d-1}_EPI"
+                            else:
+                                m.d.sync += self.done.eq(1)
+                                m.next = "IDLE"
+                        with m.Else():
+                            m.d.sync += ctr.eq(ctr + 1)
+                            m.next = f"L{d}_PRO"
 
-                    for buf_idx, addr_sig, value in post_stores:
-                        wp = int_wports[buf_idx]
-                        m.d.comb += [
-                            wp.en.eq(1),
-                            wp.addr.eq(addr_sig),
-                            wp.data.eq(value),
-                        ]
+    def _build_scalar_fsm(self, m, stores, sig, acc, int_wports):
+        """FSM for scalar kernels (no loops). One compute cycle."""
+        with m.FSM(init="IDLE"):
+            with m.State("IDLE"):
+                m.d.sync += self.done.eq(0)
+                with m.If(self.start):
+                    m.next = "SCALAR"
+            with m.State("SCALAR"):
+                self._emit_stores(m, sig, stores, acc, int_wports)
+                m.d.sync += self.done.eq(1)
+                m.next = "IDLE"
 
-                    with m.If(outer_ctr == outer_bound - 1):
-                        m.next = "DONE"
-                    with m.Else():
-                        m.d.sync += outer_ctr.eq(outer_ctr + 1)
-                        m.next = "INIT_ROW"
+    # ------------------------------------------------------------------
+    # Store emission helper
+    # ------------------------------------------------------------------
 
-                with m.State("DONE"):
-                    m.d.comb += self.done.eq(1)
-                    m.next = "IDLE"
+    def _emit_stores(self, m, sig, stores, acc, int_wports):
+        """Emit STORE ops within the current FSM state context.
 
-        return m
+        Resolves store targets by looking up sig[id(store.src[0])]:
+          - If target is acc (register) → m.d.sync += acc.eq(value)
+          - If target is ("index", buf_idx, addr) → memory write via comb override
+        """
+        for store_uop in stores:
+            index_info = sig.get(id(store_uop.src[0]))
+            value_sig = self._to_signal(
+                m, sig, store_uop.src[1], f"sv_{id(store_uop) % 10000}"
+            )
+
+            if index_info is acc:
+                # Register store (accumulator update)
+                m.d.sync += acc.eq(value_sig)
+            elif isinstance(index_info, tuple) and index_info[0] == "index":
+                # Memory store — override default write port wiring
+                _, buf_idx, addr_sig = index_info
+                wp = int_wports[buf_idx]
+                m.d.comb += [
+                    wp.addr.eq(addr_sig),
+                    wp.data.eq(value_sig),
+                    wp.en.eq(1),
+                ]
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
     def _find_buf_idx(self, ptr_uop, uops):
         """Walk through AFTER chains to find the DEFINE_GLOBAL buffer index."""
