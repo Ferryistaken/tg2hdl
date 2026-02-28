@@ -1,7 +1,7 @@
 tg2hdl
 ======
 
-INT8 GEMV accelerators for FPGA-based neural network inference.
+A compiler from tinygrad's IR to synthesizable FPGA hardware.
 
 .. toctree::
    :maxdepth: 1

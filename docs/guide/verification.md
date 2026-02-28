@@ -2,20 +2,7 @@
 
 Amaranth cycle-accurate simulation against NumPy ground truth. All numeric results are compared at the bit level — the numpy references model INT8 truncation at every intermediate step to match UOp semantics exactly.
 
-## Test suite (39 tests)
-
-### Manual GEMV unit (`tests/test_gemv.py`)
-
-| Test | Dimensions | Validates |
-|------|------------|-----------|
-| `test_2x2` | 2×2 | Minimal case |
-| `test_4x3` | 4×3 | Non-square |
-| `test_negative_values` | 2×2 | Signed INT8 |
-| `test_identity` | 3×3 | Identity matrix |
-| `test_single_element` | 1×1 | Edge case |
-| `test_random_8x16` | 8×16 | Random INT8 |
-| `test_kernel1_10x128` | 10×128 | MNIST layer 2 dimensions |
-| `test_cycle_count_4x3` | 4×3 | M×(K+1)+1 timing model |
+## Test suite
 
 ### Compiler — structure (`tests/test_compiler.py`)
 
@@ -46,7 +33,8 @@ Amaranth cycle-accurate simulation against NumPy ground truth. All numeric resul
 ## Running tests
 
 ```bash
-uv run pytest                      # full suite (39 tests)
-uv run pytest -k "not slow"        # skip MNIST shape test
-uv run pytest tests/test_compiler.py -v   # compiler only
+uv run pytest                                  # full suite
+uv run pytest -k "not slow"                    # skip MNIST shape test
+uv run pytest tests/test_compiler.py -v        # compiler only
+uv run pytest tests/test_compiler.py tests/test_combined.py -v   # compiler + elementwise
 ```
