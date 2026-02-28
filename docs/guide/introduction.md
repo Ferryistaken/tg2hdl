@@ -12,8 +12,7 @@ The compiler operates on tinygrad's linearized UOps — the same IR tinygrad use
 |------|------|
 | `compiler/backend.py` | `HDLRenderer`, `compile_kernel`, `simulate_kernel` |
 | `compiler/hdl_module.py` | `CompiledKernel` — three-pass Amaranth Elaboratable |
-| `hdl/gemv.py` | Manual INT8 GEMV unit (reference implementation) |
-| `hdl/relu.py` | Combinational ReLU (reference) |
+| `compiler/utils.py` | `pretty_print_uops` — UOp inspection helper |
 | `tests/test_compiler.py` | Compiler unit and simulation tests |
 | `tests/test_combined.py` | Elementwise fusion tests |
 | `compare_inference.py` | End-to-end MNIST: CPU float32 vs compiler INT8 |

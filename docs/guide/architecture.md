@@ -100,10 +100,6 @@ L{d}_EPI  (non-innermost levels)
 | Elementwise (single LOOP, bound N) | IDLE → L0_BODY × N → IDLE | N |
 | GEMV (LOOP M, REDUCE K) | IDLE → (L0_PRO + L1_BODY×K + L0_EPI) × M → IDLE | M×(K+2) |
 
-## Reference implementation (`hdl/gemv.py`)
-
-The manual `GEMVUnit` predates the compiler and uses a fixed FSM (IDLE → COMPUTE → EMIT → DONE) hardcoded for the GEMV pattern. Its cycle count is M×(K+1)+1. The compiler generates a comparable structure generically from UOps.
-
 ## Overflow analysis
 
 $$\max(\text{acc}) = K \times 127^2 = K \times 16{,}129$$

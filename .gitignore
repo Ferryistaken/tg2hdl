@@ -6,6 +6,7 @@
 notes/
 books/
 scratch/
+*.vcd
 
 ### Python ###
 # Byte-compiled / optimized / DLL files
