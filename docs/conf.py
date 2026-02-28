@@ -12,7 +12,6 @@ extensions = [
     'myst_parser',
     'sphinx.ext.autodoc',
     'sphinx.ext.napoleon',
-    'sphinx.ext.viewcode',
 ]
 
 templates_path = ['_templates']
@@ -36,3 +35,6 @@ myst_enable_extensions = [
 ]
 
 html_css_files = ['custom.css']
+
+html_copy_source = False
+html_show_sourcelink = False
