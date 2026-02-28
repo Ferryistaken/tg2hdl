@@ -1,68 +1,48 @@
 # Introduction
 
-## Project goal
+## What is tg2hdl?
 
-`tg2hdl` explores a practical question: **can we take neural-network math from tinygrad and map it to a hardware-friendly datapath?**
+tg2hdl is a compiler from tinygrad's IR to synthesizable FPGA hardware. You describe a neural network in tinygrad; tg2hdl compiles it to an Amaranth HDL module that simulates cycle-accurately and can be synthesized to an FPGA.
 
-The current focus is intentionally narrow and concrete:
+The compiler operates on tinygrad's linearized UOps — the same IR tinygrad uses to emit GPU kernels — and maps each op to hardware: memories, combinational arithmetic, and an FSM sequencer.
 
-- a tiny 2-layer MNIST MLP,
-- the key matrix-vector kernels in that model,
-- and a sequential INT8 GEMV implementation in Amaranth HDL.
+## Components
 
-This repo is a prototype to validate correctness, interfaces, and timing behavior before bigger steps like kernel auto-generation and parallel MAC architectures.
+| Path | Role |
+|------|------|
+| `compiler/backend.py` | `HDLRenderer`, `compile_kernel`, `simulate_kernel` |
+| `compiler/hdl_module.py` | `CompiledKernel` — three-pass Amaranth Elaboratable |
+| `hdl/gemv.py` | Manual INT8 GEMV unit (reference implementation) |
+| `hdl/relu.py` | Combinational ReLU (reference) |
+| `tests/test_compiler.py` | Compiler unit and simulation tests |
+| `tests/test_combined.py` | Elementwise fusion tests |
+| `compare_inference.py` | End-to-end MNIST: CPU float32 vs compiler INT8 |
 
-## End-to-end flow today
+## Workflow
 
-At a high level, the workflow is:
+```
+tinygrad model
+    │ .schedule()
+    ▼
+list[ExecItem]
+    │ compile_kernel() per SINK item
+    ▼
+list[CompiledKernel]   (Amaranth Elaboratables)
+    │ simulate_kernel()
+    ▼
+numpy outputs + cycle counts
+```
 
-1. Build / inspect a tinygrad model and identify kernel shapes (`inspect_kernels.py`).
-2. Train and export model parameters (`train_mnist.py` → `mnist_weights.safetensors`).
-3. Implement hardware building blocks in Amaranth (`hdl/gemv.py`, `hdl/relu.py`).
-4. Validate behavior cycle-by-cycle in simulation (`tests/test_gemv.py`).
+## Status
 
-The current hardware primitive is GEMV because the model is run with batch size 1, so matrix multiplications collapse to matrix-vector products.
+| Capability | Status |
+|------------|--------|
+| Generic kernel compilation | ✅ |
+| Scalar / elementwise / GEMV patterns | ✅ |
+| Fused multi-op kernels (matmul + bias + relu) | ✅ |
+| Multi-kernel simulation (Python-chained) | ✅ sim only — see note below |
+| Multi-kernel hardware (shared memories, sequenced FSMs) | Planned |
+| Multi-MAC parallelism (UNROLL) | Planned |
+| FPGA synthesis | Planned |
 
-## Is this auto-generated from Python today?
-
-**Partially, but not end-to-end auto-generated yet.**
-
-- tinygrad is used in Python to define/inspect model compute and kernel structure.
-- Amaranth is also Python, but the HDL module (`GEMVUnit`) is currently **hand-authored**.
-- Tests compare the hardware simulation output against NumPy reference math for correctness.
-
-So the project already has Python at every stage, but there is **not yet** an automatic compiler pass that converts tinygrad kernel IR directly into Amaranth modules. That is a planned direction.
-
-## What exists now vs. what is planned
-
-### Implemented now
-
-- Sequential single-MAC GEMV with INT8 × INT8 multiply and INT32 accumulation.
-- FSM-driven control (`IDLE → COMPUTE → EMIT → DONE`).
-- Deterministic and randomized simulation tests, including timing checks.
-
-### Planned next
-
-- Multi-MAC parallelization.
-- Bias and activation chaining for fuller layer execution.
-- Better handling of larger kernel dimensions.
-- **Auto-generation from tinygrad kernel IR to hardware templates**.
-
-## Why this shape is valuable
-
-This incremental structure keeps risk low:
-
-- validate numeric behavior early,
-- make cycle costs explicit,
-- and keep hardware/software assumptions transparent.
-
-In short, this repo is the bridge between model-kernel understanding and hardware realization, with correctness-first tooling to support iteration.
-
-## Are these docs auto-generated from Python docstrings?
-
-Partially. Guides are hand-written, and API reference pages are auto-generated with **Sphinx autodoc**.
-
-- Narrative pages in `docs/guide/*.md` are written manually.
-- `docs/guide/api-reference.md` renders API docs from Python modules/docstrings automatically via `automodule`.
-- This gives both high-level explainers and synchronized code-level reference.
-
+**Multi-kernel note:** `compile_model()` (`backend.py:143`) compiles each schedule item into an independent `CompiledKernel` with its own private memories. There is no top-level hardware module that wires kernel 0's output memory to kernel 1's input memory or sequences their FSMs. In simulation, `compare_inference.py` bridges the gap by reading kernel 0's output via `buf_read_ports` and writing it into kernel 1's input via `buf_write_ports` — i.e. the Python host acts as the DMA controller. On real hardware, this would require a top-level module that shares BRAMs between kernels and chains their `done`/`start` signals.

@@ -1,28 +1,34 @@
 # tg2hdl
 
-A tinygrad-to-hardware exploration centered on an INT8 GEMV unit in Amaranth.
+A compiler from tinygrad's IR to synthesizable FPGA hardware.
+
+## What it does
+
+You write a neural network in tinygrad. tg2hdl compiles it to an Amaranth HDL module — memories for buffers, an FSM for loop control, and combinational logic for arithmetic. The result simulates cycle-accurately and is ready for synthesis.
+
+```python
+from compiler import HDLRenderer, compile_kernel, simulate_kernel
+from compiler.backend import _get_uops
+
+renderer = HDLRenderer()
+x = Tensor.empty(1, 3, dtype=dtypes.int8)
+w = Tensor.empty(3, 4, dtype=dtypes.int8)
+out = (x @ w).cast(dtypes.int32)
+
+uops = _get_uops(out.schedule()[0].ast, renderer)
+kernel = compile_kernel(uops)
+output, cycles, wall = simulate_kernel(kernel, {1: x_data, 2: w_data})
+```
+
+Multi-kernel models chain by passing each kernel's output as the next kernel's input — a complete 2-layer MLP compiles and simulates correctly today.
+
+## Quick Start
+
+```bash
+uv run pytest                      # 39 tests
+uv run python compare_inference.py # CPU vs HDL MNIST comparison
+```
 
 ## Documentation
 
-Docs use **Sphinx + Furo** with automatic API reference generation from Python docstrings (`autodoc`).
-
-### Build locally
-
-```bash
-uv sync
-uv run sphinx-build -b dirhtml docs docs/_build/dirhtml
-```
-
-### Preview locally
-
-```bash
-python -m http.server 4173 -d docs/_build/dirhtml
-```
-
-Open `http://localhost:4173`.
-
-### Deployment
-
-- GitHub Pages: `.github/workflows/docs-gh-pages.yml`
-- Netlify: `netlify.toml`
-- Detailed guide: `docs/guide/deployment.md`
+See [`docs/`](docs/index.rst) for architecture, verification, and benchmarks.

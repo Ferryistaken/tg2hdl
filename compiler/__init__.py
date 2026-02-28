@@ -10,3 +10,5 @@ Public API:
 
 from .backend import HDLRenderer, compile_kernel, compile_model, simulate_kernel, quantize_int8
 from .hdl_module import CompiledKernel
+
+from .utils import pretty_print_uops
