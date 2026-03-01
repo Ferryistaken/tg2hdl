@@ -4,7 +4,7 @@ This guide shows how to benchmark any tinygrad computation against the
 HDL compiler's simulation.  It covers:
 
 - **Integer (int8/int16/int32)** — full Amaranth simulation, bit-exact results
-- **Float (float16/float32)** — structural HDL, cycle count from loop analysis
+- **Float32** — full Amaranth simulation with IEEE 754 hardware modules, `rtol=1e-5`
 - How to write your own benchmark
 - How to interpret the output
 - Advanced: multi-kernel chaining, TopModule, quantization workflow
@@ -133,17 +133,17 @@ result = run_bench(
 
 ## Float Models
 
-The HDL compiler is **dtype-agnostic**: it emits HDL signals with widths
-matching any dtype (float16 = 16 bits, float32 = 32 bits, etc.).
+The HDL compiler supports **float32** natively via dedicated IEEE 754 hardware
+modules (`FP32Add`, `FP32Mul`, `FP32Cmp`) that produce bit-accurate results in
+both Amaranth simulation and synthesis.  Float32 benchmarks use the same
+hardware simulation path as integer benchmarks — `result.float_path` is always
+`False`.
 
-However, Amaranth's simulation computes with Python integers, so float
-arithmetic inside the FSM is not IEEE 754-accurate.  For float inputs,
-the harness uses a **software float path**:
-
-1. Compile the graph to HDL to verify it structurally parses (no errors).
-2. Count cycles analytically from the UOp loop structure.
-3. Use tinygrad CPU for the output (numerically correct).
-4. Report `correct=True` and `float_path=True`.
+```
+result.float_path == False   (always — no software fallback)
+result.correct    == True    (IEEE 754 result matches tinygrad CPU within rtol=1e-5)
+result.hdl_cycles > 0        (real hardware cycle count, not analytical)
+```
 
 ### Example — float32 model
 
@@ -153,15 +153,23 @@ result = run_bench(
     lambda t: t[0].relu(),
     [rng.randn(64).astype(np.float32)],
 )
-# result.float_path == True
-# result.hdl_cycles == analytically counted (e.g., 65)
-# result.correct    == True (tinygrad CPU reference)
-print(result)
+assert not result.float_path   # uses hardware sim, not software fallback
+assert result.correct          # IEEE 754 result within rtol=1e-5
+print(f"Cycles: {result.hdl_cycles}")
 ```
 
-### When you want bit-accurate float simulation
+### Float32 limitations
 
-Quantize your model to int8 first:
+- Subnormal numbers flush to zero.
+- Rounding is truncation (round-toward-zero), not IEEE default round-to-nearest-even.
+- Float16 / BFloat16 arithmetic is **not supported** — these dtypes have no
+  dedicated hardware units and will raise `NotImplementedError` at compile time
+  for any arithmetic op.
+
+### When you need quantized integer inference
+
+Quantize your model to int8 first — this gives bit-exact simulation and much
+better simulation throughput:
 
 ```python
 from utils import quantize_int8, dequantize
@@ -212,11 +220,13 @@ per kernel.  Large kernels (MNIST 784→128) take minutes to simulate.
 
 ### `result.correct` and `result.max_abs_error`
 
-For integer paths, `correct=True` means the HDL output is **bit-identical**
+For **integer** paths, `correct=True` means the HDL output is **bit-identical**
 to tinygrad CPU.  A non-zero `max_abs_error` indicates a logic bug.
 
-For float paths (`float_path=True`), `correct=True` always because the float
-path uses tinygrad CPU as the HDL output.
+For **float32** paths, `correct=True` means the IEEE 754 hardware simulation
+result matches tinygrad CPU within `rtol=1e-5, atol=1e-6`.  A small non-zero
+`max_abs_error` is normal (rounding differences); a large error indicates a
+hardware module bug.
 
 ---
 

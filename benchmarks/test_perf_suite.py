@@ -256,15 +256,15 @@ def test_perf_08_mlp_2layer_medium():
     ),
 ])
 def test_perf_09_float32_path(op_name, build_fn, arrays):
-    """Float32 workloads — analytical cycle count, tinygrad CPU output.
+    """Float32 workloads — full Amaranth hardware simulation with IEEE 754 FP units.
 
-    The harness uses the float path automatically when input arrays are float.
-    Correctness is always True (both paths use tinygrad CPU).
-    Cycle count is estimated analytically from UOp loop structure.
+    The harness now runs float32 through real Amaranth simulation using the
+    FP32Add / FP32Mul / FP32Cmp modules, giving bit-accurate IEEE 754 results.
+    Correctness is verified against tinygrad CPU with rtol=1e-5.
     """
     r = run_bench(op_name, build_fn, arrays)
-    assert r.float_path, "Expected float-analytical path for float32 inputs"
-    assert r.correct, f"Float path should always be correct; got {r}"
+    assert not r.float_path, "Float32 should now use hardware simulation, not analytical path"
+    assert r.correct, f"IEEE 754 simulation should match CPU reference; got {r}"
     assert r.hdl_cycles > 0, "Cycle count must be positive"
     _report(r)
 

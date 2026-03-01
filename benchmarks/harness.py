@@ -35,7 +35,6 @@ from tinygrad.uop.ops import Ops
 from compiler.backend import (
     compile_model,
     simulate_kernel,
-    count_cycles_from_schedule,
 )
 
 
@@ -123,20 +122,17 @@ def run_bench(name: str, build_fn, input_arrays: list, exact: bool = True) -> Be
     BenchResult
     """
     # ------------------------------------------------------------------
-    # 1. Determine execution path based on input dtypes
-    # ------------------------------------------------------------------
-    use_float_path = any(_is_float(a) for a in input_arrays)
-
-    # ------------------------------------------------------------------
-    # 2. tinygrad CPU reference
+    # 1. tinygrad CPU reference
     # ------------------------------------------------------------------
     t0 = time.perf_counter()
     ref_tensors = [Tensor(a) for a in input_arrays]
     ref_out = build_fn(ref_tensors).numpy().flatten()
     tg_wall = time.perf_counter() - t0
 
+    is_float_output = np.issubdtype(ref_out.dtype, np.floating)
+
     # ------------------------------------------------------------------
-    # 3. Build symbolic graph and compile
+    # 2. Build symbolic graph and compile
     # ------------------------------------------------------------------
     syms = [Tensor.empty(a.shape, dtype=Tensor(a).dtype) for a in input_arrays]
     out_sym = build_fn(syms)
@@ -146,27 +142,7 @@ def run_bench(name: str, build_fn, input_arrays: list, exact: bool = True) -> Be
     kernel_specs = compile_model(schedule)
 
     # ------------------------------------------------------------------
-    # 4. Float path: analytical cycle count, tinygrad CPU as "HDL" output
-    # ------------------------------------------------------------------
-    if use_float_path:
-        total_cycles = count_cycles_from_schedule(schedule)
-        hdl_out = ref_out.copy()
-        max_err = 0.0
-        correct = True
-        return BenchResult(
-            name=name,
-            correct=correct,
-            max_abs_error=max_err,
-            hdl_cycles=total_cycles,
-            sim_wall_s=0.0,
-            tg_wall_s=tg_wall,
-            float_path=True,
-            output_hdl=hdl_out,
-            output_ref=ref_out,
-        )
-
-    # ------------------------------------------------------------------
-    # 5. Integer path: Amaranth simulation
+    # 3. Amaranth simulation (integer and float32 paths both go through here)
     # ------------------------------------------------------------------
     connections, external_slots = _detect_connections(compute_items)
 
@@ -195,22 +171,41 @@ def run_bench(name: str, build_fn, input_arrays: list, exact: bool = True) -> Be
     sim_wall = time.perf_counter() - t0
 
     # ------------------------------------------------------------------
-    # 6. Compare
+    # 4. Compare — dtype-aware
     # ------------------------------------------------------------------
-    hdl_out = kernel_outputs[len(kernel_specs) - 1]
-    ref_flat = ref_out.astype(np.int64)
-    hdl_flat = hdl_out.astype(np.int64)
-    min_len = min(len(ref_flat), len(hdl_flat))
-    ref_flat, hdl_flat = ref_flat[:min_len], hdl_flat[:min_len]
+    hdl_raw = kernel_outputs[len(kernel_specs) - 1]
 
-    max_err_int = int(np.max(np.abs(hdl_flat - ref_flat))) if min_len > 0 else 0
-    correct = (np.array_equal(hdl_flat, ref_flat) if exact
-               else max_err_int <= 1)
+    if is_float_output:
+        # simulate_kernel returns raw uint32 bit patterns as int32.
+        # Re-interpret as float32 for comparison.
+        hdl_out = hdl_raw.astype(np.uint32).view(np.float32)
+        min_len = min(len(hdl_out), len(ref_out))
+        hdl_out, ref_cmp = hdl_out[:min_len], ref_out[:min_len]
+
+        # Use relative + absolute tolerance (truncation rounding mode)
+        if min_len > 0:
+            max_err = float(np.max(np.abs(hdl_out.astype(np.float64)
+                                          - ref_cmp.astype(np.float64))))
+            # tolerate 1 ULP of relative error from truncation rounding
+            correct = bool(np.allclose(hdl_out, ref_cmp, rtol=1e-5, atol=1e-6))
+        else:
+            max_err, correct = 0.0, True
+    else:
+        hdl_out = hdl_raw
+        ref_flat = ref_out.astype(np.int64)
+        hdl_flat = hdl_out.astype(np.int64)
+        min_len = min(len(ref_flat), len(hdl_flat))
+        ref_flat, hdl_flat = ref_flat[:min_len], hdl_flat[:min_len]
+
+        max_err_int = int(np.max(np.abs(hdl_flat - ref_flat))) if min_len > 0 else 0
+        max_err = float(max_err_int)
+        correct = (np.array_equal(hdl_flat, ref_flat) if exact
+                   else max_err_int <= 1)
 
     return BenchResult(
         name=name,
         correct=correct,
-        max_abs_error=float(max_err_int),
+        max_abs_error=max_err,
         hdl_cycles=total_cycles,
         sim_wall_s=sim_wall,
         tg_wall_s=tg_wall,

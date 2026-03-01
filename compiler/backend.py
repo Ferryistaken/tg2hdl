@@ -235,10 +235,18 @@ def simulate_kernel(kernel, input_data, clock_period=1e-8):
         for buf_idx, data in input_data.items():
             wp = kernel.buf_write_ports[buf_idx]
             data_flat = data.flatten()
-            for j in range(len(data_flat)):
+            # Float arrays must be loaded as IEEE 754 bit patterns, not
+            # cast to int (which would give the truncated integer value).
+            if np.issubdtype(data_flat.dtype, np.floating):
+                nbytes = data_flat.dtype.itemsize
+                uint_dtype = np.uint32 if nbytes == 4 else np.uint16
+                bits_flat = data_flat.view(uint_dtype)
+            else:
+                bits_flat = data_flat
+            for j in range(len(bits_flat)):
                 ctx.set(wp["wen"], 1)
                 ctx.set(wp["waddr"], j)
-                ctx.set(wp["wdata"], int(data_flat[j]))
+                ctx.set(wp["wdata"], int(bits_flat[j]))
                 await ctx.tick()
             ctx.set(wp["wen"], 0)
         await ctx.tick()
@@ -274,8 +282,11 @@ def simulate_kernel(kernel, input_data, clock_period=1e-8):
     sim.run()
     wall = time.perf_counter() - t0
 
-    # Assemble output
-    output = np.array([results.get(i, 0) for i in range(out_depth)], dtype=np.int32)
+    # Assemble output.  ctx.get() returns unsigned integer bit-patterns.
+    # Use uint32→int32 view so: (a) int32 values get correct sign extension,
+    # (b) float32 bit-patterns can be recovered via .astype(uint32).view(float32).
+    raw = [results.get(i, 0) & 0xFFFFFFFF for i in range(out_depth)]
+    output = np.array(raw, dtype=np.uint32).view(np.int32)
     return output, cycle_count, wall
 
 
@@ -385,7 +396,8 @@ def count_cycles_from_schedule(schedule):
     int
         Total cycle count across all compute kernels.
     """
-    from .hdl_module import CompiledKernel
+    from .uop_to_ir import uop_to_ir
+    from .ir import BufferMeta, DType
 
     renderer = HDLRenderer()
     total = 0
@@ -393,9 +405,15 @@ def count_cycles_from_schedule(schedule):
         if si.ast.op != Ops.SINK:
             continue
         uops = _get_uops(si.ast, renderer)
-        # Reuse the loop-structure parser without elaborating the full module
-        kernel = object.__new__(CompiledKernel)
-        kernel.buf_infos = []
-        root = kernel._parse_loop_structure(uops)
-        total += _count_cycles_from_root(root)
+        buf_metas = [
+            BufferMeta(
+                idx=b.idx,
+                depth=b.depth,
+                dtype=DType.from_width(b.elem_width, b.is_signed),
+                is_output=b.is_output,
+            )
+            for b in analyze_buffers(uops)
+        ]
+        kernel_ir = uop_to_ir(uops, buf_metas)
+        total += _count_cycles_from_root(kernel_ir.loop_tree)
     return total
