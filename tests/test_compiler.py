@@ -14,7 +14,8 @@ from tinygrad.uop.ops import AxisType
 
 from compiler import HDLRenderer, compile_kernel, simulate_kernel
 from compiler.backend import _get_uops, analyze_buffers
-from compiler.hdl_module import LoopLevel
+from compiler.ir import LoopIR, IRBufStore, IRRegStore, DType, BufferMeta
+from compiler.uop_to_ir import uop_to_ir
 
 
 # ---------------------------------------------------------------------------
@@ -247,10 +248,17 @@ class TestSingleKernel:
 # ---------------------------------------------------------------------------
 
 class TestParseLoopStructure:
-    def _parse(self, uops):
-        """Helper: call _parse_loop_structure via a kernel instance."""
-        kernel = compile_kernel(uops)
-        return kernel._parse_loop_structure(uops)
+    def _build_ir(self, uops):
+        """Helper: convert UOps to KernelIR via uop_to_ir."""
+        buf_metas = [
+            BufferMeta(
+                idx=b.idx, depth=b.depth,
+                dtype=DType.from_width(b.elem_width, b.is_signed),
+                is_output=b.is_output,
+            )
+            for b in analyze_buffers(uops)
+        ]
+        return uop_to_ir(uops, buf_metas)
 
     def test_scalar_returns_root_no_body(self):
         """Kernel with no loops (n=1 elementwise) returns root with body=None."""
@@ -259,7 +267,7 @@ class TestParseLoopStructure:
         b = Tensor.empty(1, dtype=dtypes.int32)
         c = (a + b).relu()
         uops = _get_uops(c.schedule()[-1].ast, renderer)
-        result = self._parse(uops)
+        result = self._build_ir(uops).loop_tree
         assert result is not None          # always returns root
         assert result.axis_type is None    # root level
         assert result.body is None         # no loops
@@ -271,7 +279,7 @@ class TestParseLoopStructure:
         b = Tensor.empty(4, dtype=dtypes.int32)
         c = a + b
         uops = _get_uops(c.schedule()[-1].ast, renderer)
-        result = self._parse(uops)
+        result = self._build_ir(uops).loop_tree
 
         assert result is not None
         assert result.axis_type is None    # root
@@ -279,7 +287,7 @@ class TestParseLoopStructure:
         assert result.body.axis_type == AxisType.LOOP
         assert result.body.bound == 4
         assert result.body.body is None
-        assert len(result.body.prologue) > 0   # loads, add, store
+        assert len(result.body.prologue) > 0   # stores in loop body
         assert len(result.body.epilogue) == 0
 
     def test_gemv_two_levels(self):
@@ -289,7 +297,7 @@ class TestParseLoopStructure:
         w = Tensor.empty(4, 3, dtype=dtypes.int8)
         out = x @ w.T
         uops = _get_uops(out.schedule()[-1].ast, renderer)
-        result = self._parse(uops)
+        result = self._build_ir(uops).loop_tree
 
         assert result is not None
         assert result.axis_type is None    # root
@@ -309,19 +317,16 @@ class TestParseLoopStructure:
         w = Tensor.empty(4, 3, dtype=dtypes.int8)
         out = x @ w.T
         uops = _get_uops(out.schedule()[-1].ast, renderer)
-        result = self._parse(uops)
+        result = self._build_ir(uops).loop_tree
         outer = result.body
 
-        # prologue: ops before inner RANGE (acc reset)
+        # prologue: typed stores before inner loop (acc reset → IRRegStore)
         assert len(outer.prologue) > 0
-        prologue_ops = {u.op for u in outer.prologue}
-        assert Ops.STORE in prologue_ops   # accumulator reset
+        assert any(isinstance(s, IRRegStore) for s in outer.prologue)
 
-        # epilogue: ops after inner END (read acc, store to output)
+        # epilogue: typed stores after inner loop (output write → IRBufStore)
         assert len(outer.epilogue) > 0
-        epilogue_ops = {u.op for u in outer.epilogue}
-        assert Ops.STORE in epilogue_ops   # output write
-        assert Ops.LOAD in epilogue_ops    # read final acc
+        assert any(isinstance(s, IRBufStore) for s in outer.epilogue)
 
 
 # ---------------------------------------------------------------------------

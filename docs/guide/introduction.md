@@ -10,11 +10,22 @@ The compiler operates on tinygrad's linearized UOps — the same IR tinygrad use
 
 | Path | Role |
 |------|------|
-| `compiler/backend.py` | `HDLRenderer`, `compile_kernel`, `simulate_kernel` |
-| `compiler/hdl_module.py` | `CompiledKernel` — three-pass Amaranth Elaboratable |
+| `compiler/backend.py` | `HDLRenderer`, `compile_kernel`, `compile_model`, `compile_top_module`, `simulate_kernel`, `count_cycles_from_schedule` |
+| `compiler/hdl_module.py` | `CompiledKernel` — four-pass Amaranth Elaboratable |
+| `compiler/ir.py` | Typed IR: `DType`, `IRConst/Counter/BufLoad/RegLoad/Op`, `IRBufStore/RegStore`, `LoopIR`, `BufferMeta`, `KernelIR` |
+| `compiler/uop_to_ir.py` | `uop_to_ir()` — single-pass UOp list → `KernelIR` conversion |
+| `compiler/lowering/arithmetic.py` | `ArithmeticLowering`, `create_counters()` — combinational signal emission |
+| `compiler/lowering/control.py` | `build_control()` — FSM construction from typed loop tree |
+| `compiler/fp32.py` | `FP32Add`, `FP32Mul`, `FP32Cmp` — IEEE 754 combinational hardware modules |
+| `compiler/top_module.py` | `TopModule`, `simulate_top` — multi-kernel sequencer with copy FSM |
 | `compiler/utils.py` | `pretty_print_uops` — UOp inspection helper |
+| `benchmarks/harness.py` | `run_bench`, `BenchResult` — compare any tinygrad graph vs HDL simulation |
+| `benchmarks/test_suite.py` | Correctness suite: Tier 1–3 (elementwise, GEMV, multi-kernel MLP) |
+| `benchmarks/test_perf_suite.py` | Performance suite: 10 workloads, scalar → MNIST-scale |
+| `utils/quantization.py` | `quantize_int8`, `dequantize` — user-level quantization helpers |
 | `tests/test_compiler.py` | Compiler unit and simulation tests |
-| `tests/test_combined.py` | Elementwise fusion tests |
+| `tests/test_top_module.py` | TopModule hardware simulation tests |
+| `tests/test_fp32.py` | IEEE 754 FP32 unit and integration tests |
 | `compare_inference.py` | End-to-end MNIST: CPU float32 vs compiler INT8 |
 
 ## Workflow
@@ -24,12 +35,20 @@ tinygrad model
     │ .schedule()
     ▼
 list[ExecItem]
-    │ compile_kernel() per SINK item
+    │ compile_top_module()  ← auto-detects inter-kernel connections
     ▼
-list[CompiledKernel]   (Amaranth Elaboratables)
-    │ simulate_kernel()
+TopModule + list[KernelSpec]     (Amaranth Elaboratables)
+    │ simulate_kernel() per kernel   — or —   simulate_top()
     ▼
 numpy outputs + cycle counts
+```
+
+Or via the benchmark harness (handles single- and multi-kernel automatically):
+
+```python
+from benchmarks.harness import run_bench
+result = run_bench("my_kernel", build_fn, input_arrays)
+assert result.correct
 ```
 
 ## Status
@@ -39,9 +58,14 @@ numpy outputs + cycle counts
 | Generic kernel compilation | ✅ |
 | Scalar / elementwise / GEMV patterns | ✅ |
 | Fused multi-op kernels (matmul + bias + relu) | ✅ |
-| Multi-kernel simulation (Python-chained) | ✅ sim only — see note below |
-| Multi-kernel hardware (shared memories, sequenced FSMs) | Planned |
+| Multi-kernel hardware sequencing (`TopModule`) | ✅ |
+| Float32 — IEEE 754 hardware simulation | ✅ `FP32Add`, `FP32Mul`, `FP32Cmp` |
+| Float16 / BFloat16 arithmetic | ❌ No dedicated units — compile error in practice |
 | Multi-MAC parallelism (UNROLL) | Planned |
 | FPGA synthesis | Planned |
 
-**Multi-kernel note:** `compile_model()` (`backend.py:143`) compiles each schedule item into an independent `CompiledKernel` with its own private memories. There is no top-level hardware module that wires kernel 0's output memory to kernel 1's input memory or sequences their FSMs. In simulation, `compare_inference.py` bridges the gap by reading kernel 0's output via `buf_read_ports` and writing it into kernel 1's input via `buf_write_ports` — i.e. the Python host acts as the DMA controller. On real hardware, this would require a top-level module that shares BRAMs between kernels and chains their `done`/`start` signals.
+## Supported ops
+
+The compiler handles: `ADD`, `MUL`, `CAST`, `CMPLT`, `WHERE`, `MAX`, `LOAD`, `STORE`, `RANGE`, `INDEX`, `DEFINE_GLOBAL`, `DEFINE_REG`, `CONST`, `AFTER`.
+
+All other UOps raise `NotImplementedError` at compile time (fail-loud policy).
