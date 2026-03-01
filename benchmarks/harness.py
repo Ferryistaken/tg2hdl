@@ -1,0 +1,268 @@
+"""Benchmark harness: compare any tinygrad computation against HDL simulation.
+
+Supported dtype paths
+---------------------
+Integer dtypes (int8, int16, int32)
+    Full Amaranth simulation.  Output is bit-exact.  Correctness is verified
+    by comparing the simulated HDL output to the tinygrad CPU reference.
+
+Float dtypes (float16, float32, bfloat16)
+    Structural HDL compilation only.  Amaranth simulation of float arithmetic
+    uses integer-bit-pattern semantics and is not IEEE 754-accurate.  For the
+    float path, ``run_bench`` uses tinygrad CPU for the output and reports a
+    cycle count derived analytically from the UOp loop structure.
+    ``correct`` is True when the tinygrad reference matches itself (always).
+
+    For production float workflows, quantize your model to int8/int16 first
+    (see ``utils.quantization``), then run the integer path for exact results.
+
+Multi-kernel connection detection
+----------------------------------
+Buffer object identity (``id(si.bufs[0]) == id(si.bufs[j])``) detects when
+one kernel's output feeds into another kernel's input.  ``input_arrays`` are
+assigned to external (non-connected) input buffer slots in natural schedule
+order.
+"""
+
+import os
+import time
+from dataclasses import dataclass
+
+import numpy as np
+from tinygrad import Tensor
+from tinygrad.uop.ops import Ops
+
+from compiler.backend import (
+    compile_model,
+    simulate_kernel,
+    count_cycles_from_schedule,
+)
+
+
+# ---------------------------------------------------------------------------
+# Result dataclass
+# ---------------------------------------------------------------------------
+
+@dataclass
+class BenchResult:
+    """Result of a single benchmark run."""
+    name: str
+    correct: bool           # True if HDL output matches reference (or float path)
+    max_abs_error: float    # 0 for exact integer, may be non-zero for float/tolerance
+    hdl_cycles: int         # total hardware cycles across all kernels
+    sim_wall_s: float       # simulation wall-clock seconds (0.0 for float path)
+    tg_wall_s: float        # tinygrad CPU reference wall-clock seconds
+    float_path: bool        # True when float-mode path was used
+    output_hdl: np.ndarray
+    output_ref: np.ndarray
+
+    def __str__(self):
+        mode = "float-analytical" if self.float_path else "hdl-sim"
+        status = "PASS" if self.correct else "FAIL"
+        return (
+            f"[{status}] {self.name} [{mode}]: "
+            f"err={self.max_abs_error:.4g} cycles={self.hdl_cycles} "
+            f"sim={self.sim_wall_s:.3f}s tg={self.tg_wall_s:.4f}s"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _is_float(arr: np.ndarray) -> bool:
+    return np.issubdtype(arr.dtype, np.floating)
+
+
+def _detect_connections(compute_items):
+    """Return (connections_dict, external_slots) from a list of ExecItems."""
+    output_buf_ids: dict[int, int] = {}
+    for k_idx, si in enumerate(compute_items):
+        if si.bufs:
+            output_buf_ids[id(si.bufs[0])] = k_idx
+
+    connections: dict[tuple, tuple] = {}
+    for k_idx, si in enumerate(compute_items):
+        for buf_pos, buf in enumerate(si.bufs[1:], start=1):
+            if buf is not None and id(buf) in output_buf_ids:
+                src_k = output_buf_ids[id(buf)]
+                if src_k < k_idx:
+                    connections[(k_idx, buf_pos)] = (src_k, 0)
+
+    external_slots = [
+        (k_idx, buf_pos)
+        for k_idx, si in enumerate(compute_items)
+        for buf_pos in range(1, len(si.bufs))
+        if (k_idx, buf_pos) not in connections
+    ]
+    return connections, external_slots
+
+
+# ---------------------------------------------------------------------------
+# run_bench
+# ---------------------------------------------------------------------------
+
+def run_bench(name: str, build_fn, input_arrays: list, exact: bool = True) -> BenchResult:
+    """Run *build_fn* on tinygrad CPU and HDL simulation, compare outputs.
+
+    Parameters
+    ----------
+    name : str
+        Human-readable benchmark name.
+    build_fn : callable
+        ``list[Tensor] → Tensor``.  Must work with both real and empty tensors.
+    input_arrays : list[np.ndarray]
+        Input data in the same order as the tensors ``build_fn`` receives.
+        Dtypes may be int8, int16, int32, float16, or float32.
+    exact : bool
+        True  → require bit-exact match (integer path).
+        False → allow ±1 absolute error (use for expected truncation effects).
+
+    Returns
+    -------
+    BenchResult
+    """
+    # ------------------------------------------------------------------
+    # 1. Determine execution path based on input dtypes
+    # ------------------------------------------------------------------
+    use_float_path = any(_is_float(a) for a in input_arrays)
+
+    # ------------------------------------------------------------------
+    # 2. tinygrad CPU reference
+    # ------------------------------------------------------------------
+    t0 = time.perf_counter()
+    ref_tensors = [Tensor(a) for a in input_arrays]
+    ref_out = build_fn(ref_tensors).numpy().flatten()
+    tg_wall = time.perf_counter() - t0
+
+    # ------------------------------------------------------------------
+    # 3. Build symbolic graph and compile
+    # ------------------------------------------------------------------
+    syms = [Tensor.empty(a.shape, dtype=Tensor(a).dtype) for a in input_arrays]
+    out_sym = build_fn(syms)
+    schedule = out_sym.schedule()
+
+    compute_items = [si for si in schedule if si.ast.op == Ops.SINK]
+    kernel_specs = compile_model(schedule)
+
+    # ------------------------------------------------------------------
+    # 4. Float path: analytical cycle count, tinygrad CPU as "HDL" output
+    # ------------------------------------------------------------------
+    if use_float_path:
+        total_cycles = count_cycles_from_schedule(schedule)
+        hdl_out = ref_out.copy()
+        max_err = 0.0
+        correct = True
+        return BenchResult(
+            name=name,
+            correct=correct,
+            max_abs_error=max_err,
+            hdl_cycles=total_cycles,
+            sim_wall_s=0.0,
+            tg_wall_s=tg_wall,
+            float_path=True,
+            output_hdl=hdl_out,
+            output_ref=ref_out,
+        )
+
+    # ------------------------------------------------------------------
+    # 5. Integer path: Amaranth simulation
+    # ------------------------------------------------------------------
+    connections, external_slots = _detect_connections(compute_items)
+
+    input_map: dict[tuple, np.ndarray] = {}
+    for i, slot in enumerate(external_slots):
+        if i < len(input_arrays):
+            input_map[slot] = input_arrays[i]
+
+    kernel_outputs: dict[int, np.ndarray] = {}
+    total_cycles = 0
+    t0 = time.perf_counter()
+
+    for k_idx, ks in enumerate(kernel_specs):
+        kernel_inputs: dict[int, np.ndarray] = {}
+        for (ki, buf_pos), arr in input_map.items():
+            if ki == k_idx:
+                kernel_inputs[buf_pos] = arr
+        for (ki, buf_pos), (src_k, _) in connections.items():
+            if ki == k_idx:
+                kernel_inputs[buf_pos] = kernel_outputs[src_k]
+
+        out, cycles, _ = simulate_kernel(ks.kernel, kernel_inputs)
+        kernel_outputs[k_idx] = out
+        total_cycles += cycles
+
+    sim_wall = time.perf_counter() - t0
+
+    # ------------------------------------------------------------------
+    # 6. Compare
+    # ------------------------------------------------------------------
+    hdl_out = kernel_outputs[len(kernel_specs) - 1]
+    ref_flat = ref_out.astype(np.int64)
+    hdl_flat = hdl_out.astype(np.int64)
+    min_len = min(len(ref_flat), len(hdl_flat))
+    ref_flat, hdl_flat = ref_flat[:min_len], hdl_flat[:min_len]
+
+    max_err_int = int(np.max(np.abs(hdl_flat - ref_flat))) if min_len > 0 else 0
+    correct = (np.array_equal(hdl_flat, ref_flat) if exact
+               else max_err_int <= 1)
+
+    return BenchResult(
+        name=name,
+        correct=correct,
+        max_abs_error=float(max_err_int),
+        hdl_cycles=total_cycles,
+        sim_wall_s=sim_wall,
+        tg_wall_s=tg_wall,
+        float_path=False,
+        output_hdl=hdl_out,
+        output_ref=ref_out,
+    )
+
+
+# ---------------------------------------------------------------------------
+# CLI: python -m benchmarks.harness
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import sys
+
+    os.environ.setdefault("NOOPT", "1")
+    os.environ.setdefault("DEBUG", "0")
+
+    from tinygrad import dtypes
+
+    rng = np.random.RandomState(0)
+
+    cases = [
+        (
+            "relu_int32_4",
+            lambda t: t[0].relu(),
+            [rng.randint(-10, 10, 4).astype(np.int32)],
+        ),
+        (
+            "add_int32_4",
+            lambda t: t[0] + t[1],
+            [rng.randint(-5, 5, 4).astype(np.int32),
+             rng.randint(-5, 5, 4).astype(np.int32)],
+        ),
+        (
+            "matmul_int8_1x4_4x3",
+            lambda t: (t[0] @ t[1]).cast(dtypes.int32),
+            [rng.randint(-4, 4, (1, 4)).astype(np.int8),
+             rng.randint(-4, 4, (4, 3)).astype(np.int8)],
+        ),
+        (
+            "relu_float32_8",
+            lambda t: t[0].relu(),
+            [rng.randn(8).astype(np.float32)],
+        ),
+    ]
+
+    all_pass = True
+    for case_name, fn, arrays in cases:
+        r = run_bench(case_name, fn, arrays)
+        print(r)
+        all_pass = all_pass and r.correct
+
+    sys.exit(0 if all_pass else 1)

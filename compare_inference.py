@@ -17,7 +17,8 @@ from tinygrad.nn.state import safe_load
 
 from tinygrad.uop.ops import Ops
 
-from compiler import HDLRenderer, compile_kernel, simulate_kernel, quantize_int8
+from compiler import HDLRenderer, compile_kernel, simulate_kernel
+from utils import quantize_int8
 from compiler.backend import _get_uops
 
 

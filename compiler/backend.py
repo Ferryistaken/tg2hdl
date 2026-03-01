@@ -20,6 +20,7 @@ from tinygrad.dtype import AddrSpace
 from amaranth.sim import Simulator
 
 from .hdl_module import CompiledKernel
+from .top_module import TopModule
 
 
 # ---------------------------------------------------------------------------
@@ -64,7 +65,13 @@ def _get_uops(ast, renderer):
 
 
 def _dtype_info(dtype):
-    """Return (bit_width, is_signed) for a tinygrad base dtype."""
+    """Return (bit_width, is_signed) for a tinygrad base dtype.
+
+    For floating-point types the storage is treated as an unsigned integer
+    bit-vector of the appropriate width (IEEE 754 bit pattern).  Arithmetic
+    on float signals in simulation will not be IEEE-accurate; use the software
+    float path in the benchmark harness for numerically correct float results.
+    """
     if dtype in (dtypes.char, dtypes.int8):
         return 8, True
     if dtype in (dtypes.uchar, dtypes.uint8):
@@ -75,7 +82,14 @@ def _dtype_info(dtype):
         return 32, True
     if dtype in (dtypes.uint, dtypes.uint32):
         return 32, False
-    return 32, True  # fallback
+    # Float types: stored as unsigned bit patterns
+    if dtype in (dtypes.float16, dtypes.half):
+        return 16, False
+    if dtype in (dtypes.float32, dtypes.float):
+        return 32, False
+    if dtype in (dtypes.bfloat16,):
+        return 16, False
+    return 32, False  # fallback for unknown types
 
 
 def analyze_buffers(uops):
@@ -269,11 +283,119 @@ def simulate_kernel(kernel, input_data, clock_period=1e-8):
 # simulate_model — end-to-end model simulation
 # ---------------------------------------------------------------------------
 
-def quantize_int8(arr):
-    """Symmetric per-tensor INT8 quantization. Returns (int8_array, scale)."""
-    max_abs = np.max(np.abs(arr))
-    if max_abs == 0:
-        return np.zeros_like(arr, dtype=np.int8), 1.0
-    scale = max_abs / 127.0
-    q = np.clip(np.round(arr / scale), -127, 127).astype(np.int8)
-    return q, scale
+# ---------------------------------------------------------------------------
+# compile_top_module — auto-detect kernel connections and build TopModule
+# ---------------------------------------------------------------------------
+
+def compile_top_module(schedule):
+    """Compile a tinygrad schedule into a TopModule.
+
+    Detects inter-kernel buffer connections automatically by checking Buffer
+    object identity: if ``si_prev.bufs[0]`` is the same Python object as
+    ``si_curr.bufs[j]`` for j ≥ 1, the two kernels are connected.
+
+    Parameters
+    ----------
+    schedule : list[ExecItem]
+        From Tensor.schedule().
+
+    Returns
+    -------
+    top : TopModule
+        Assembled top module with all kernels and copy FSM.
+    connections : list[tuple[int,int,int,int]]
+        Detected connections as (src_k, src_buf, dst_k, dst_buf).
+    kernel_specs : list[KernelSpec]
+        One KernelSpec per compute kernel (same order as in TopModule).
+    """
+    kernel_specs = compile_model(schedule)
+    compute_items = [si for si in schedule if si.ast.op == Ops.SINK]
+
+    # Map output buffer id → kernel index
+    output_buf_ids = {}
+    for k_idx, si in enumerate(compute_items):
+        if si.bufs:
+            output_buf_ids[id(si.bufs[0])] = k_idx
+
+    # Detect connections: input buffer of later kernel == output buffer of earlier kernel
+    connections = []
+    for k_idx, si in enumerate(compute_items):
+        for buf_pos, buf in enumerate(si.bufs[1:], start=1):
+            if buf is not None and id(buf) in output_buf_ids:
+                src_k = output_buf_ids[id(buf)]
+                if src_k < k_idx:  # only forward connections
+                    connections.append((src_k, 0, k_idx, buf_pos))
+
+    # Build buf_depths: depth of each buffer involved in a copy
+    buf_depths = {}
+    for ks in kernel_specs:
+        for info in ks.buf_infos:
+            # BufferInfo dataclass with .idx and .depth
+            k_idx_for_spec = kernel_specs.index(ks)
+            buf_depths[(k_idx_for_spec, info.idx)] = info.depth
+
+    kernels = [ks.kernel for ks in kernel_specs]
+    top = TopModule(kernels, connections, buf_depths)
+    return top, connections, kernel_specs
+
+
+# ---------------------------------------------------------------------------
+# count_cycles_from_schedule — analytical cycle estimator (no simulation)
+# ---------------------------------------------------------------------------
+
+def _count_cycles_from_root(root):
+    """Count FSM cycles from a LoopLevel tree (no simulation required).
+
+    Matches the cycle model of CompiledKernel's FSM:
+      - Scalar kernel:          2  (IDLE → SCALAR → IDLE)
+      - Single-level loop:      bound + 1
+      - Two-level loop (GEMV):  outer × (inner + 2) + 1
+    """
+    levels = []
+    level = root.body
+    while level is not None:
+        levels.append(level)
+        level = level.body
+
+    if not levels:
+        return 2  # scalar kernel
+
+    if len(levels) == 1:
+        return levels[0].bound + 1
+
+    # Two levels: M × (K + 2) + 1
+    outer, inner = levels[0], levels[1]
+    return outer.bound * (inner.bound + 2) + 1
+
+
+def count_cycles_from_schedule(schedule):
+    """Analytically count total FSM cycles for all kernels in *schedule*.
+
+    Returns the sum of per-kernel cycle counts using the same model as the
+    Amaranth FSM without running any simulation.  Useful for float models
+    where Amaranth simulation is not bit-accurate.
+
+    Parameters
+    ----------
+    schedule : list[ExecItem]
+        From Tensor.schedule().
+
+    Returns
+    -------
+    int
+        Total cycle count across all compute kernels.
+    """
+    from .hdl_module import CompiledKernel
+
+    renderer = HDLRenderer()
+    total = 0
+    for si in schedule:
+        if si.ast.op != Ops.SINK:
+            continue
+        uops = _get_uops(si.ast, renderer)
+        # Reuse the loop-structure parser without elaborating the full module
+        kernel = object.__new__(CompiledKernel)
+        kernel.buf_infos = []
+        root = kernel._parse_loop_structure(uops)
+        total += _count_cycles_from_root(root)
+    return total

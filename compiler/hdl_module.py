@@ -547,7 +547,14 @@ class CompiledKernel(Elaboratable):
         return val
 
     def _dtype_to_width(self, dtype):
-        """Return (bit_width, is_signed) for a tinygrad dtype."""
+        """Return (bit_width, is_signed) for a tinygrad dtype.
+
+        Float types are stored as unsigned integer bit-vectors of the matching
+        width (IEEE 754 bit pattern).  Arithmetic on float signals in Amaranth
+        simulation uses integer semantics and is therefore not IEEE-accurate;
+        use the software-float path in the benchmark harness for numerically
+        correct results when benchmarking float models.
+        """
         from tinygrad import dtypes
 
         if dtype == dtypes.char or dtype == dtypes.int8:
@@ -562,5 +569,12 @@ class CompiledKernel(Elaboratable):
             return 32, False
         if dtype == dtypes.bool:
             return 1, False
-        # Default to 32-bit signed
-        return 32, True
+        # Float types: stored as unsigned bit patterns (IEEE 754)
+        if dtype in (dtypes.float16, dtypes.half):
+            return 16, False
+        if dtype in (dtypes.float32, dtypes.float):
+            return 32, False
+        if dtype == dtypes.bfloat16:
+            return 16, False
+        # Default to 32-bit unsigned for unknown types
+        return 32, False
