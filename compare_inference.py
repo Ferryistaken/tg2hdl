@@ -364,7 +364,7 @@ def main():
         print(f"  {_ref_lbl} is {1/_ratio:.1f}x faster than HDL  "
               f"(sequential FSM, 1 MAC/cycle — pipelining needed to compete)")
     else:
-        print(f"  HDL is {_ratio:.1f}x faster than {_ref_lbl} at 100 MHz")
+        print(f"  HDL at 100 MHz is {_ratio:.1f}x faster than {_ref_lbl}")
     print()
 
     # --- Hardware resources ---
