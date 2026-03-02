@@ -6,15 +6,18 @@ Integer dtypes (int8, int16, int32)
     Full Amaranth simulation.  Output is bit-exact.  Correctness is verified
     by comparing the simulated HDL output to the tinygrad CPU reference.
 
-Float dtypes (float16, float32, bfloat16)
-    Structural HDL compilation only.  Amaranth simulation of float arithmetic
-    uses integer-bit-pattern semantics and is not IEEE 754-accurate.  For the
-    float path, ``run_bench`` uses tinygrad CPU for the output and reports a
-    cycle count derived analytically from the UOp loop structure.
-    ``correct`` is True when the tinygrad reference matches itself (always).
+Float32
+    Full Amaranth simulation using IEEE 754 hardware modules (FP32Add, FP32Mul,
+    FP32Cmp).  Results are compared to the tinygrad CPU reference with
+    ``rtol=1e-5, atol=1e-6``.  The same elaboratable hardware is used for
+    simulation and synthesis — there is no software float fallback.
+    ``result.float_path`` is always ``False``.
 
-    For production float workflows, quantize your model to int8/int16 first
-    (see ``utils.quantization``), then run the integer path for exact results.
+    Known limitations: subnormals flush to zero; rounding is truncation
+    (round-toward-zero) rather than IEEE default round-to-nearest-even.
+
+Float16 / BFloat16
+    No dedicated arithmetic units — compile error at any arithmetic op.
 
 Multi-kernel connection detection
 ----------------------------------
