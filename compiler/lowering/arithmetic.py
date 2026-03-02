@@ -306,6 +306,123 @@ class ArithmeticLowering:
             m.d.comb += result_sig.eq(src_sig)
             result.signals[id(val)] = result_sig
 
+        # ----------------------------------------------------------------
+        # Easy ops — combinational integer arithmetic / bitwise
+        # ----------------------------------------------------------------
+
+        elif op == "sub":
+            a_sig, b_sig = get_sig(val.srcs[0]), get_sig(val.srcs[1])
+            shape = dtype.amaranth_shape()
+            result_sig = Signal(shape, name=f"sub_{uid}")
+            if dtype.is_float:
+                raise NotImplementedError(
+                    "ArithmeticLowering: float SUB not yet implemented — "
+                    "needs an FP32Sub module. Use ADD(a, NEG(b)) as a workaround."
+                )
+            m.d.comb += result_sig.eq(a_sig - b_sig)
+            result.signals[id(val)] = result_sig
+
+        elif op == "neg":
+            a_sig = get_sig(val.srcs[0])
+            shape = dtype.amaranth_shape()
+            result_sig = Signal(shape, name=f"neg_{uid}")
+            if dtype.is_float and dtype.bit_width == 32:
+                # Flip IEEE 754 sign bit — no arithmetic needed
+                m.d.comb += result_sig.eq(a_sig ^ 0x80000000)
+            elif dtype.is_float:
+                raise NotImplementedError(
+                    f"ArithmeticLowering: NEG not implemented for {dtype}."
+                )
+            else:
+                m.d.comb += result_sig.eq(-a_sig)
+            result.signals[id(val)] = result_sig
+
+        elif op == "and":
+            a_sig, b_sig = get_sig(val.srcs[0]), get_sig(val.srcs[1])
+            shape = dtype.amaranth_shape()
+            result_sig = Signal(shape, name=f"and_{uid}")
+            m.d.comb += result_sig.eq(a_sig & b_sig)
+            result.signals[id(val)] = result_sig
+
+        elif op == "or":
+            a_sig, b_sig = get_sig(val.srcs[0]), get_sig(val.srcs[1])
+            shape = dtype.amaranth_shape()
+            result_sig = Signal(shape, name=f"or_{uid}")
+            m.d.comb += result_sig.eq(a_sig | b_sig)
+            result.signals[id(val)] = result_sig
+
+        elif op == "xor":
+            a_sig, b_sig = get_sig(val.srcs[0]), get_sig(val.srcs[1])
+            shape = dtype.amaranth_shape()
+            result_sig = Signal(shape, name=f"xor_{uid}")
+            m.d.comb += result_sig.eq(a_sig ^ b_sig)
+            result.signals[id(val)] = result_sig
+
+        elif op == "shl":
+            a_sig, b_sig = get_sig(val.srcs[0]), get_sig(val.srcs[1])
+            shape = dtype.amaranth_shape()
+            result_sig = Signal(shape, name=f"shl_{uid}")
+            m.d.comb += result_sig.eq(a_sig << b_sig)
+            result.signals[id(val)] = result_sig
+
+        elif op == "shr":
+            a_sig, b_sig = get_sig(val.srcs[0]), get_sig(val.srcs[1])
+            shape = dtype.amaranth_shape()
+            result_sig = Signal(shape, name=f"shr_{uid}")
+            # Amaranth's >> on signed signals is arithmetic (sign-extending)
+            m.d.comb += result_sig.eq(a_sig >> b_sig)
+            result.signals[id(val)] = result_sig
+
+        elif op == "idiv":
+            a_sig, b_sig = get_sig(val.srcs[0]), get_sig(val.srcs[1])
+            shape = dtype.amaranth_shape()
+            result_sig = Signal(shape, name=f"idiv_{uid}")
+            m.d.comb += result_sig.eq(a_sig // b_sig)
+            result.signals[id(val)] = result_sig
+
+        elif op == "mod":
+            a_sig, b_sig = get_sig(val.srcs[0]), get_sig(val.srcs[1])
+            shape = dtype.amaranth_shape()
+            result_sig = Signal(shape, name=f"mod_{uid}")
+            m.d.comb += result_sig.eq(a_sig % b_sig)
+            result.signals[id(val)] = result_sig
+
+        elif op == "cmpeq":
+            a_sig, b_sig = get_sig(val.srcs[0]), get_sig(val.srcs[1])
+            result_sig = Signal(name=f"cmpeq_{uid}")
+            # Bit-pattern equality works for both int and float (no NaN in our model)
+            m.d.comb += result_sig.eq(a_sig == b_sig)
+            result.signals[id(val)] = result_sig
+
+        elif op == "cmpne":
+            a_sig, b_sig = get_sig(val.srcs[0]), get_sig(val.srcs[1])
+            result_sig = Signal(name=f"cmpne_{uid}")
+            m.d.comb += result_sig.eq(a_sig != b_sig)
+            result.signals[id(val)] = result_sig
+
+        elif op == "trunc":
+            src = val.srcs[0]
+            src_sig = get_sig(src)
+            shape = dtype.amaranth_shape()
+            result_sig = Signal(shape, name=f"trunc_{uid}")
+            if dtype.is_float:
+                raise NotImplementedError(
+                    "ArithmeticLowering: float TRUNC (round-toward-zero to int) "
+                    "not yet implemented — needs a dedicated FP→int conversion unit."
+                )
+            # For integer→integer, TRUNC is equivalent to a cast (truncate high bits)
+            m.d.comb += result_sig.eq(src_sig)
+            result.signals[id(val)] = result_sig
+
+        elif op == "bitcast":
+            # Reinterpret bit pattern as a different type — identical to cast at RTL level
+            src = val.srcs[0]
+            src_sig = get_sig(src)
+            shape = dtype.amaranth_shape()
+            result_sig = Signal(shape, name=f"bitcast_{uid}")
+            m.d.comb += result_sig.eq(src_sig)
+            result.signals[id(val)] = result_sig
+
         else:
             raise NotImplementedError(
                 f"ArithmeticLowering: unsupported op {op!r} in IROp. "

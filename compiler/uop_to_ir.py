@@ -238,6 +238,11 @@ def uop_to_ir(uops, buf_metas: list) -> KernelIR:
         # ----------------------------------------------------------------
         # Arithmetic / logical ops
         # ----------------------------------------------------------------
+        # ----------------------------------------------------------------
+        # Arithmetic / logical ops
+        # ----------------------------------------------------------------
+
+        # --- Binary arithmetic ---
         elif u.op == Ops.MUL:
             dtype = _try_dtype(u.dtype, acc_dtype or DType.INT32)
             a = val_map.get(id(u.src[0]))
@@ -252,21 +257,87 @@ def uop_to_ir(uops, buf_metas: list) -> KernelIR:
             val_map[id(u)] = IROp("add", dtype, (a, b))
             continue
 
-        elif u.op == Ops.CAST:
+        elif u.op == Ops.SUB:
             dtype = _try_dtype(u.dtype, acc_dtype or DType.INT32)
-            src = val_map.get(id(u.src[0]))
-            val_map[id(u)] = IROp("cast", dtype, (src,))
-            continue
-
-        elif u.op == Ops.CMPLT:
-            # Result is boolean (1-bit), stored as UINT8 for simplicity
             a = val_map.get(id(u.src[0]))
             b = val_map.get(id(u.src[1]))
-            # Record operand dtype on the IROp so dispatch can check is_float
+            val_map[id(u)] = IROp("sub", dtype, (a, b))
+            continue
+
+        elif u.op == Ops.IDIV:
+            dtype = _try_dtype(u.dtype, acc_dtype or DType.INT32)
+            a = val_map.get(id(u.src[0]))
+            b = val_map.get(id(u.src[1]))
+            val_map[id(u)] = IROp("idiv", dtype, (a, b))
+            continue
+
+        elif u.op == Ops.MOD:
+            dtype = _try_dtype(u.dtype, acc_dtype or DType.INT32)
+            a = val_map.get(id(u.src[0]))
+            b = val_map.get(id(u.src[1]))
+            val_map[id(u)] = IROp("mod", dtype, (a, b))
+            continue
+
+        # --- Bitwise binary ---
+        elif u.op == Ops.AND:
+            dtype = _try_dtype(u.dtype, acc_dtype or DType.INT32)
+            a = val_map.get(id(u.src[0]))
+            b = val_map.get(id(u.src[1]))
+            val_map[id(u)] = IROp("and", dtype, (a, b))
+            continue
+
+        elif u.op == Ops.OR:
+            dtype = _try_dtype(u.dtype, acc_dtype or DType.INT32)
+            a = val_map.get(id(u.src[0]))
+            b = val_map.get(id(u.src[1]))
+            val_map[id(u)] = IROp("or", dtype, (a, b))
+            continue
+
+        elif u.op == Ops.XOR:
+            dtype = _try_dtype(u.dtype, acc_dtype or DType.INT32)
+            a = val_map.get(id(u.src[0]))
+            b = val_map.get(id(u.src[1]))
+            val_map[id(u)] = IROp("xor", dtype, (a, b))
+            continue
+
+        elif u.op == Ops.SHL:
+            dtype = _try_dtype(u.dtype, acc_dtype or DType.INT32)
+            a = val_map.get(id(u.src[0]))
+            b = val_map.get(id(u.src[1]))
+            val_map[id(u)] = IROp("shl", dtype, (a, b))
+            continue
+
+        elif u.op == Ops.SHR:
+            dtype = _try_dtype(u.dtype, acc_dtype or DType.INT32)
+            a = val_map.get(id(u.src[0]))
+            b = val_map.get(id(u.src[1]))
+            val_map[id(u)] = IROp("shr", dtype, (a, b))
+            continue
+
+        # --- Comparisons ---
+        elif u.op == Ops.CMPLT:
+            # Record operand dtype (not result dtype) so dispatch can check is_float
+            a = val_map.get(id(u.src[0]))
+            b = val_map.get(id(u.src[1]))
             op_dtype = _irvalue_dtype(a, buf_meta_map, DType.INT32) if a is not None else DType.INT32
             val_map[id(u)] = IROp("cmplt", op_dtype, (a, b))
             continue
 
+        elif u.op == Ops.CMPEQ:
+            a = val_map.get(id(u.src[0]))
+            b = val_map.get(id(u.src[1]))
+            op_dtype = _irvalue_dtype(a, buf_meta_map, DType.INT32) if a is not None else DType.INT32
+            val_map[id(u)] = IROp("cmpeq", op_dtype, (a, b))
+            continue
+
+        elif u.op == Ops.CMPNE:
+            a = val_map.get(id(u.src[0]))
+            b = val_map.get(id(u.src[1]))
+            op_dtype = _irvalue_dtype(a, buf_meta_map, DType.INT32) if a is not None else DType.INT32
+            val_map[id(u)] = IROp("cmpne", op_dtype, (a, b))
+            continue
+
+        # --- Ternary / selection ---
         elif u.op == Ops.WHERE:
             dtype = _try_dtype(u.dtype, acc_dtype or DType.INT32)
             cond = val_map.get(id(u.src[0]))
@@ -280,6 +351,32 @@ def uop_to_ir(uops, buf_metas: list) -> KernelIR:
             a = val_map.get(id(u.src[0]))
             b = val_map.get(id(u.src[1]))
             val_map[id(u)] = IROp("max", dtype, (a, b))
+            continue
+
+        # --- Unary ---
+        elif u.op == Ops.NEG:
+            dtype = _try_dtype(u.dtype, acc_dtype or DType.INT32)
+            a = val_map.get(id(u.src[0]))
+            val_map[id(u)] = IROp("neg", dtype, (a,))
+            continue
+
+        elif u.op == Ops.TRUNC:
+            dtype = _try_dtype(u.dtype, acc_dtype or DType.INT32)
+            src = val_map.get(id(u.src[0]))
+            val_map[id(u)] = IROp("trunc", dtype, (src,))
+            continue
+
+        # --- Type operations ---
+        elif u.op == Ops.CAST:
+            dtype = _try_dtype(u.dtype, acc_dtype or DType.INT32)
+            src = val_map.get(id(u.src[0]))
+            val_map[id(u)] = IROp("cast", dtype, (src,))
+            continue
+
+        elif u.op == Ops.BITCAST:
+            dtype = _try_dtype(u.dtype, acc_dtype or DType.INT32)
+            src = val_map.get(id(u.src[0]))
+            val_map[id(u)] = IROp("bitcast", dtype, (src,))
             continue
 
         else:
