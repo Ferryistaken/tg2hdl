@@ -31,43 +31,100 @@ from compiler.backend import _get_uops
 
 
 # ---------------------------------------------------------------------------
-# Hardware resource estimation (no Yosys required)
+# Hardware resource estimation
 # ---------------------------------------------------------------------------
 
-def _rtlil_stats(kernel):
-    """Return pre-synthesis resource estimates by parsing Amaranth RTLIL output.
-
-    Returns a dict with:
-      mem_bits    -- total on-chip storage (exact, from buf_infos)
-      fp32_units  -- FP32Add/Mul/Cmp submodule instances
-      int_muls    -- $mul cells at top level (integer multipliers)
-      logic_cells -- other combinational cells ($mux, $add, $eq, …)
-    """
+def _rtlil_fp32_units(kernel) -> int:
+    """Count FP32Add/Mul/Cmp submodule instances from RTLIL (no Yosys needed)."""
     from amaranth.back import rtlil
     from collections import Counter
-
     il = rtlil.convert(kernel, ports=[kernel.start, kernel.done, kernel.busy])
-
     cell_counts = Counter()
     for line in il.split('\n'):
         s = line.strip()
         if s.startswith('cell '):
             cell_counts[s.split()[1]] += 1
+    return sum(v for k, v in cell_counts.items() if k.startswith(r'\top.fp'))
 
-    fp32_units  = sum(v for k, v in cell_counts.items() if k.startswith(r'\top.fp'))
-    int_muls    = cell_counts.get('$mul', 0)
-    logic_cells = sum(
-        v for k, v in cell_counts.items()
-        if k.startswith('$') and 'mem' not in k and 'dff' not in k and k != '$mul'
+
+def _synthesis_stats(kernel, device="45k", package="CABGA381"):
+    """Run Yosys + nextpnr-ecp5 and return real resource/timing data.
+
+    Returns a dict with:
+      fmax_mhz    -- achieved Fmax in MHz (float), or None if unavailable
+      comb        -- TRELLIS_COMB cells used (LUT equivalent)
+      ff          -- TRELLIS_FF flip-flops used
+      dp16kd      -- DP16KD block RAM tiles used
+      mult18      -- MULT18X18D DSP multiplier tiles used
+      mem_bits    -- total on-chip storage in bits (exact, from buf_infos)
+      fp32_units  -- FP32 submodule count (from RTLIL)
+      from_synth  -- True when Yosys+nextpnr ran successfully
+
+    Falls back gracefully when Yosys or nextpnr-ecp5 is not on PATH.
+    """
+    import shutil, subprocess, tempfile, json
+    from amaranth.back import rtlil
+
+    mem_bits   = sum(b["depth"] * b["elem_width"] for b in kernel.buf_infos)
+    fp32_units = _rtlil_fp32_units(kernel)
+    base = dict(mem_bits=mem_bits, fp32_units=fp32_units,
+                fmax_mhz=None, comb=0, ff=0, dp16kd=0, mult18=0, from_synth=False)
+
+    if not shutil.which("yosys") or not shutil.which("nextpnr-ecp5"):
+        return base
+
+    il = rtlil.convert(kernel, ports=[kernel.start, kernel.done, kernel.busy])
+
+    with tempfile.TemporaryDirectory() as d:
+        il_path     = f"{d}/top.il"
+        json_path   = f"{d}/top.json"
+        report_path = f"{d}/report.json"
+
+        with open(il_path, "w") as f:
+            f.write(il)
+
+        # Yosys: synthesise for ECP5
+        r = subprocess.run(
+            ["yosys", "-q", "-p", f"read_rtlil {il_path}; synth_ecp5 -json {json_path}"],
+            capture_output=True, text=True, timeout=120,
+        )
+        if r.returncode != 0:
+            return base
+
+        # nextpnr-ecp5: place & route, emit timing report
+        r2 = subprocess.run(
+            ["nextpnr-ecp5", f"--{device}", "--package", package,
+             "--json", json_path, "--report", report_path,
+             "--timing-allow-fail", "--quiet"],
+            capture_output=True, text=True, timeout=300,
+        )
+        if r2.returncode != 0:
+            return base
+
+        try:
+            with open(report_path) as f:
+                rep = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return base
+
+    # Extract Fmax: take minimum achieved over all clocks (most conservative)
+    fmax_mhz = None
+    for clk_data in rep.get("fmax", {}).values():
+        achieved = clk_data.get("achieved")
+        if achieved and (fmax_mhz is None or achieved < fmax_mhz):
+            fmax_mhz = float(achieved)
+
+    util = rep.get("utilization", {})
+    return dict(
+        mem_bits   = mem_bits,
+        fp32_units = fp32_units,
+        fmax_mhz   = fmax_mhz,
+        comb       = util.get("TRELLIS_COMB",  {}).get("used", 0),
+        ff         = util.get("TRELLIS_FF",     {}).get("used", 0),
+        dp16kd     = util.get("DP16KD",         {}).get("used", 0),
+        mult18     = util.get("MULT18X18D",     {}).get("used", 0),
+        from_synth = True,
     )
-    mem_bits = sum(b["depth"] * b["elem_width"] for b in kernel.buf_infos)
-
-    return {
-        'mem_bits':    mem_bits,
-        'fp32_units':  fp32_units,
-        'int_muls':    int_muls,
-        'logic_cells': logic_cells,
-    }
 
 
 # Xilinx RAMB36 = 36 Kbits; one block covers up to 36,864 bits of storage.
@@ -234,8 +291,13 @@ def main():
     print()
 
     kernels_fp32 = _compile_kernels(_build_fp32_schedule())
-    stats_fp32   = [_rtlil_stats(k) for k in kernels_fp32]
     print(f"  compiled {len(kernels_fp32)} kernels")
+    print(f"  synthesising for ECP5 45F (Yosys + nextpnr-ecp5)...", end=" ", flush=True)
+    stats_fp32 = [_synthesis_stats(k) for k in kernels_fp32]
+    if stats_fp32[0]["from_synth"]:
+        print("done")
+    else:
+        print("tools not found, using RTLIL estimates")
 
     # tinygrad layout: x(1,784) @ w(784,128) — so weights must be transposed
     # from safetensors (128,784) → (784,128)
@@ -284,8 +346,13 @@ def main():
     print()
 
     kernels_i8 = _compile_kernels(_build_int8_schedule())
-    stats_i8   = [_rtlil_stats(k) for k in kernels_i8]
     print(f"  compiled {len(kernels_i8)} kernels")
+    print(f"  synthesising for ECP5 45F (Yosys + nextpnr-ecp5)...", end=" ", flush=True)
+    stats_i8 = [_synthesis_stats(k) for k in kernels_i8]
+    if stats_i8[0]["from_synth"]:
+        print("done")
+    else:
+        print("tools not found, using RTLIL estimates")
 
     w1_q, w1_scale = quantize_int8(w1)
     x_q,  x_scale  = quantize_int8(x_float)
@@ -346,46 +413,76 @@ def main():
     print()
 
     # --- Latency ---
-    hw_fp32_ms = cyc_fp32_total * 10 / 1e6
-    hw_i8_ms   = cyc_i8_total   * 10 / 1e6
+    # Fmax: use minimum across all synthesised kernels (same clock domain)
+    all_fmax = [s["fmax_mhz"] for s in stats_fp32 + stats_i8 if s["fmax_mhz"] is not None]
+    fmax_mhz = min(all_fmax) if all_fmax else None
+
     cpu_ms     = t_cpu * 1e3
+    hw_fp32_ms_100 = cyc_fp32_total / 100e6 * 1e3
+    hw_i8_ms_100   = cyc_i8_total   / 100e6 * 1e3
+
     print(f"Inference latency (single image):")
-    print(f"  CPU float32 : {cpu_ms:>7.3f} ms  (wall-clock, numpy/BLAS)")
+    print(f"  CPU float32 : {cpu_ms:>8.3f} ms  (wall-clock, numpy/BLAS)")
     if gpu_ms is not None:
-        print(f"  GPU {gpu_device:<8}: {gpu_ms:>7.3f} ms  (avg of 50 runs, float32)")
+        print(f"  GPU {gpu_device:<8}: {gpu_ms:>8.3f} ms  (avg of 50 runs, float32)")
     else:
-        print(f"  GPU         :     N/A     (no GPU detected)")
-    print(f"  FP32 HDL    : {hw_fp32_ms:>7.3f} ms  ({cyc_fp32_total:,} cycles at 100 MHz)")
-    print(f"  INT8 HDL    : {hw_i8_ms:>7.3f} ms  ({cyc_i8_total:,} cycles at 100 MHz)")
-    _ref_ms = gpu_ms if gpu_ms is not None else cpu_ms
+        print(f"  GPU         :      N/A     (no GPU detected)")
+
+    if fmax_mhz is not None:
+        hw_fp32_ms_fmax = cyc_fp32_total / (fmax_mhz * 1e6) * 1e3
+        hw_i8_ms_fmax   = cyc_i8_total   / (fmax_mhz * 1e6) * 1e3
+        print(f"  FP32 HDL    : {hw_fp32_ms_100:>8.3f} ms  at 100 MHz  "
+              f"/ {hw_fp32_ms_fmax:.3f} ms  at {fmax_mhz:.0f} MHz  ({cyc_fp32_total:,} cycles)")
+        print(f"  INT8 HDL    : {hw_i8_ms_100:>8.3f} ms  at 100 MHz  "
+              f"/ {hw_i8_ms_fmax:.3f} ms  at {fmax_mhz:.0f} MHz  ({cyc_i8_total:,} cycles)")
+    else:
+        print(f"  FP32 HDL    : {hw_fp32_ms_100:>8.3f} ms  ({cyc_fp32_total:,} cycles at 100 MHz)")
+        print(f"  INT8 HDL    : {hw_i8_ms_100:>8.3f} ms  ({cyc_i8_total:,} cycles at 100 MHz)")
+
+    _ref_ms  = gpu_ms if gpu_ms is not None else cpu_ms
     _ref_lbl = f"GPU ({gpu_device})" if gpu_ms is not None else "CPU"
-    _ratio = _ref_ms / hw_fp32_ms
+    _hdl_ms  = hw_fp32_ms_fmax if fmax_mhz is not None else hw_fp32_ms_100
+    _ratio   = _ref_ms / _hdl_ms
     if _ratio < 1.0:
-        print(f"  {_ref_lbl} is {1/_ratio:.1f}x faster than HDL  "
-              f"(sequential FSM, 1 MAC/cycle — pipelining needed to compete)")
+        print(f"  → {_ref_lbl} is {1/_ratio:.1f}× faster than FP32 HDL  "
+              f"(sequential 1-MAC/cycle FSM — pipelining + batching needed to compete)")
     else:
-        print(f"  HDL at 100 MHz is {_ratio:.1f}x faster than {_ref_lbl}")
+        print(f"  → FP32 HDL is {_ratio:.1f}× faster than {_ref_lbl}")
     print()
 
-    # --- Hardware resources ---
-    fp32_total_mem = sum(s['mem_bits'] for s in stats_fp32)
-    i8_total_mem   = sum(s['mem_bits'] for s in stats_i8)
+    # --- Hardware resources (ECP5 45F synthesis) ---
+    from_synth = stats_fp32[0]["from_synth"]
+    src_label  = "ECP5 45F — Yosys + nextpnr-ecp5" if from_synth else "RTLIL pre-synthesis estimates"
+    fp32_total_mem = sum(s["mem_bits"] for s in stats_fp32)
+    i8_total_mem   = sum(s["mem_bits"] for s in stats_i8)
     fp32_ramb36    = math.ceil(fp32_total_mem / _RAMB36_BITS)
     i8_ramb36      = math.ceil(i8_total_mem   / _RAMB36_BITS)
 
-    print(f"Hardware resources (RTLIL pre-synthesis; Yosys needed for LUT count):")
-    print(f"  {'':16s}  {'mem':>8s}  {'arithmetic':>14s}  logic cells")
-    for i, s in enumerate(stats_fp32):
-        arith = f"{s['fp32_units']} FP32 units"
-        print(f"  float32 kernel {i}  {s['mem_bits']/8/1024:>7.1f} KB  {arith:>14s}  {s['logic_cells']}")
-    for i, s in enumerate(stats_i8):
-        arith = f"{s['int_muls']} int ×mul"
-        print(f"  int8    kernel {i}  {s['mem_bits']/8/1024:>7.1f} KB  {arith:>14s}  {s['logic_cells']}")
+    print(f"Hardware resources ({src_label}):")
+    if from_synth:
+        hdr = f"  {'':16s}  {'mem KB':>7s}  {'COMB':>6s}  {'FF':>5s}  {'DP16KD':>6s}  {'MULT18':>6s}  {'FP32 units':>10s}"
+        print(hdr)
+        for i, s in enumerate(stats_fp32):
+            print(f"  float32 kernel {i}  {s['mem_bits']/8/1024:>7.1f}"
+                  f"  {s['comb']:>6d}  {s['ff']:>5d}  {s['dp16kd']:>6d}  {s['mult18']:>6d}"
+                  f"  {s['fp32_units']:>10d}")
+        for i, s in enumerate(stats_i8):
+            print(f"  int8    kernel {i}  {s['mem_bits']/8/1024:>7.1f}"
+                  f"  {s['comb']:>6d}  {s['ff']:>5d}  {s['dp16kd']:>6d}  {s['mult18']:>6d}"
+                  f"  {'N/A':>10s}")
+        if fmax_mhz is not None:
+            print(f"  worst-case Fmax: {fmax_mhz:.1f} MHz  (ECP5 45F, CABGA381, no pipeline regs)")
+    else:
+        print(f"  {'':16s}  {'mem':>8s}  {'FP32 units':>10s}")
+        for i, s in enumerate(stats_fp32):
+            print(f"  float32 kernel {i}  {s['mem_bits']/8/1024:>7.1f} KB  {s['fp32_units']:>10d}")
+        for i, s in enumerate(stats_i8):
+            print(f"  int8    kernel {i}  {s['mem_bits']/8/1024:>7.1f} KB  {'N/A':>10s}")
     print()
     print(f"  float32 total on-chip: {fp32_total_mem/8/1024:>6.1f} KB  → ~{fp32_ramb36} Xilinx RAMB36")
     print(f"  int8    total on-chip: {i8_total_mem/8/1024:>6.1f} KB  → ~{i8_ramb36} Xilinx RAMB36")
-    print(f"  (dominated by weight matrices; streaming weights from DRAM would")
-    print(f"   collapse BRAM to activation buffers only: ~1 KB per kernel)")
+    print(f"  (dominated by weight matrices; streaming from SDRAM collapses")
+    print(f"   on-chip BRAM to activation buffers only: ~1 KB per kernel)")
 
 
 if __name__ == "__main__":
