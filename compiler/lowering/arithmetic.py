@@ -11,7 +11,7 @@ import struct
 from dataclasses import dataclass, field
 from typing import Any
 
-from amaranth.hdl import Module, Signal, signed, unsigned, Const, Mux
+from amaranth.hdl import Module, Signal, signed, unsigned, Const, Mux, Cat
 
 from ..ir import (
     DType,
@@ -19,7 +19,7 @@ from ..ir import (
     IRBufStore, IRRegStore,
     LoopIR, BufferMeta, KernelIR,
 )
-from ..fp32 import FP32Add, FP32Mul, FP32Cmp
+from ..fp32 import FP32Add, FP32Mul, FP32Cmp, FP32Reciprocal
 
 
 # ---------------------------------------------------------------------------
@@ -303,7 +303,71 @@ class ArithmeticLowering:
             src_sig = get_sig(src)
             shape = dtype.amaranth_shape()
             result_sig = Signal(shape, name=f"cast_{uid}")
-            m.d.comb += result_sig.eq(src_sig)
+
+            src_dtype = src.dtype if hasattr(src, "dtype") else DType.INT32
+
+            if src_dtype.is_float and not dtype.is_float:
+                # float32 → int: truncate toward zero
+                f_s   = src_sig[31]
+                f_e   = src_sig[23:31]
+                f_mnt = src_sig[0:23]
+                full_mant_c = Signal(unsigned(24), name=f"cast_fmnt_{uid}")
+                abs_int_c   = Signal(unsigned(32), name=f"cast_abs_{uid}")
+                m.d.comb += full_mant_c.eq((1 << 23) | f_mnt)
+                with m.Switch(f_e):
+                    for ea_val in range(256):
+                        with m.Case(ea_val):
+                            ue = ea_val - 127
+                            if ea_val == 0 or ue < 0:
+                                m.d.comb += abs_int_c.eq(0)
+                            elif ue > 30:
+                                m.d.comb += abs_int_c.eq(0x7FFFFFFF)
+                            elif ue >= 23:
+                                m.d.comb += abs_int_c.eq(full_mant_c << (ue - 23))
+                            else:
+                                m.d.comb += abs_int_c.eq(full_mant_c >> (23 - ue))
+                with m.If(f_s):
+                    m.d.comb += result_sig.eq(-abs_int_c)
+                with m.Else():
+                    m.d.comb += result_sig.eq(abs_int_c)
+
+            elif not src_dtype.is_float and dtype.is_float:
+                # int → float32: convert integer value to IEEE 754
+                int_s   = src_sig[31]
+                abs_val = Signal(unsigned(32), name=f"cast_av_{uid}")
+                with m.If(int_s):
+                    m.d.comb += abs_val.eq(-src_sig)
+                with m.Else():
+                    m.d.comb += abs_val.eq(src_sig)
+                lo = Signal(range(32), name=f"cast_lo_{uid}")
+                m.d.comb += lo.eq(0)
+                for i in range(32):
+                    with m.If(abs_val[i]):
+                        m.d.comb += lo.eq(i)
+                shift_r = Signal(range(32), name=f"cast_sr_{uid}")
+                shift_l = Signal(range(32), name=f"cast_sl_{uid}")
+                right_s = Signal(unsigned(32), name=f"cast_rs_{uid}")
+                left_s  = Signal(unsigned(32), name=f"cast_ls_{uid}")
+                res_e_c = Signal(unsigned(8),  name=f"cast_re_{uid}")
+                res_m_c = Signal(unsigned(23), name=f"cast_rm_{uid}")
+                m.d.comb += [
+                    shift_r.eq(Mux(lo >= 23, lo - 23, 0)),
+                    shift_l.eq(Mux(lo >= 23, 0, 23 - lo)),
+                    right_s.eq(abs_val >> shift_r),
+                    left_s.eq(abs_val << shift_l),
+                ]
+                with m.If(abs_val == 0):
+                    m.d.comb += [res_e_c.eq(0), res_m_c.eq(0)]
+                with m.Elif(lo >= 23):
+                    m.d.comb += [res_e_c.eq(lo + 127), res_m_c.eq(right_s[0:23])]
+                with m.Else():
+                    m.d.comb += [res_e_c.eq(lo + 127), res_m_c.eq(left_s[0:23])]
+                m.d.comb += result_sig.eq(Cat(res_m_c, res_e_c, int_s))
+
+            else:
+                # bool→int, int↔int, same-type: bit extend / truncate
+                m.d.comb += result_sig.eq(src_sig)
+
             result.signals[id(val)] = result_sig
 
         # ----------------------------------------------------------------
@@ -335,6 +399,19 @@ class ArithmeticLowering:
                 )
             else:
                 m.d.comb += result_sig.eq(-a_sig)
+            result.signals[id(val)] = result_sig
+
+        elif op == "reciprocal":
+            a_sig = get_sig(val.srcs[0])
+            result_sig = Signal(unsigned(32), name=f"rcp_{uid}")
+            if dtype.is_float and dtype.bit_width == 32:
+                fp = FP32Reciprocal(uid=uid)
+                m.submodules[f"fp_rcp_{uid}"] = fp
+                m.d.comb += [fp.a.eq(a_sig), result_sig.eq(fp.result)]
+            else:
+                raise NotImplementedError(
+                    f"ArithmeticLowering: RECIPROCAL only supported for FP32, got {dtype}."
+                )
             result.signals[id(val)] = result_sig
 
         elif op == "and":

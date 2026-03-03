@@ -353,6 +353,12 @@ def uop_to_ir(uops, buf_metas: list) -> KernelIR:
             val_map[id(u)] = IROp("max", dtype, (a, b))
             continue
 
+        elif u.op == Ops.RECIPROCAL:
+            dtype = _try_dtype(u.dtype, acc_dtype or DType.FP32)
+            a = val_map.get(id(u.src[0]))
+            val_map[id(u)] = IROp("reciprocal", dtype, (a,))
+            continue
+
         # --- Unary ---
         elif u.op == Ops.NEG:
             dtype = _try_dtype(u.dtype, acc_dtype or DType.INT32)
