@@ -26,7 +26,7 @@ from tinygrad.nn.datasets import mnist
 from tinygrad.nn.state import safe_load
 from tinygrad.uop.ops import Ops
 
-from compiler import HDLRenderer, compile_kernel, simulate_kernel
+from compiler import HDLRenderer, CompileOptions, compile_kernel, simulate_kernel
 from utils import quantize_int8
 from compiler.backend import _get_uops
 
@@ -223,14 +223,19 @@ def _gpu_inference(x_input, w1, b1, w2, b2, device, *, noopt: int, warmup=3, run
 # Kernel builders
 # ---------------------------------------------------------------------------
 
-def _compile_kernels(sched):
+def _compile_kernels(sched, *, unroll_loop: int = 1):
     renderer = HDLRenderer()
     kernels = []
     with _noopt_scope(1):
         for si in sched:
             if si.ast.op != Ops.SINK:
                 continue
-            kernels.append(compile_kernel(_get_uops(si.ast, renderer)))
+            kernels.append(
+                compile_kernel(
+                    _get_uops(si.ast, renderer),
+                    options=CompileOptions(unroll_loop=unroll_loop),
+                )
+            )
     return kernels
 
 
@@ -339,6 +344,7 @@ def _parse_args():
     parser.add_argument("--skip-int8", action="store_true", help="Disable INT8 FPGA path")
     parser.add_argument("--skip-stream", action="store_true", help="Disable multi-image FPGA stream simulation")
     parser.add_argument("--skip-synth", action="store_true", help="Skip synthesis estimation even if tools exist")
+    parser.add_argument("--unroll-loop", type=int, default=1, help="Requested LOOP-axis unroll factor for HDL compilation")
     return parser.parse_args()
 
 
@@ -463,7 +469,7 @@ def main():
     if not args.skip_fp32:
         print("Path B — float32 FPGA simulation:")
         with _noopt_scope(1):
-            kernels_fp32 = _compile_kernels(_build_fp32_schedule())
+            kernels_fp32 = _compile_kernels(_build_fp32_schedule(), unroll_loop=args.unroll_loop)
         print(f"  compiled {len(kernels_fp32)} kernels")
         if args.skip_synth:
             stats_fp32 = [_synthesis_stats(k) | {"from_synth": False} for k in kernels_fp32]
@@ -489,7 +495,7 @@ def main():
     if not args.skip_int8:
         print("Path C — INT8 FPGA simulation:")
         with _noopt_scope(1):
-            kernels_i8 = _compile_kernels(_build_int8_schedule())
+            kernels_i8 = _compile_kernels(_build_int8_schedule(), unroll_loop=args.unroll_loop)
         print(f"  compiled {len(kernels_i8)} kernels")
         if args.skip_synth:
             stats_i8 = [_synthesis_stats(k) | {"from_synth": False} for k in kernels_i8]

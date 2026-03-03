@@ -26,9 +26,11 @@ class CompiledKernel(Elaboratable):
         Buffer descriptors: {idx, depth, elem_width, is_signed, is_output}.
     """
 
-    def __init__(self, uops, buf_infos):
+    def __init__(self, uops, buf_infos, compile_options=None):
         self.uops = uops
         self.buf_infos = buf_infos
+        self.compile_options = compile_options
+        self.compile_report = {}
 
         # Control signals
         self.start = Signal()
@@ -67,6 +69,7 @@ class CompiledKernel(Elaboratable):
         # --- Pass 1: Build typed IR ---
         from .ir import DType, BufferMeta
         from .uop_to_ir import uop_to_ir
+        from .transforms import apply_loop_unroll
         from .lowering.arithmetic import ArithmeticLowering, create_counters
         from .lowering.control import build_control
 
@@ -80,6 +83,16 @@ class CompiledKernel(Elaboratable):
             for b in self.buf_infos
         ]
         kernel_ir = uop_to_ir(self.uops, buf_metas)
+        unroll_requested = getattr(self.compile_options, "unroll_loop", 1)
+        kernel_ir, unroll_info = apply_loop_unroll(kernel_ir, unroll_requested)
+        self.compile_report = {
+            "unroll_loop_requested": unroll_info.requested_unroll,
+            "unroll_loop_applied": unroll_info.applied_unroll,
+            "loop_bound": unroll_info.loop_bound,
+            "loop_tail": unroll_info.tail_length,
+            "loop_iterations_per_cycle_est": unroll_info.iterations_per_cycle_est,
+            "unroll_fallback_reason": unroll_info.fallback_reason,
+        }
 
         # --- Pass 2: Create counters + build arithmetic datapath ---
         counter_sigs = create_counters(kernel_ir, m)

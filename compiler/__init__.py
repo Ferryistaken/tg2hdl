@@ -15,6 +15,7 @@ Quantization utilities are in the ``utils`` package, not here:
 
 from .backend import (
     HDLRenderer,
+    CompileOptions,
     compile_kernel,
     compile_model,
     compile_top_module,

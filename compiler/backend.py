@@ -23,6 +23,23 @@ from .hdl_module import CompiledKernel
 from .top_module import TopModule
 
 
+@dataclass(frozen=True)
+class CompileOptions:
+    """Compiler configuration knobs.
+
+    Parameters
+    ----------
+    unroll_loop : int
+        Requested LOOP-axis unroll factor. ``1`` preserves legacy scalar behavior.
+    """
+
+    unroll_loop: int = 1
+
+    def normalized(self) -> "CompileOptions":
+        """Return a validated/normalized copy of the options."""
+        return CompileOptions(unroll_loop=max(1, int(self.unroll_loop)))
+
+
 # ---------------------------------------------------------------------------
 # HDLRenderer — tinygrad Renderer subclass
 # ---------------------------------------------------------------------------
@@ -113,7 +130,7 @@ def analyze_buffers(uops):
 # compile_kernel
 # ---------------------------------------------------------------------------
 
-def compile_kernel(uops):
+def compile_kernel(uops, *, options: CompileOptions | None = None, unroll_loop: int | None = None):
     """Compile a linearized UOp list into a CompiledKernel (Amaranth Elaboratable).
 
     Parameters
@@ -137,7 +154,11 @@ def compile_kernel(uops):
         }
         for b in buf_infos_raw
     ]
-    return CompiledKernel(uops, buf_infos)
+    opts = options or CompileOptions()
+    if unroll_loop is not None:
+        opts = CompileOptions(unroll_loop=unroll_loop)
+    opts = opts.normalized()
+    return CompiledKernel(uops, buf_infos, compile_options=opts)
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +175,7 @@ class KernelSpec:
     buf_map: dict  # buf_idx → schedule buffer reference
 
 
-def compile_model(schedule):
+def compile_model(schedule, *, options: CompileOptions | None = None, unroll_loop: int | None = None):
     """Compile a tinygrad schedule into a list of KernelSpecs.
 
     Parameters
@@ -168,6 +189,10 @@ def compile_model(schedule):
         One KernelSpec per compute kernel in the schedule.
     """
     renderer = HDLRenderer()
+    opts = options or CompileOptions()
+    if unroll_loop is not None:
+        opts = CompileOptions(unroll_loop=unroll_loop)
+    opts = opts.normalized()
     kernels = []
 
     for si in schedule:
@@ -176,7 +201,7 @@ def compile_model(schedule):
             continue
         uops = _get_uops(ast, renderer)
         buf_infos = analyze_buffers(uops)
-        kernel = compile_kernel(uops)
+        kernel = compile_kernel(uops, options=opts)
         kernels.append(KernelSpec(
             kernel=kernel,
             uops=uops,
@@ -298,7 +323,7 @@ def simulate_kernel(kernel, input_data, clock_period=1e-8):
 # compile_top_module — auto-detect kernel connections and build TopModule
 # ---------------------------------------------------------------------------
 
-def compile_top_module(schedule):
+def compile_top_module(schedule, *, options: CompileOptions | None = None, unroll_loop: int | None = None):
     """Compile a tinygrad schedule into a TopModule.
 
     Detects inter-kernel buffer connections automatically by checking Buffer
@@ -319,7 +344,7 @@ def compile_top_module(schedule):
     kernel_specs : list[KernelSpec]
         One KernelSpec per compute kernel (same order as in TopModule).
     """
-    kernel_specs = compile_model(schedule)
+    kernel_specs = compile_model(schedule, options=options, unroll_loop=unroll_loop)
     compute_items = [si for si in schedule if si.ast.op == Ops.SINK]
 
     # Map output buffer id → kernel index
