@@ -29,10 +29,12 @@ order.
 
 import os
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import numpy as np
 from tinygrad import Tensor
+from tinygrad.helpers import NOOPT as tg_noopt
 from tinygrad.uop.ops import Ops
 
 from compiler.backend import (
@@ -53,7 +55,8 @@ class BenchResult:
     max_abs_error: float    # 0 for exact integer, may be non-zero for float/tolerance
     hdl_cycles: int         # total hardware cycles across all kernels
     sim_wall_s: float       # simulation wall-clock seconds (0.0 for float path)
-    tg_wall_s: float        # tinygrad CPU reference wall-clock seconds
+    tg_wall: float          # tinygrad optimized CPU reference wall-clock seconds
+    tg_wall_noopt: float    # tinygrad NOOPT=1 wall-clock seconds
     float_path: bool        # True when float-mode path was used
     output_hdl: np.ndarray
     output_ref: np.ndarray
@@ -64,7 +67,8 @@ class BenchResult:
         return (
             f"[{status}] {self.name} [{mode}]: "
             f"err={self.max_abs_error:.4g} cycles={self.hdl_cycles} "
-            f"sim={self.sim_wall_s:.3f}s tg={self.tg_wall_s:.4f}s"
+            f"sim={self.sim_wall_s:.3f}s tg={self.tg_wall:.4f}s "
+            f"tg_noopt={self.tg_wall_noopt:.4f}s"
         )
 
 
@@ -100,6 +104,16 @@ def _detect_connections(compute_items):
     return connections, external_slots
 
 
+@contextmanager
+def _noopt_scope(value=1):
+    old = tg_noopt.value
+    tg_noopt.value = value
+    try:
+        yield
+    finally:
+        tg_noopt.value = old
+
+
 # ---------------------------------------------------------------------------
 # run_bench
 # ---------------------------------------------------------------------------
@@ -127,6 +141,16 @@ def run_bench(name: str, build_fn, input_arrays: list, exact: bool = True) -> Be
     # ------------------------------------------------------------------
     # 1. tinygrad CPU reference
     # ------------------------------------------------------------------
+    # warm up both execution modes outside timing to avoid one-time compile skew
+    _ = build_fn([Tensor(a) for a in input_arrays]).numpy().flatten()
+    with _noopt_scope(1):
+        _ = build_fn([Tensor(a) for a in input_arrays]).numpy().flatten()
+
+    with _noopt_scope(1):
+        t1 = time.perf_counter()
+        ref_noopt = build_fn([Tensor(a) for a in input_arrays]).numpy().flatten()
+        tg_wall_noopt = time.perf_counter() - t1
+
     t0 = time.perf_counter()
     ref_tensors = [Tensor(a) for a in input_arrays]
     ref_out = build_fn(ref_tensors).numpy().flatten()
@@ -139,10 +163,10 @@ def run_bench(name: str, build_fn, input_arrays: list, exact: bool = True) -> Be
     # ------------------------------------------------------------------
     syms = [Tensor.empty(a.shape, dtype=Tensor(a).dtype) for a in input_arrays]
     out_sym = build_fn(syms)
-    schedule = out_sym.schedule()
-
-    compute_items = [si for si in schedule if si.ast.op == Ops.SINK]
-    kernel_specs = compile_model(schedule)
+    with _noopt_scope(1):
+        schedule = out_sym.schedule()
+        compute_items = [si for si in schedule if si.ast.op == Ops.SINK]
+        kernel_specs = compile_model(schedule)
 
     # ------------------------------------------------------------------
     # 3. Amaranth simulation (integer and float32 paths both go through here)
@@ -211,7 +235,8 @@ def run_bench(name: str, build_fn, input_arrays: list, exact: bool = True) -> Be
         max_abs_error=max_err,
         hdl_cycles=total_cycles,
         sim_wall_s=sim_wall,
-        tg_wall_s=tg_wall,
+        tg_wall=tg_wall,
+        tg_wall_noopt=tg_wall_noopt,
         float_path=False,
         output_hdl=hdl_out,
         output_ref=ref_out,
@@ -225,7 +250,6 @@ def run_bench(name: str, build_fn, input_arrays: list, exact: bool = True) -> Be
 if __name__ == "__main__":
     import sys
 
-    os.environ.setdefault("NOOPT", "1")
     os.environ.setdefault("DEBUG", "0")
 
     from tinygrad import dtypes

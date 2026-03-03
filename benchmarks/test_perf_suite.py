@@ -22,7 +22,6 @@ Run everything:
 
 import os
 
-os.environ.setdefault("NOOPT", "1")
 os.environ.setdefault("DEBUG", "0")
 
 import numpy as np
@@ -68,7 +67,7 @@ def _report(r):
         f"\n  {mode} {r.name}: "
         f"cycles={r.hdl_cycles:,}  "
         f"sim={r.sim_wall_s:.3f}s  "
-        f"tg={r.tg_wall_s:.4f}s  "
+        f"tg={r.tg_wall:.4f}s  tg_noopt={r.tg_wall_noopt:.4f}s  "
         f"err={r.max_abs_error:.4g}"
     )
 
