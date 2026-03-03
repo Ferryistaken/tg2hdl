@@ -321,360 +321,253 @@ def _simulate_int8_stream(kernels_i8, x_batch, w1, b1, w2, b2):
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
-    # --- Weights ---
-    state = safe_load("mnist_weights.safetensors")
-    w1 = state["l1.weight"].numpy()   # (128, 784) float32
-    b1 = state["l1.bias"].numpy()     # (128,)     float32
-    w2 = state["l2.weight"].numpy()   # (10, 128)  float32
-    b2 = state["l2.bias"].numpy()     # (10,)      float32
+def _parse_args():
+    import argparse
 
-    # --- Test image + batch ---
+    parser = argparse.ArgumentParser(description="MNIST CPU/GPU/FPGA inference comparison")
+    parser.add_argument("--img-idx", type=int, default=0, help="MNIST test index for single-image comparison")
+    parser.add_argument("--batch-size", type=int, default=64, help="Batch size for multi-image comparison")
+
+    parser.add_argument("--cpu-warmup", type=int, default=3)
+    parser.add_argument("--cpu-runs", type=int, default=20)
+    parser.add_argument("--gpu-warmup", type=int, default=3)
+    parser.add_argument("--gpu-runs", type=int, default=50)
+
+    parser.add_argument("--skip-cpu", action="store_true", help="Disable CPU measurements")
+    parser.add_argument("--skip-gpu", action="store_true", help="Disable GPU measurements")
+    parser.add_argument("--skip-fp32", action="store_true", help="Disable FP32 FPGA path")
+    parser.add_argument("--skip-int8", action="store_true", help="Disable INT8 FPGA path")
+    parser.add_argument("--skip-stream", action="store_true", help="Disable multi-image FPGA stream simulation")
+    parser.add_argument("--skip-synth", action="store_true", help="Skip synthesis estimation even if tools exist")
+    return parser.parse_args()
+
+
+def _load_data(img_idx: int, batch_size: int):
+    state = safe_load("mnist_weights.safetensors")
+    w1 = state["l1.weight"].numpy()
+    b1 = state["l1.bias"].numpy()
+    w2 = state["l2.weight"].numpy()
+    b2 = state["l2.bias"].numpy()
+
     _, _, X_test, y_test = mnist()
-    img_idx = 0
-    batch_size = 64
     x_single = X_test[img_idx].numpy().reshape(1, 784).astype(np.float32) / 255.0
     label = int(y_test[img_idx].numpy())
     x_batch = X_test[:batch_size].numpy().reshape(batch_size, 784).astype(np.float32) / 255.0
     labels_batch = y_test[:batch_size].numpy().astype(np.int32)
+    return (w1, b1, w2, b2), (x_single, label, x_batch, labels_batch)
+
+
+def main():
+    args = _parse_args()
+    Tensor.training = False
+
+    (w1, b1, w2, b2), (x_single, label, x_batch, labels_batch) = _load_data(args.img_idx, args.batch_size)
     x_float = x_single.reshape(784)
 
     print("=" * 60)
     print("MNIST Inference Comparison  (A=CPU · B=FP32-HDL · C=INT8-HDL)")
     print("=" * 60)
-    print(f"Test image index: {img_idx}, true label: {label}")
+    print(f"Test image index: {args.img_idx}, true label: {label}")
+    print(f"Config: batch={args.batch_size}, cpu_runs={args.cpu_runs}, gpu_runs={args.gpu_runs}")
     print()
 
-    # ================================================================
-    # Path A: tinygrad float32 CPU (optimized + NOOPT)
-    # ================================================================
-    Tensor.training = False
-    pred_cpu_arr, t_cpu_ms = _cpu_inference(x_single, w1, b1, w2, b2, noopt=0)
-    pred_cpu_noopt_arr, t_cpu_noopt_ms = _cpu_inference(x_single, w1, b1, w2, b2, noopt=1)
-    pred_cpu = int(pred_cpu_arr[0])
-    pred_cpu_noopt = int(pred_cpu_noopt_arr[0])
+    pred_cpu = pred_cpu_noopt = None
+    t_cpu_ms = t_cpu_noopt_ms = None
+    t_cpu_batch_ms = t_cpu_batch_noopt_ms = None
 
-    pred_cpu_batch_arr, t_cpu_batch_ms = _cpu_inference(x_batch, w1, b1, w2, b2, noopt=0)
-    pred_cpu_batch_noopt_arr, t_cpu_batch_noopt_ms = _cpu_inference(x_batch, w1, b1, w2, b2, noopt=1)
-    batch_acc_opt = float((pred_cpu_batch_arr == labels_batch).mean())
-    batch_acc_noopt = float((pred_cpu_batch_noopt_arr == labels_batch).mean())
-
-    mark = "✓" if pred_cpu == label else "✗"
-    mark_noopt = "✓" if pred_cpu_noopt == label else "✗"
-    print(f"Path A — tinygrad float32 CPU:")
-    print(f"  prediction (NOOPT=0): {pred_cpu} {mark}")
-    print(f"  prediction (NOOPT=1): {pred_cpu_noopt} {mark_noopt}")
-    print(f"  wall-clock (NOOPT=0): {t_cpu_ms:.3f} ms")
-    print(f"  wall-clock (NOOPT=1): {t_cpu_noopt_ms:.3f} ms")
-    print(f"  batch={batch_size} avg (NOOPT=0): {t_cpu_batch_ms:.3f} ms  ({t_cpu_batch_ms/batch_size:.3f} ms/img, acc={batch_acc_opt*100:.1f}%)")
-    print(f"  batch={batch_size} avg (NOOPT=1): {t_cpu_batch_noopt_ms:.3f} ms  ({t_cpu_batch_noopt_ms/batch_size:.3f} ms/img, acc={batch_acc_noopt*100:.1f}%)")
-    print()
-
-    # ================================================================
-    # Path G: GPU (if available)
-    # ================================================================
-    print("Path G — tinygrad float32 GPU:", end=" ", flush=True)
-    gpu_device = _detect_gpu()
-    pred_gpu_opt = gpu_ms_opt = None
-    pred_gpu_noopt = gpu_ms_noopt = None
+    pred_gpu_opt = pred_gpu_noopt = None
+    gpu_ms_opt = gpu_ms_noopt = None
     gpu_batch_ms_opt = gpu_batch_ms_noopt = None
-    pred_gpu_batch_opt = pred_gpu_batch_noopt = None
-    if gpu_device is None:
-        print("no GPU detected (tried: " + ", ".join(_GPU_BACKENDS) + ")")
-    else:
-        print(f"{gpu_device} detected, running...", end=" ", flush=True)
-        try:
-            pred_gpu_opt_arr, gpu_ms_opt = _gpu_inference(x_single, w1, b1, w2, b2, gpu_device, noopt=0)
-            pred_gpu_noopt_arr, gpu_ms_noopt = _gpu_inference(x_single, w1, b1, w2, b2, gpu_device, noopt=1)
-            pred_gpu_opt = int(pred_gpu_opt_arr[0])
-            pred_gpu_noopt = int(pred_gpu_noopt_arr[0])
+    gpu_device = None
 
-            pred_gpu_batch_opt, gpu_batch_ms_opt = _gpu_inference(x_batch, w1, b1, w2, b2, gpu_device, noopt=0)
-            pred_gpu_batch_noopt, gpu_batch_ms_noopt = _gpu_inference(x_batch, w1, b1, w2, b2, gpu_device, noopt=1)
+    kernels_fp32 = []
+    kernels_i8 = []
+    stats_fp32 = []
+    stats_i8 = []
 
-            mark_opt = "✓" if pred_gpu_opt == label else "✗"
-            mark_noopt = "✓" if pred_gpu_noopt == label else "✗"
-            batch_acc_gpu_opt = float((pred_gpu_batch_opt == labels_batch).mean())
-            batch_acc_gpu_noopt = float((pred_gpu_batch_noopt == labels_batch).mean())
-            print("done")
-            print(f"  prediction (NOOPT=0): {pred_gpu_opt} {mark_opt}")
-            print(f"  prediction (NOOPT=1): {pred_gpu_noopt} {mark_noopt}")
-            print(f"  avg of 50 runs (NOOPT=0): {gpu_ms_opt:.3f} ms  (single image)")
-            print(f"  avg of 50 runs (NOOPT=1): {gpu_ms_noopt:.3f} ms  (single image)")
-            print(f"  batch={batch_size} avg (NOOPT=0): {gpu_batch_ms_opt:.3f} ms  ({gpu_batch_ms_opt/batch_size:.3f} ms/img, acc={batch_acc_gpu_opt*100:.1f}%)")
-            print(f"  batch={batch_size} avg (NOOPT=1): {gpu_batch_ms_noopt:.3f} ms  ({gpu_batch_ms_noopt/batch_size:.3f} ms/img, acc={batch_acc_gpu_noopt*100:.1f}%)")
-        except Exception as e:
-            print(f"failed ({e})")
-            gpu_device = None
-    print()
+    pred_fp32 = pred_i8 = None
+    cyc_fp32_total = cyc_i8_total = None
 
-    # ================================================================
-    # Path B: float32 HDL simulation
-    # ================================================================
-    print("Path B \u2014 float32 HDL simulation (FP32Add / FP32Mul / FP32Cmp):")
-    print("  Note: full MNIST simulation (~100k cycles) may take several minutes.")
-    print()
+    pred_fp32_stream = pred_i8_stream = None
+    cyc_fp32_stream_total = cyc_i8_stream_total = None
 
-    with _noopt_scope(1):
-        kernels_fp32 = _compile_kernels(_build_fp32_schedule())
-    print(f"  compiled {len(kernels_fp32)} kernels")
-    print(f"  synthesising for ECP5 45F (Yosys + nextpnr-ecp5)...", end=" ", flush=True)
-    stats_fp32 = [_synthesis_stats(k) for k in kernels_fp32]
-    if stats_fp32[0]["from_synth"]:
-        print("done")
-    else:
-        print("tools not found, using RTLIL estimates")
+    # CPU
+    if not args.skip_cpu:
+        pred_cpu_arr, t_cpu_ms = _cpu_inference(
+            x_single, w1, b1, w2, b2, noopt=0, warmup=args.cpu_warmup, runs=args.cpu_runs
+        )
+        pred_cpu_noopt_arr, t_cpu_noopt_ms = _cpu_inference(
+            x_single, w1, b1, w2, b2, noopt=1, warmup=args.cpu_warmup, runs=args.cpu_runs
+        )
+        pred_cpu = int(pred_cpu_arr[0])
+        pred_cpu_noopt = int(pred_cpu_noopt_arr[0])
 
-    # tinygrad layout: x(1,784) @ w(784,128) — so weights must be transposed
-    # from safetensors (128,784) → (784,128)
-    w1_fp32 = w1.T.astype(np.float32)   # (784, 128) float32
-    w2_fp32 = w2.T.astype(np.float32)   # (128, 10)  float32
+        pred_cpu_batch_arr, t_cpu_batch_ms = _cpu_inference(
+            x_batch, w1, b1, w2, b2, noopt=0, warmup=args.cpu_warmup, runs=args.cpu_runs
+        )
+        pred_cpu_batch_noopt_arr, t_cpu_batch_noopt_ms = _cpu_inference(
+            x_batch, w1, b1, w2, b2, noopt=1, warmup=args.cpu_warmup, runs=args.cpu_runs
+        )
+        batch_acc_opt = float((pred_cpu_batch_arr == labels_batch).mean())
+        batch_acc_noopt = float((pred_cpu_batch_noopt_arr == labels_batch).mean())
 
-    print(f"  running kernel 0 (128\u00d7784 GEMV + bias + ReLU)...", end=" ", flush=True)
-    out1_fp32, cyc0_fp32, wall0_fp32 = simulate_kernel(
-        kernels_fp32[0],
-        {1: x_float,         # (784,)    float32
-         2: w1_fp32.flatten(), # (100352,) float32
-         3: b1},              # (128,)    float32
-    )
-    print(f"done ({wall0_fp32:.1f}s)")
+        print("Path A — tinygrad float32 CPU:")
+        print(f"  prediction (NOOPT=0): {pred_cpu} {'✓' if pred_cpu == label else '✗'}")
+        print(f"  prediction (NOOPT=1): {pred_cpu_noopt} {'✓' if pred_cpu_noopt == label else '✗'}")
+        print(f"  wall-clock (NOOPT=0): {t_cpu_ms:.3f} ms")
+        print(f"  wall-clock (NOOPT=1): {t_cpu_noopt_ms:.3f} ms")
+        print(f"  batch={args.batch_size} avg (NOOPT=0): {t_cpu_batch_ms:.3f} ms  ({t_cpu_batch_ms/args.batch_size:.3f} ms/img, acc={batch_acc_opt*100:.1f}%)")
+        print(f"  batch={args.batch_size} avg (NOOPT=1): {t_cpu_batch_noopt_ms:.3f} ms  ({t_cpu_batch_noopt_ms/args.batch_size:.3f} ms/img, acc={batch_acc_noopt*100:.1f}%)")
+        print()
 
-    # simulate_kernel returns int32 bit-patterns; reinterpret as float32
-    hidden_fp32 = out1_fp32.astype(np.uint32).view(np.float32)
+    # GPU
+    if not args.skip_gpu:
+        print("Path G — tinygrad float32 GPU:", end=" ", flush=True)
+        gpu_device = _detect_gpu()
+        if gpu_device is None:
+            print("no GPU detected (tried: " + ", ".join(_GPU_BACKENDS) + ")")
+        else:
+            print(f"{gpu_device} detected, running...", end=" ", flush=True)
+            try:
+                pred_gpu_opt_arr, gpu_ms_opt = _gpu_inference(
+                    x_single, w1, b1, w2, b2, gpu_device, noopt=0, warmup=args.gpu_warmup, runs=args.gpu_runs
+                )
+                pred_gpu_noopt_arr, gpu_ms_noopt = _gpu_inference(
+                    x_single, w1, b1, w2, b2, gpu_device, noopt=1, warmup=args.gpu_warmup, runs=args.gpu_runs
+                )
+                pred_gpu_opt = int(pred_gpu_opt_arr[0])
+                pred_gpu_noopt = int(pred_gpu_noopt_arr[0])
 
-    print(f"  running kernel 1 (10\u00d7128 GEMV + bias)...", end=" ", flush=True)
-    out2_fp32, cyc1_fp32, wall1_fp32 = simulate_kernel(
-        kernels_fp32[1],
-        {1: hidden_fp32,       # (128,)    float32 from kernel 0
-         2: w2_fp32.flatten(), # (1280,)   float32
-         3: b2},               # (10,)     float32
-    )
-    print(f"done ({wall1_fp32:.1f}s)")
+                _, gpu_batch_ms_opt = _gpu_inference(
+                    x_batch, w1, b1, w2, b2, gpu_device, noopt=0, warmup=args.gpu_warmup, runs=args.gpu_runs
+                )
+                _, gpu_batch_ms_noopt = _gpu_inference(
+                    x_batch, w1, b1, w2, b2, gpu_device, noopt=1, warmup=args.gpu_warmup, runs=args.gpu_runs
+                )
+                print("done")
+                print(f"  prediction (NOOPT=0): {pred_gpu_opt} {'✓' if pred_gpu_opt == label else '✗'}")
+                print(f"  prediction (NOOPT=1): {pred_gpu_noopt} {'✓' if pred_gpu_noopt == label else '✗'}")
+                print(f"  avg runs (NOOPT=0): {gpu_ms_opt:.3f} ms  (single image)")
+                print(f"  avg runs (NOOPT=1): {gpu_ms_noopt:.3f} ms  (single image)")
+                print(f"  batch={args.batch_size} avg (NOOPT=0): {gpu_batch_ms_opt:.3f} ms  ({gpu_batch_ms_opt/args.batch_size:.3f} ms/img)")
+                print(f"  batch={args.batch_size} avg (NOOPT=1): {gpu_batch_ms_noopt:.3f} ms  ({gpu_batch_ms_noopt/args.batch_size:.3f} ms/img)")
+            except Exception as e:
+                print(f"failed ({e})")
+                gpu_device = None
+        print()
 
-    logits_fp32_hdl = out2_fp32.astype(np.uint32).view(np.float32)
-    pred_fp32       = int(logits_fp32_hdl.argmax())
-    cyc_fp32_total  = cyc0_fp32 + cyc1_fp32
-    wall_fp32_total = wall0_fp32 + wall1_fp32
+    if (not args.skip_fp32) or (not args.skip_int8):
+        print("Compiling FPGA kernels...")
 
-    mark = "\u2713" if pred_fp32 == label else "\u2717"
-    print()
-    print(f"  prediction: {pred_fp32} {mark}")
-    print(f"  kernel 0: {cyc0_fp32:>7,} cycles ({cyc0_fp32 * 10:>10,} ns at 100 MHz)")
-    print(f"  kernel 1: {cyc1_fp32:>7,} cycles ({cyc1_fp32 * 10:>10,} ns at 100 MHz)")
-    print(f"  total:    {cyc_fp32_total:>7,} cycles ({cyc_fp32_total * 10:>10,} ns at 100 MHz)")
-    print(f"  sim wall-clock: {wall_fp32_total:.1f}s")
-    print()
+    # FP32 FPGA
+    if not args.skip_fp32:
+        print("Path B — float32 FPGA simulation:")
+        with _noopt_scope(1):
+            kernels_fp32 = _compile_kernels(_build_fp32_schedule())
+        print(f"  compiled {len(kernels_fp32)} kernels")
+        if args.skip_synth:
+            stats_fp32 = [_synthesis_stats(k) | {"from_synth": False} for k in kernels_fp32]
+            print("  synthesis stats skipped by option")
+        else:
+            print("  synthesising for ECP5 45F...", end=" ", flush=True)
+            stats_fp32 = [_synthesis_stats(k) for k in kernels_fp32]
+            print("done" if stats_fp32[0]["from_synth"] else "tools not found, using RTLIL estimates")
 
-    # ================================================================
-    # Path C: INT8 quantized HDL simulation
-    # ================================================================
-    print("Path C \u2014 INT8 quantized HDL simulation:")
-    print()
+        w1_fp32 = w1.T.astype(np.float32)
+        w2_fp32 = w2.T.astype(np.float32)
+        out1_fp32, cyc0_fp32, wall0_fp32 = simulate_kernel(kernels_fp32[0], {1: x_float, 2: w1_fp32.flatten(), 3: b1})
+        hidden_fp32 = out1_fp32.astype(np.uint32).view(np.float32)
+        out2_fp32, cyc1_fp32, wall1_fp32 = simulate_kernel(kernels_fp32[1], {1: hidden_fp32, 2: w2_fp32.flatten(), 3: b2})
+        logits_fp32_hdl = out2_fp32.astype(np.uint32).view(np.float32)
+        pred_fp32 = int(logits_fp32_hdl.argmax())
+        cyc_fp32_total = cyc0_fp32 + cyc1_fp32
+        print(f"  prediction: {pred_fp32} {'✓' if pred_fp32 == label else '✗'}")
+        print(f"  total cycles: {cyc_fp32_total:,}  sim wall: {wall0_fp32 + wall1_fp32:.1f}s")
+        print()
 
-    with _noopt_scope(1):
-        kernels_i8 = _compile_kernels(_build_int8_schedule())
-    print(f"  compiled {len(kernels_i8)} kernels")
-    print(f"  synthesising for ECP5 45F (Yosys + nextpnr-ecp5)...", end=" ", flush=True)
-    stats_i8 = [_synthesis_stats(k) for k in kernels_i8]
-    if stats_i8[0]["from_synth"]:
-        print("done")
-    else:
-        print("tools not found, using RTLIL estimates")
+    # INT8 FPGA
+    if not args.skip_int8:
+        print("Path C — INT8 FPGA simulation:")
+        with _noopt_scope(1):
+            kernels_i8 = _compile_kernels(_build_int8_schedule())
+        print(f"  compiled {len(kernels_i8)} kernels")
+        if args.skip_synth:
+            stats_i8 = [_synthesis_stats(k) | {"from_synth": False} for k in kernels_i8]
+            print("  synthesis stats skipped by option")
+        else:
+            print("  synthesising for ECP5 45F...", end=" ", flush=True)
+            stats_i8 = [_synthesis_stats(k) for k in kernels_i8]
+            print("done" if stats_i8[0]["from_synth"] else "tools not found, using RTLIL estimates")
 
-    w1_q, w1_scale = quantize_int8(w1)
-    x_q,  x_scale  = quantize_int8(x_float)
-    w1_tg = w1_q.T.flatten()   # (784,128) int8 flattened
-    b1_q  = np.round(b1 / (w1_scale * x_scale)).astype(np.int32)
+        w1_q, w1_scale = quantize_int8(w1)
+        x_q, x_scale = quantize_int8(x_float)
+        w1_tg = w1_q.T.flatten()
+        b1_q = np.round(b1 / (w1_scale * x_scale)).astype(np.int32)
+        out1_i8, cyc0_i8, wall0_i8 = simulate_kernel(kernels_i8[0], {1: x_q, 2: w1_tg, 3: b1_q})
+        hidden_i8 = out1_i8.astype(np.int8)
 
-    print(f"  running kernel 0 (128\u00d7784 GEMV + bias + ReLU)...", end=" ", flush=True)
-    out1_i8, cyc0_i8, wall0_i8 = simulate_kernel(
-        kernels_i8[0],
-        {1: x_q, 2: w1_tg, 3: b1_q},
-    )
-    print(f"done ({wall0_i8:.1f}s)")
+        w2_q, w2_scale = quantize_int8(w2)
+        w2_tg = w2_q.T.flatten()
+        b2_q = np.round(b2 / (w2_scale * 1.0)).astype(np.int32)
+        out2_i8, cyc1_i8, wall1_i8 = simulate_kernel(kernels_i8[1], {1: hidden_i8.astype(np.int32), 2: w2_tg, 3: b2_q})
+        logits_i8_hdl = out2_i8.astype(np.float64) * w2_scale + b2
+        pred_i8 = int(logits_i8_hdl.argmax())
+        cyc_i8_total = cyc0_i8 + cyc1_i8
+        print(f"  prediction: {pred_i8} {'✓' if pred_i8 == label else '✗'}")
+        print(f"  total cycles: {cyc_i8_total:,}  sim wall: {wall0_i8 + wall1_i8:.1f}s")
+        print()
 
-    hidden_i8 = out1_i8.astype(np.int8)
+    if (not args.skip_stream) and kernels_fp32:
+        print(f"Path S — FP32 FPGA stream simulation over N={args.batch_size} images...")
+        pred_fp32_stream, cyc_fp32_stream_total, wall_fp32_stream_total = _simulate_fp32_stream(kernels_fp32, x_batch, w1, b1, w2, b2)
+        print(f"  done in {wall_fp32_stream_total:.1f}s, acc={(pred_fp32_stream == labels_batch).mean()*100:.1f}%")
+    if (not args.skip_stream) and kernels_i8:
+        print(f"Path S — INT8 FPGA stream simulation over N={args.batch_size} images...")
+        pred_i8_stream, cyc_i8_stream_total, wall_i8_stream_total = _simulate_int8_stream(kernels_i8, x_batch, w1, b1, w2, b2)
+        print(f"  done in {wall_i8_stream_total:.1f}s, acc={(pred_i8_stream == labels_batch).mean()*100:.1f}%")
+    if not args.skip_stream:
+        print()
 
-    w2_q, w2_scale = quantize_int8(w2)
-    w2_tg = w2_q.T.flatten()   # (128,10) int8 flattened
-    b2_q  = np.round(b2 / (w2_scale * 1.0)).astype(np.int32)
-
-    print(f"  running kernel 1 (10\u00d7128 GEMV + bias)...", end=" ", flush=True)
-    out2_i8, cyc1_i8, wall1_i8 = simulate_kernel(
-        kernels_i8[1],
-        {1: hidden_i8.astype(np.int32), 2: w2_tg, 3: b2_q},
-    )
-    print(f"done ({wall1_i8:.1f}s)")
-
-    logits_i8_hdl = out2_i8.astype(np.float64) * w2_scale + b2
-    pred_i8       = int(logits_i8_hdl.argmax())
-    cyc_i8_total  = cyc0_i8 + cyc1_i8
-    wall_i8_total = wall0_i8 + wall1_i8
-
-    mark = "\u2713" if pred_i8 == label else "\u2717"
-    print()
-    print(f"  prediction: {pred_i8} {mark}")
-    print(f"  kernel 0: {cyc0_i8:>7,} cycles ({cyc0_i8 * 10:>10,} ns at 100 MHz)")
-    print(f"  kernel 1: {cyc1_i8:>7,} cycles ({cyc1_i8 * 10:>10,} ns at 100 MHz)")
-    print(f"  total:    {cyc_i8_total:>7,} cycles ({cyc_i8_total * 10:>10,} ns at 100 MHz)")
-    print(f"  sim wall-clock: {wall_i8_total:.1f}s")
-    print()
-
-    # ================================================================
-    # Multi-image FPGA streaming simulation (actual, not scaled)
-    # ================================================================
-    print(f"Path S — FPGA streaming simulation over N={batch_size} images:")
-    print("  Note: this runs full sequential simulation for each image and can take a long time.")
-
-    print("  running FP32 stream...", end=" ", flush=True)
-    pred_fp32_stream, cyc_fp32_stream_total, wall_fp32_stream_total = _simulate_fp32_stream(
-        kernels_fp32, x_batch, w1, b1, w2, b2
-    )
-    fp32_stream_acc = float((pred_fp32_stream == labels_batch).mean())
-    print(f"done ({wall_fp32_stream_total:.1f}s)")
-
-    print("  running INT8 stream...", end=" ", flush=True)
-    pred_i8_stream, cyc_i8_stream_total, wall_i8_stream_total = _simulate_int8_stream(
-        kernels_i8, x_batch, w1, b1, w2, b2
-    )
-    i8_stream_acc = float((pred_i8_stream == labels_batch).mean())
-    print(f"done ({wall_i8_stream_total:.1f}s)")
-    print()
-
-    # ================================================================
-    # Summary
-    # ================================================================
     print("=" * 60)
+    print("Latency summary")
+    if t_cpu_ms is not None:
+        print(f"  CPU single NOOPT=0/1: {t_cpu_ms:.3f} / {t_cpu_noopt_ms:.3f} ms")
+        print(f"  CPU batch  NOOPT=0/1: {t_cpu_batch_ms:.3f} / {t_cpu_batch_noopt_ms:.3f} ms")
+    if gpu_ms_opt is not None:
+        print(f"  GPU single NOOPT=0/1: {gpu_ms_opt:.3f} / {gpu_ms_noopt:.3f} ms")
+        print(f"  GPU batch  NOOPT=0/1: {gpu_batch_ms_opt:.3f} / {gpu_batch_ms_noopt:.3f} ms")
 
-    # --- Predictions ---
-    preds = [pred_cpu, pred_cpu_noopt, pred_fp32, pred_i8]
-    if pred_gpu_opt is not None:
-        preds.extend([pred_gpu_opt, pred_gpu_noopt])
-    all_agree = len(set(preds)) == 1
-    print(f"Predictions (true label: {label})")
-    print(f"  CPU float32 NOOPT=0: {pred_cpu}  {'\u2713' if pred_cpu == label else '\u2717'}")
-    print(f"  CPU float32 NOOPT=1: {pred_cpu_noopt}  {'\u2713' if pred_cpu_noopt == label else '\u2717'}")
-    if pred_gpu_opt is not None:
-        print(f"  GPU {gpu_device:<8} NOOPT=0: {pred_gpu_opt}  {'\u2713' if pred_gpu_opt == label else '\u2717'}")
-        print(f"  GPU {gpu_device:<8} NOOPT=1: {pred_gpu_noopt}  {'\u2713' if pred_gpu_noopt == label else '\u2717'}")
-    print(f"  FP32 HDL    : {pred_fp32}  {'\u2713' if pred_fp32 == label else '\u2717'}")
-    print(f"  INT8 HDL    : {pred_i8}  {'\u2713' if pred_i8 == label else '\u2717'}")
-    print(f"  All agree   : {'YES' if all_agree else 'NO'}")
-    print()
-
-    # --- Latency ---
-    # Fmax: use minimum across all synthesised kernels (same clock domain)
-    all_fmax = [s["fmax_mhz"] for s in stats_fp32 + stats_i8 if s["fmax_mhz"] is not None]
+    all_stats = stats_fp32 + stats_i8
+    all_fmax = [s["fmax_mhz"] for s in all_stats if s["fmax_mhz"] is not None]
     fmax_mhz = min(all_fmax) if all_fmax else None
 
-    cpu_ms = t_cpu_ms
-    cpu_noopt_ms = t_cpu_noopt_ms
-    cpu_batch_ms = t_cpu_batch_ms
-    cpu_batch_noopt_ms = t_cpu_batch_noopt_ms
-
-    hw_fp32_ms_100 = cyc_fp32_total / 100e6 * 1e3
-    hw_i8_ms_100   = cyc_i8_total   / 100e6 * 1e3
-    hw_fp32_stream_ms_100 = cyc_fp32_stream_total / 100e6 * 1e3
-    hw_i8_stream_ms_100   = cyc_i8_stream_total / 100e6 * 1e3
-
-    if fmax_mhz is not None:
-        hw_fp32_ms_fmax = cyc_fp32_total / (fmax_mhz * 1e6) * 1e3
-        hw_i8_ms_fmax   = cyc_i8_total   / (fmax_mhz * 1e6) * 1e3
-        hw_fp32_stream_ms_fmax = cyc_fp32_stream_total / (fmax_mhz * 1e6) * 1e3
-        hw_i8_stream_ms_fmax   = cyc_i8_stream_total / (fmax_mhz * 1e6) * 1e3
-    else:
-        hw_fp32_ms_fmax = hw_i8_ms_fmax = None
-        hw_fp32_stream_ms_fmax = hw_i8_stream_ms_fmax = None
-
-    print("Single-image latency comparison:")
-    print(f"  CPU float32 NOOPT=0: {cpu_ms:>8.3f} ms")
-    print(f"  CPU float32 NOOPT=1: {cpu_noopt_ms:>8.3f} ms")
-    if gpu_ms_opt is not None:
-        print(f"  GPU {gpu_device:<8} NOOPT=0: {gpu_ms_opt:>8.3f} ms")
-        print(f"  GPU {gpu_device:<8} NOOPT=1: {gpu_ms_noopt:>8.3f} ms")
-    else:
-        print(f"  GPU         :      N/A     (no GPU detected)")
+    if cyc_fp32_total is not None:
+        ms100 = cyc_fp32_total / 100e6 * 1e3
+        print(f"  FP32 FPGA single: {ms100:.3f} ms @100MHz ({cyc_fp32_total:,} cyc)")
+    if cyc_i8_total is not None:
+        ms100 = cyc_i8_total / 100e6 * 1e3
+        print(f"  INT8 FPGA single: {ms100:.3f} ms @100MHz ({cyc_i8_total:,} cyc)")
+    if cyc_fp32_stream_total is not None:
+        ms100 = cyc_fp32_stream_total / 100e6 * 1e3
+        print(f"  FP32 FPGA stream: {ms100:.3f} ms @100MHz ({cyc_fp32_stream_total:,} cyc)")
+    if cyc_i8_stream_total is not None:
+        ms100 = cyc_i8_stream_total / 100e6 * 1e3
+        print(f"  INT8 FPGA stream: {ms100:.3f} ms @100MHz ({cyc_i8_stream_total:,} cyc)")
 
     if fmax_mhz is not None:
-        print(f"  FP32 FPGA   : {hw_fp32_ms_100:>8.3f} ms at 100 MHz / {hw_fp32_ms_fmax:.3f} ms at {fmax_mhz:.0f} MHz")
-        print(f"  INT8 FPGA   : {hw_i8_ms_100:>8.3f} ms at 100 MHz / {hw_i8_ms_fmax:.3f} ms at {fmax_mhz:.0f} MHz")
-    else:
-        print(f"  FP32 FPGA   : {hw_fp32_ms_100:>8.3f} ms at 100 MHz")
-        print(f"  INT8 FPGA   : {hw_i8_ms_100:>8.3f} ms at 100 MHz")
-    print()
+        print(f"  Synthesized worst-case Fmax: {fmax_mhz:.1f} MHz")
 
-    print(f"Multi-image comparison (N={batch_size}):")
-    print(f"  CPU batch NOOPT=0: {cpu_batch_ms:>8.3f} ms  ({cpu_batch_ms/batch_size:.3f} ms/img)")
-    print(f"  CPU batch NOOPT=1: {cpu_batch_noopt_ms:>8.3f} ms  ({cpu_batch_noopt_ms/batch_size:.3f} ms/img)")
-    if gpu_ms_opt is not None:
-        print(f"  GPU batch NOOPT=0: {gpu_batch_ms_opt:>8.3f} ms  ({gpu_batch_ms_opt/batch_size:.3f} ms/img)")
-        print(f"  GPU batch NOOPT=1: {gpu_batch_ms_noopt:>8.3f} ms  ({gpu_batch_ms_noopt/batch_size:.3f} ms/img)")
-    else:
-        print(f"  GPU batch      :      N/A     (no GPU detected)")
-
-    if fmax_mhz is not None:
-        print(f"  FP32 FPGA stream: {hw_fp32_stream_ms_100:>8.3f} ms at 100 MHz / {hw_fp32_stream_ms_fmax:.3f} ms at {fmax_mhz:.0f} MHz")
-        print(f"  INT8 FPGA stream: {hw_i8_stream_ms_100:>8.3f} ms at 100 MHz / {hw_i8_stream_ms_fmax:.3f} ms at {fmax_mhz:.0f} MHz")
-    else:
-        print(f"  FP32 FPGA stream: {hw_fp32_stream_ms_100:>8.3f} ms at 100 MHz")
-        print(f"  INT8 FPGA stream: {hw_i8_stream_ms_100:>8.3f} ms at 100 MHz")
-
-    single_ref_ms = gpu_ms_opt if gpu_ms_opt is not None else cpu_ms
-    single_ref_lbl = f"GPU ({gpu_device}, NOOPT=0)" if gpu_ms_opt is not None else "CPU (NOOPT=0)"
-    single_fpga_ms = hw_fp32_ms_fmax if hw_fp32_ms_fmax is not None else hw_fp32_ms_100
-    single_ratio = single_ref_ms / single_fpga_ms
-
-    multi_ref_ms = gpu_batch_ms_opt if gpu_batch_ms_opt is not None else cpu_batch_ms
-    multi_ref_lbl = f"GPU batch ({gpu_device}, NOOPT=0)" if gpu_batch_ms_opt is not None else "CPU batch (NOOPT=0)"
-    multi_fpga_ms = hw_fp32_stream_ms_fmax if hw_fp32_stream_ms_fmax is not None else hw_fp32_stream_ms_100
-    multi_ratio = multi_ref_ms / multi_fpga_ms
-
-    if single_ratio < 1.0:
-        print(f"  → Single-image: {single_ref_lbl} is {1/single_ratio:.1f}× faster than FP32 FPGA")
-    else:
-        print(f"  → Single-image: FP32 FPGA is {single_ratio:.1f}× faster than {single_ref_lbl}")
-
-    if multi_ratio < 1.0:
-        print(f"  → Multi-image: {multi_ref_lbl} is {1/multi_ratio:.1f}× faster than FP32 FPGA stream")
-    else:
-        print(f"  → Multi-image: FP32 FPGA stream is {multi_ratio:.1f}× faster than {multi_ref_lbl}")
-
-    print("  [note] FPGA stream uses actual repeated simulation per image; wall-clock includes simulator overhead.")
-    print()
-
-    # --- Hardware resources (ECP5 45F synthesis) ---
-    from_synth = stats_fp32[0]["from_synth"]
-    src_label  = "ECP5 45F — Yosys + nextpnr-ecp5" if from_synth else "RTLIL pre-synthesis estimates"
-    fp32_total_mem = sum(s["mem_bits"] for s in stats_fp32)
-    i8_total_mem   = sum(s["mem_bits"] for s in stats_i8)
-    fp32_ramb36    = math.ceil(fp32_total_mem / _RAMB36_BITS)
-    i8_ramb36      = math.ceil(i8_total_mem   / _RAMB36_BITS)
-
-    print(f"Hardware resources ({src_label}):")
-    if from_synth:
-        hdr = f"  {'':16s}  {'mem KB':>7s}  {'COMB':>6s}  {'FF':>5s}  {'DP16KD':>6s}  {'MULT18':>6s}  {'FP32 units':>10s}"
-        print(hdr)
-        for i, s in enumerate(stats_fp32):
-            print(f"  float32 kernel {i}  {s['mem_bits']/8/1024:>7.1f}"
-                  f"  {s['comb']:>6d}  {s['ff']:>5d}  {s['dp16kd']:>6d}  {s['mult18']:>6d}"
-                  f"  {s['fp32_units']:>10d}")
-        for i, s in enumerate(stats_i8):
-            print(f"  int8    kernel {i}  {s['mem_bits']/8/1024:>7.1f}"
-                  f"  {s['comb']:>6d}  {s['ff']:>5d}  {s['dp16kd']:>6d}  {s['mult18']:>6d}"
-                  f"  {'N/A':>10s}")
-        if fmax_mhz is not None:
-            print(f"  worst-case Fmax: {fmax_mhz:.1f} MHz  (ECP5 45F, CABGA381, no pipeline regs)")
-    else:
-        print(f"  {'':16s}  {'mem':>8s}  {'FP32 units':>10s}")
-        for i, s in enumerate(stats_fp32):
-            print(f"  float32 kernel {i}  {s['mem_bits']/8/1024:>7.1f} KB  {s['fp32_units']:>10d}")
-        for i, s in enumerate(stats_i8):
-            print(f"  int8    kernel {i}  {s['mem_bits']/8/1024:>7.1f} KB  {'N/A':>10s}")
-    print()
-    print(f"  float32 total on-chip: {fp32_total_mem/8/1024:>6.1f} KB  → ~{fp32_ramb36} Xilinx RAMB36")
-    print(f"  int8    total on-chip: {i8_total_mem/8/1024:>6.1f} KB  → ~{i8_ramb36} Xilinx RAMB36")
-    print(f"  (dominated by weight matrices; streaming from SDRAM collapses")
-    print(f"   on-chip BRAM to activation buffers only: ~1 KB per kernel)")
+    if stats_fp32 or stats_i8:
+        from_synth = (stats_fp32[0]["from_synth"] if stats_fp32 else stats_i8[0]["from_synth"])
+        src_label = "ECP5 45F — Yosys + nextpnr-ecp5" if from_synth else "RTLIL pre-synthesis estimates"
+        fp32_total_mem = sum(s["mem_bits"] for s in stats_fp32)
+        i8_total_mem = sum(s["mem_bits"] for s in stats_i8)
+        fp32_ramb36 = math.ceil(fp32_total_mem / _RAMB36_BITS) if fp32_total_mem else 0
+        i8_ramb36 = math.ceil(i8_total_mem / _RAMB36_BITS) if i8_total_mem else 0
+        print()
+        print(f"Hardware resources ({src_label}):")
+        print(f"  float32 total on-chip: {fp32_total_mem/8/1024:>6.1f} KB  → ~{fp32_ramb36} Xilinx RAMB36")
+        print(f"  int8    total on-chip: {i8_total_mem/8/1024:>6.1f} KB  → ~{i8_ramb36} Xilinx RAMB36")
 
 
 if __name__ == "__main__":
