@@ -13,14 +13,15 @@ Warning: full MNIST simulation (100k+ cycles) takes several minutes per path.
 """
 
 import os
+from contextlib import contextmanager
 
-os.environ["NOOPT"] = "1"
 os.environ["DEBUG"] = "0"
 
 import math
 import time
 import numpy as np
 from tinygrad import Tensor, dtypes
+from tinygrad.helpers import NOOPT as tg_noopt
 from tinygrad.nn.datasets import mnist
 from tinygrad.nn.state import safe_load
 from tinygrad.uop.ops import Ops
@@ -28,6 +29,16 @@ from tinygrad.uop.ops import Ops
 from compiler import HDLRenderer, compile_kernel, simulate_kernel
 from utils import quantize_int8
 from compiler.backend import _get_uops
+
+
+@contextmanager
+def _noopt_scope(value=1):
+    old = tg_noopt.value
+    tg_noopt.value = value
+    try:
+        yield
+    finally:
+        tg_noopt.value = old
 
 
 # ---------------------------------------------------------------------------
@@ -188,10 +199,11 @@ def _gpu_inference(x_float, w1, b1, w2, b2, device, warmup=3, runs=50):
 def _compile_kernels(sched):
     renderer = HDLRenderer()
     kernels = []
-    for si in sched:
-        if si.ast.op != Ops.SINK:
-            continue
-        kernels.append(compile_kernel(_get_uops(si.ast, renderer)))
+    with _noopt_scope(1):
+        for si in sched:
+            if si.ast.op != Ops.SINK:
+                continue
+            kernels.append(compile_kernel(_get_uops(si.ast, renderer)))
     return kernels
 
 
@@ -290,7 +302,8 @@ def main():
     print("  Note: full MNIST simulation (~100k cycles) may take several minutes.")
     print()
 
-    kernels_fp32 = _compile_kernels(_build_fp32_schedule())
+    with _noopt_scope(1):
+        kernels_fp32 = _compile_kernels(_build_fp32_schedule())
     print(f"  compiled {len(kernels_fp32)} kernels")
     print(f"  synthesising for ECP5 45F (Yosys + nextpnr-ecp5)...", end=" ", flush=True)
     stats_fp32 = [_synthesis_stats(k) for k in kernels_fp32]
@@ -345,7 +358,8 @@ def main():
     print("Path C \u2014 INT8 quantized HDL simulation:")
     print()
 
-    kernels_i8 = _compile_kernels(_build_int8_schedule())
+    with _noopt_scope(1):
+        kernels_i8 = _compile_kernels(_build_int8_schedule())
     print(f"  compiled {len(kernels_i8)} kernels")
     print(f"  synthesising for ECP5 45F (Yosys + nextpnr-ecp5)...", end=" ", flush=True)
     stats_i8 = [_synthesis_stats(k) for k in kernels_i8]

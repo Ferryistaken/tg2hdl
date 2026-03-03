@@ -14,7 +14,6 @@ Each test asserts result.correct and prints cycle counts.
 
 import os
 
-os.environ.setdefault("NOOPT", "1")
 os.environ.setdefault("DEBUG", "0")
 
 import numpy as np

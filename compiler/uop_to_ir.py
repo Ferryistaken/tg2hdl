@@ -153,7 +153,7 @@ def uop_to_ir(uops, buf_metas: list) -> KernelIR:
             val_map[id(u)] = val_map.get(id(u.src[0])) if u.src else None
             continue
 
-        elif u.op in (Ops.SINK,):
+        elif u.op in (Ops.SINK, Ops.GROUP):
             continue
 
         # ----------------------------------------------------------------
