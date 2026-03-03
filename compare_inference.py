@@ -489,42 +489,75 @@ def main():
     cpu_noopt_ms = t_cpu_noopt_ms
     cpu_batch_ms = t_cpu_batch_ms
     cpu_batch_noopt_ms = t_cpu_batch_noopt_ms
+
     hw_fp32_ms_100 = cyc_fp32_total / 100e6 * 1e3
     hw_i8_ms_100   = cyc_i8_total   / 100e6 * 1e3
-
-    print(f"Inference latency (single image):")
-    print(f"  CPU float32 NOOPT=0: {cpu_ms:>8.3f} ms  (single image)")
-    print(f"  CPU float32 NOOPT=1: {cpu_noopt_ms:>8.3f} ms  (single image)")
-    print(f"  CPU batch={batch_size} NOOPT=0: {cpu_batch_ms:>8.3f} ms  ({cpu_batch_ms/batch_size:.3f} ms/img)")
-    print(f"  CPU batch={batch_size} NOOPT=1: {cpu_batch_noopt_ms:>8.3f} ms  ({cpu_batch_noopt_ms/batch_size:.3f} ms/img)")
-    if gpu_ms_opt is not None:
-        print(f"  GPU {gpu_device:<8} NOOPT=0: {gpu_ms_opt:>8.3f} ms  (single image)")
-        print(f"  GPU {gpu_device:<8} NOOPT=1: {gpu_ms_noopt:>8.3f} ms  (single image)")
-        print(f"  GPU {gpu_device:<8} batch={batch_size} NOOPT=0: {gpu_batch_ms_opt:>8.3f} ms  ({gpu_batch_ms_opt/batch_size:.3f} ms/img)")
-        print(f"  GPU {gpu_device:<8} batch={batch_size} NOOPT=1: {gpu_batch_ms_noopt:>8.3f} ms  ({gpu_batch_ms_noopt/batch_size:.3f} ms/img)")
-    else:
-        print(f"  GPU         :      N/A     (no GPU detected)")
+    hw_fp32_stream_ms_100 = hw_fp32_ms_100 * batch_size
+    hw_i8_stream_ms_100   = hw_i8_ms_100 * batch_size
 
     if fmax_mhz is not None:
         hw_fp32_ms_fmax = cyc_fp32_total / (fmax_mhz * 1e6) * 1e3
         hw_i8_ms_fmax   = cyc_i8_total   / (fmax_mhz * 1e6) * 1e3
-        print(f"  FP32 HDL    : {hw_fp32_ms_100:>8.3f} ms  at 100 MHz  "
-              f"/ {hw_fp32_ms_fmax:.3f} ms  at {fmax_mhz:.0f} MHz  ({cyc_fp32_total:,} cycles)")
-        print(f"  INT8 HDL    : {hw_i8_ms_100:>8.3f} ms  at 100 MHz  "
-              f"/ {hw_i8_ms_fmax:.3f} ms  at {fmax_mhz:.0f} MHz  ({cyc_i8_total:,} cycles)")
+        hw_fp32_stream_ms_fmax = hw_fp32_ms_fmax * batch_size
+        hw_i8_stream_ms_fmax   = hw_i8_ms_fmax * batch_size
     else:
-        print(f"  FP32 HDL    : {hw_fp32_ms_100:>8.3f} ms  ({cyc_fp32_total:,} cycles at 100 MHz)")
-        print(f"  INT8 HDL    : {hw_i8_ms_100:>8.3f} ms  ({cyc_i8_total:,} cycles at 100 MHz)")
+        hw_fp32_ms_fmax = hw_i8_ms_fmax = None
+        hw_fp32_stream_ms_fmax = hw_i8_stream_ms_fmax = None
 
-    _ref_ms = gpu_ms_opt if gpu_ms_opt is not None else cpu_ms
-    _ref_lbl = f"GPU ({gpu_device}, NOOPT=0)" if gpu_ms_opt is not None else "CPU (NOOPT=0)"
-    _hdl_ms  = hw_fp32_ms_fmax if fmax_mhz is not None else hw_fp32_ms_100
-    _ratio   = _ref_ms / _hdl_ms
-    if _ratio < 1.0:
-        print(f"  → {_ref_lbl} is {1/_ratio:.1f}× faster than FP32 HDL  "
-              f"(sequential 1-MAC/cycle FSM — pipelining + batching needed to compete)")
+    print("Single-image latency comparison:")
+    print(f"  CPU float32 NOOPT=0: {cpu_ms:>8.3f} ms")
+    print(f"  CPU float32 NOOPT=1: {cpu_noopt_ms:>8.3f} ms")
+    if gpu_ms_opt is not None:
+        print(f"  GPU {gpu_device:<8} NOOPT=0: {gpu_ms_opt:>8.3f} ms")
+        print(f"  GPU {gpu_device:<8} NOOPT=1: {gpu_ms_noopt:>8.3f} ms")
     else:
-        print(f"  → FP32 HDL is {_ratio:.1f}× faster than {_ref_lbl}")
+        print(f"  GPU         :      N/A     (no GPU detected)")
+
+    if fmax_mhz is not None:
+        print(f"  FP32 FPGA   : {hw_fp32_ms_100:>8.3f} ms at 100 MHz / {hw_fp32_ms_fmax:.3f} ms at {fmax_mhz:.0f} MHz")
+        print(f"  INT8 FPGA   : {hw_i8_ms_100:>8.3f} ms at 100 MHz / {hw_i8_ms_fmax:.3f} ms at {fmax_mhz:.0f} MHz")
+    else:
+        print(f"  FP32 FPGA   : {hw_fp32_ms_100:>8.3f} ms at 100 MHz")
+        print(f"  INT8 FPGA   : {hw_i8_ms_100:>8.3f} ms at 100 MHz")
+    print()
+
+    print(f"Multi-image comparison (N={batch_size}):")
+    print(f"  CPU batch NOOPT=0: {cpu_batch_ms:>8.3f} ms  ({cpu_batch_ms/batch_size:.3f} ms/img)")
+    print(f"  CPU batch NOOPT=1: {cpu_batch_noopt_ms:>8.3f} ms  ({cpu_batch_noopt_ms/batch_size:.3f} ms/img)")
+    if gpu_ms_opt is not None:
+        print(f"  GPU batch NOOPT=0: {gpu_batch_ms_opt:>8.3f} ms  ({gpu_batch_ms_opt/batch_size:.3f} ms/img)")
+        print(f"  GPU batch NOOPT=1: {gpu_batch_ms_noopt:>8.3f} ms  ({gpu_batch_ms_noopt/batch_size:.3f} ms/img)")
+    else:
+        print(f"  GPU batch      :      N/A     (no GPU detected)")
+
+    if fmax_mhz is not None:
+        print(f"  FP32 FPGA stream: {hw_fp32_stream_ms_100:>8.3f} ms at 100 MHz / {hw_fp32_stream_ms_fmax:.3f} ms at {fmax_mhz:.0f} MHz")
+        print(f"  INT8 FPGA stream: {hw_i8_stream_ms_100:>8.3f} ms at 100 MHz / {hw_i8_stream_ms_fmax:.3f} ms at {fmax_mhz:.0f} MHz")
+    else:
+        print(f"  FP32 FPGA stream: {hw_fp32_stream_ms_100:>8.3f} ms at 100 MHz")
+        print(f"  INT8 FPGA stream: {hw_i8_stream_ms_100:>8.3f} ms at 100 MHz")
+
+    single_ref_ms = gpu_ms_opt if gpu_ms_opt is not None else cpu_ms
+    single_ref_lbl = f"GPU ({gpu_device}, NOOPT=0)" if gpu_ms_opt is not None else "CPU (NOOPT=0)"
+    single_fpga_ms = hw_fp32_ms_fmax if hw_fp32_ms_fmax is not None else hw_fp32_ms_100
+    single_ratio = single_ref_ms / single_fpga_ms
+
+    multi_ref_ms = gpu_batch_ms_opt if gpu_batch_ms_opt is not None else cpu_batch_ms
+    multi_ref_lbl = f"GPU batch ({gpu_device}, NOOPT=0)" if gpu_batch_ms_opt is not None else "CPU batch (NOOPT=0)"
+    multi_fpga_ms = hw_fp32_stream_ms_fmax if hw_fp32_stream_ms_fmax is not None else hw_fp32_stream_ms_100
+    multi_ratio = multi_ref_ms / multi_fpga_ms
+
+    if single_ratio < 1.0:
+        print(f"  → Single-image: {single_ref_lbl} is {1/single_ratio:.1f}× faster than FP32 FPGA")
+    else:
+        print(f"  → Single-image: FP32 FPGA is {single_ratio:.1f}× faster than {single_ref_lbl}")
+
+    if multi_ratio < 1.0:
+        print(f"  → Multi-image: {multi_ref_lbl} is {1/multi_ratio:.1f}× faster than FP32 FPGA stream")
+    else:
+        print(f"  → Multi-image: FP32 FPGA stream is {multi_ratio:.1f}× faster than {multi_ref_lbl}")
+
+    print("  [note] FPGA stream estimate assumes image-by-image execution with no host I/O stalls and no additional per-image bubbles beyond measured kernel cycles.")
     print()
 
     # --- Hardware resources (ECP5 45F synthesis) ---
