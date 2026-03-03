@@ -256,6 +256,67 @@ def _build_int8_schedule():
     return logits.schedule()
 
 
+def _simulate_fp32_stream(kernels_fp32, x_batch, w1, b1, w2, b2):
+    """Simulate batch_size images sequentially through FP32 FPGA kernels."""
+    w1_fp32 = w1.T.astype(np.float32).flatten()
+    w2_fp32 = w2.T.astype(np.float32).flatten()
+
+    preds = []
+    total_cycles = 0
+    total_wall = 0.0
+    for i in range(x_batch.shape[0]):
+        out1_fp32, cyc0, wall0 = simulate_kernel(
+            kernels_fp32[0],
+            {1: x_batch[i], 2: w1_fp32, 3: b1},
+        )
+        hidden_fp32 = out1_fp32.astype(np.uint32).view(np.float32)
+
+        out2_fp32, cyc1, wall1 = simulate_kernel(
+            kernels_fp32[1],
+            {1: hidden_fp32, 2: w2_fp32, 3: b2},
+        )
+        logits = out2_fp32.astype(np.uint32).view(np.float32)
+        preds.append(int(logits.argmax()))
+        total_cycles += cyc0 + cyc1
+        total_wall += wall0 + wall1
+
+    return np.asarray(preds, dtype=np.int32), total_cycles, total_wall
+
+
+def _simulate_int8_stream(kernels_i8, x_batch, w1, b1, w2, b2):
+    """Simulate batch_size images sequentially through INT8 FPGA kernels."""
+    w1_q, w1_scale = quantize_int8(w1)
+    w2_q, w2_scale = quantize_int8(w2)
+    w1_tg = w1_q.T.flatten()
+    w2_tg = w2_q.T.flatten()
+
+    preds = []
+    total_cycles = 0
+    total_wall = 0.0
+    for i in range(x_batch.shape[0]):
+        x_q, x_scale = quantize_int8(x_batch[i])
+        b1_q = np.round(b1 / (w1_scale * x_scale)).astype(np.int32)
+
+        out1_i8, cyc0, wall0 = simulate_kernel(
+            kernels_i8[0],
+            {1: x_q, 2: w1_tg, 3: b1_q},
+        )
+        hidden_i8 = out1_i8.astype(np.int8)
+
+        b2_q = np.round(b2 / (w2_scale * 1.0)).astype(np.int32)
+        out2_i8, cyc1, wall1 = simulate_kernel(
+            kernels_i8[1],
+            {1: hidden_i8.astype(np.int32), 2: w2_tg, 3: b2_q},
+        )
+
+        logits = out2_i8.astype(np.float64) * w2_scale + b2
+        preds.append(int(logits.argmax()))
+        total_cycles += cyc0 + cyc1
+        total_wall += wall0 + wall1
+
+    return np.asarray(preds, dtype=np.int32), total_cycles, total_wall
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -460,6 +521,27 @@ def main():
     print()
 
     # ================================================================
+    # Multi-image FPGA streaming simulation (actual, not scaled)
+    # ================================================================
+    print(f"Path S — FPGA streaming simulation over N={batch_size} images:")
+    print("  Note: this runs full sequential simulation for each image and can take a long time.")
+
+    print("  running FP32 stream...", end=" ", flush=True)
+    pred_fp32_stream, cyc_fp32_stream_total, wall_fp32_stream_total = _simulate_fp32_stream(
+        kernels_fp32, x_batch, w1, b1, w2, b2
+    )
+    fp32_stream_acc = float((pred_fp32_stream == labels_batch).mean())
+    print(f"done ({wall_fp32_stream_total:.1f}s)")
+
+    print("  running INT8 stream...", end=" ", flush=True)
+    pred_i8_stream, cyc_i8_stream_total, wall_i8_stream_total = _simulate_int8_stream(
+        kernels_i8, x_batch, w1, b1, w2, b2
+    )
+    i8_stream_acc = float((pred_i8_stream == labels_batch).mean())
+    print(f"done ({wall_i8_stream_total:.1f}s)")
+    print()
+
+    # ================================================================
     # Summary
     # ================================================================
     print("=" * 60)
@@ -492,14 +574,14 @@ def main():
 
     hw_fp32_ms_100 = cyc_fp32_total / 100e6 * 1e3
     hw_i8_ms_100   = cyc_i8_total   / 100e6 * 1e3
-    hw_fp32_stream_ms_100 = hw_fp32_ms_100 * batch_size
-    hw_i8_stream_ms_100   = hw_i8_ms_100 * batch_size
+    hw_fp32_stream_ms_100 = cyc_fp32_stream_total / 100e6 * 1e3
+    hw_i8_stream_ms_100   = cyc_i8_stream_total / 100e6 * 1e3
 
     if fmax_mhz is not None:
         hw_fp32_ms_fmax = cyc_fp32_total / (fmax_mhz * 1e6) * 1e3
         hw_i8_ms_fmax   = cyc_i8_total   / (fmax_mhz * 1e6) * 1e3
-        hw_fp32_stream_ms_fmax = hw_fp32_ms_fmax * batch_size
-        hw_i8_stream_ms_fmax   = hw_i8_ms_fmax * batch_size
+        hw_fp32_stream_ms_fmax = cyc_fp32_stream_total / (fmax_mhz * 1e6) * 1e3
+        hw_i8_stream_ms_fmax   = cyc_i8_stream_total / (fmax_mhz * 1e6) * 1e3
     else:
         hw_fp32_ms_fmax = hw_i8_ms_fmax = None
         hw_fp32_stream_ms_fmax = hw_i8_stream_ms_fmax = None
@@ -557,7 +639,7 @@ def main():
     else:
         print(f"  → Multi-image: FP32 FPGA stream is {multi_ratio:.1f}× faster than {multi_ref_lbl}")
 
-    print("  [note] FPGA stream estimate assumes image-by-image execution with no host I/O stalls and no additional per-image bubbles beyond measured kernel cycles.")
+    print("  [note] FPGA stream uses actual repeated simulation per image; wall-clock includes simulator overhead.")
     print()
 
     # --- Hardware resources (ECP5 45F synthesis) ---
