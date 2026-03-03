@@ -163,31 +163,48 @@ def _detect_gpu():
     return None
 
 
-def _gpu_inference(x_float, w1, b1, w2, b2, device, warmup=3, runs=50):
+def _cpu_inference(x_float, w1, b1, w2, b2, *, noopt: int):
+    """Run one CPU forward pass under a specific NOOPT setting."""
+    with _noopt_scope(noopt):
+        x_t = Tensor(x_float.reshape(1, 784))
+        w1_t, b1_t = Tensor(w1), Tensor(b1)
+        w2_t, b2_t = Tensor(w2), Tensor(b2)
+
+        t0 = time.perf_counter()
+        h_cpu = (x_t.linear(w1_t.T, b1_t)).relu()
+        logits_cpu = h_cpu.linear(w2_t.T, b2_t)
+        logits_cpu_np = logits_cpu.numpy().flatten()
+        wall_s = time.perf_counter() - t0
+
+    return int(logits_cpu_np.argmax()), wall_s
+
+
+def _gpu_inference(x_float, w1, b1, w2, b2, device, warmup=3, runs=50, *, noopt: int):
     """Run MNIST forward pass on *device*, return (pred, avg_ms).
 
     Does *warmup* un-timed passes (kernel compilation / JIT tracing), then
     averages *runs* timed passes.  Each pass calls .numpy() to synchronise
     before stopping the clock.
     """
-    x_t  = Tensor(x_float.reshape(1, 784), device=device)
-    w1_t = Tensor(w1, device=device)
-    b1_t = Tensor(b1, device=device)
-    w2_t = Tensor(w2, device=device)
-    b2_t = Tensor(b2, device=device)
+    with _noopt_scope(noopt):
+        x_t  = Tensor(x_float.reshape(1, 784), device=device)
+        w1_t = Tensor(w1, device=device)
+        b1_t = Tensor(b1, device=device)
+        w2_t = Tensor(w2, device=device)
+        b2_t = Tensor(b2, device=device)
 
-    def _forward():
-        h      = (x_t.linear(w1_t.T, b1_t)).relu()
-        logits = h.linear(w2_t.T, b2_t)
-        return logits.numpy().flatten()
+        def _forward():
+            h      = (x_t.linear(w1_t.T, b1_t)).relu()
+            logits = h.linear(w2_t.T, b2_t)
+            return logits.numpy().flatten()
 
-    for _ in range(warmup):
-        _forward()
+        for _ in range(warmup):
+            _forward()
 
-    t0 = time.perf_counter()
-    for _ in range(runs):
-        out = _forward()
-    avg_ms = (time.perf_counter() - t0) / runs * 1e3
+        t0 = time.perf_counter()
+        for _ in range(runs):
+            out = _forward()
+        avg_ms = (time.perf_counter() - t0) / runs * 1e3
 
     return int(out.argmax()), avg_ms
 
@@ -254,42 +271,46 @@ def main():
     print()
 
     # ================================================================
-    # Path A: tinygrad float32 CPU
+    # Path A: tinygrad float32 CPU (optimized + NOOPT)
     # ================================================================
     Tensor.training = False
-    x_t  = Tensor(x_float.reshape(1, 784))
-    w1_t, b1_t = Tensor(w1), Tensor(b1)
-    w2_t, b2_t = Tensor(w2), Tensor(b2)
+    pred_cpu, t_cpu = _cpu_inference(x_float, w1, b1, w2, b2, noopt=0)
+    pred_cpu_noopt, t_cpu_noopt = _cpu_inference(x_float, w1, b1, w2, b2, noopt=1)
 
-    t0 = time.perf_counter()
-    h_cpu     = (x_t.linear(w1_t.T, b1_t)).relu()
-    logits_cpu = h_cpu.linear(w2_t.T, b2_t)
-    logits_cpu_np = logits_cpu.numpy().flatten()
-    pred_cpu  = int(logits_cpu_np.argmax())
-    t_cpu     = time.perf_counter() - t0
-
-    mark = "\u2713" if pred_cpu == label else "\u2717"
-    print(f"Path A \u2014 tinygrad float32 CPU:")
-    print(f"  prediction: {pred_cpu} {mark}")
-    print(f"  wall-clock: {t_cpu*1000:.2f} ms")
+    mark = "✓" if pred_cpu == label else "✗"
+    mark_noopt = "✓" if pred_cpu_noopt == label else "✗"
+    print(f"Path A — tinygrad float32 CPU:")
+    print(f"  prediction (NOOPT=0): {pred_cpu} {mark}")
+    print(f"  prediction (NOOPT=1): {pred_cpu_noopt} {mark_noopt}")
+    print(f"  wall-clock (NOOPT=0): {t_cpu*1000:.2f} ms")
+    print(f"  wall-clock (NOOPT=1): {t_cpu_noopt*1000:.2f} ms")
     print()
 
     # ================================================================
     # Path G: GPU (if available)
     # ================================================================
-    print("Path G \u2014 tinygrad float32 GPU:", end=" ", flush=True)
+    print("Path G — tinygrad float32 GPU:", end=" ", flush=True)
     gpu_device = _detect_gpu()
-    pred_gpu = gpu_ms = None
+    pred_gpu_opt = gpu_ms_opt = None
+    pred_gpu_noopt = gpu_ms_noopt = None
     if gpu_device is None:
         print("no GPU detected (tried: " + ", ".join(_GPU_BACKENDS) + ")")
     else:
         print(f"{gpu_device} detected, running...", end=" ", flush=True)
         try:
-            pred_gpu, gpu_ms = _gpu_inference(x_float, w1, b1, w2, b2, gpu_device)
-            mark = "\u2713" if pred_gpu == label else "\u2717"
-            print(f"done")
-            print(f"  prediction: {pred_gpu} {mark}")
-            print(f"  avg of 50 runs: {gpu_ms:.3f} ms  (after 3 warmup passes)")
+            pred_gpu_opt, gpu_ms_opt = _gpu_inference(
+                x_float, w1, b1, w2, b2, gpu_device, noopt=0
+            )
+            pred_gpu_noopt, gpu_ms_noopt = _gpu_inference(
+                x_float, w1, b1, w2, b2, gpu_device, noopt=1
+            )
+            mark_opt = "✓" if pred_gpu_opt == label else "✗"
+            mark_noopt = "✓" if pred_gpu_noopt == label else "✗"
+            print("done")
+            print(f"  prediction (NOOPT=0): {pred_gpu_opt} {mark_opt}")
+            print(f"  prediction (NOOPT=1): {pred_gpu_noopt} {mark_noopt}")
+            print(f"  avg of 50 runs (NOOPT=0): {gpu_ms_opt:.3f} ms  (after 3 warmup passes)")
+            print(f"  avg of 50 runs (NOOPT=1): {gpu_ms_noopt:.3f} ms  (after 3 warmup passes)")
         except Exception as e:
             print(f"failed ({e})")
             gpu_device = None
@@ -413,14 +434,16 @@ def main():
     print("=" * 60)
 
     # --- Predictions ---
-    preds = [pred_cpu, pred_fp32, pred_i8]
-    if pred_gpu is not None:
-        preds.append(pred_gpu)
+    preds = [pred_cpu, pred_cpu_noopt, pred_fp32, pred_i8]
+    if pred_gpu_opt is not None:
+        preds.extend([pred_gpu_opt, pred_gpu_noopt])
     all_agree = len(set(preds)) == 1
     print(f"Predictions (true label: {label})")
-    print(f"  CPU float32 : {pred_cpu}  {'\u2713' if pred_cpu == label else '\u2717'}")
-    if pred_gpu is not None:
-        print(f"  GPU {gpu_device:<8}: {pred_gpu}  {'\u2713' if pred_gpu == label else '\u2717'}")
+    print(f"  CPU float32 NOOPT=0: {pred_cpu}  {'\u2713' if pred_cpu == label else '\u2717'}")
+    print(f"  CPU float32 NOOPT=1: {pred_cpu_noopt}  {'\u2713' if pred_cpu_noopt == label else '\u2717'}")
+    if pred_gpu_opt is not None:
+        print(f"  GPU {gpu_device:<8} NOOPT=0: {pred_gpu_opt}  {'\u2713' if pred_gpu_opt == label else '\u2717'}")
+        print(f"  GPU {gpu_device:<8} NOOPT=1: {pred_gpu_noopt}  {'\u2713' if pred_gpu_noopt == label else '\u2717'}")
     print(f"  FP32 HDL    : {pred_fp32}  {'\u2713' if pred_fp32 == label else '\u2717'}")
     print(f"  INT8 HDL    : {pred_i8}  {'\u2713' if pred_i8 == label else '\u2717'}")
     print(f"  All agree   : {'YES' if all_agree else 'NO'}")
@@ -431,14 +454,17 @@ def main():
     all_fmax = [s["fmax_mhz"] for s in stats_fp32 + stats_i8 if s["fmax_mhz"] is not None]
     fmax_mhz = min(all_fmax) if all_fmax else None
 
-    cpu_ms     = t_cpu * 1e3
+    cpu_ms = t_cpu * 1e3
+    cpu_noopt_ms = t_cpu_noopt * 1e3
     hw_fp32_ms_100 = cyc_fp32_total / 100e6 * 1e3
     hw_i8_ms_100   = cyc_i8_total   / 100e6 * 1e3
 
     print(f"Inference latency (single image):")
-    print(f"  CPU float32 : {cpu_ms:>8.3f} ms  (wall-clock, numpy/BLAS)")
-    if gpu_ms is not None:
-        print(f"  GPU {gpu_device:<8}: {gpu_ms:>8.3f} ms  (avg of 50 runs, float32)")
+    print(f"  CPU float32 NOOPT=0: {cpu_ms:>8.3f} ms  (wall-clock, numpy/BLAS)")
+    print(f"  CPU float32 NOOPT=1: {cpu_noopt_ms:>8.3f} ms  (wall-clock, numpy/BLAS)")
+    if gpu_ms_opt is not None:
+        print(f"  GPU {gpu_device:<8} NOOPT=0: {gpu_ms_opt:>8.3f} ms  (avg of 50 runs, float32)")
+        print(f"  GPU {gpu_device:<8} NOOPT=1: {gpu_ms_noopt:>8.3f} ms  (avg of 50 runs, float32)")
     else:
         print(f"  GPU         :      N/A     (no GPU detected)")
 
@@ -453,8 +479,8 @@ def main():
         print(f"  FP32 HDL    : {hw_fp32_ms_100:>8.3f} ms  ({cyc_fp32_total:,} cycles at 100 MHz)")
         print(f"  INT8 HDL    : {hw_i8_ms_100:>8.3f} ms  ({cyc_i8_total:,} cycles at 100 MHz)")
 
-    _ref_ms  = gpu_ms if gpu_ms is not None else cpu_ms
-    _ref_lbl = f"GPU ({gpu_device})" if gpu_ms is not None else "CPU"
+    _ref_ms = gpu_ms_opt if gpu_ms_opt is not None else cpu_ms
+    _ref_lbl = f"GPU ({gpu_device}, NOOPT=0)" if gpu_ms_opt is not None else "CPU (NOOPT=0)"
     _hdl_ms  = hw_fp32_ms_fmax if fmax_mhz is not None else hw_fp32_ms_100
     _ratio   = _ref_ms / _hdl_ms
     if _ratio < 1.0:
