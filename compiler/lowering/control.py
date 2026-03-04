@@ -188,14 +188,17 @@ def _emit_stores(m, stores, result: ArithResult, int_wports: dict):
                     "but no write port exists for that buffer index. "
                     "Check that _create_memories() created a write port for every buffer."
                 )
-            wp_idx = used_wports.get(store.buf_idx, 0)
-            if wp_idx >= len(wps):
-                raise RuntimeError(
-                    f"_emit_stores: IRBufStore targets buf_idx={store.buf_idx} requires "
-                    f"{wp_idx + 1} concurrent write ports but only {len(wps)} exist."
-                )
-            wp = wps[wp_idx]
-            used_wports[store.buf_idx] = wp_idx + 1
+            if len(wps) == 1:
+                wp = wps[0]
+            else:
+                wp_idx = used_wports.get(store.buf_idx, 0)
+                if wp_idx >= len(wps):
+                    raise RuntimeError(
+                        f"_emit_stores: IRBufStore targets buf_idx={store.buf_idx} requires "
+                        f"{wp_idx + 1} concurrent write ports but only {len(wps)} exist."
+                    )
+                wp = wps[wp_idx]
+                used_wports[store.buf_idx] = wp_idx + 1
             m.d.comb += [
                 wp.addr.eq(addr_sig),
                 wp.data.eq(value_sig),

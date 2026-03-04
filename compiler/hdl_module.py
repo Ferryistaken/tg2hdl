@@ -32,6 +32,8 @@ class CompiledKernel(Elaboratable):
         self.compile_options = compile_options
         self.compile_report = {}
         self._active_unroll = 1
+        self._read_port_budget = {}
+        self._write_port_budget = {}
 
         # Control signals
         self.start = Signal()
@@ -92,6 +94,7 @@ class CompiledKernel(Elaboratable):
             "unroll_fallback_reason": unroll_info.fallback_reason,
         }
         self._active_unroll = unroll_info.applied_unroll
+        self._read_port_budget, self._write_port_budget = self._estimate_port_budgets(kernel_ir)
 
         # --- Pass 1: Create memories/ports ---
         memories, int_rports, int_wports = self._create_memories(m)
@@ -142,14 +145,14 @@ class CompiledKernel(Elaboratable):
 
             # Internal combinational read ports (one per active lane)
             lane_reads = []
-            for lane in range(max(self._active_unroll, 1)):
+            for _ in range(max(self._read_port_budget.get(idx, 1), 1)):
                 rp = mem.read_port(domain="comb")
                 lane_reads.append(rp)
             int_rports[idx] = lane_reads
 
             # Internal write ports (external loading uses port 0)
             lane_writes = []
-            for lane in range(max(self._active_unroll, 1)):
+            for _ in range(max(self._write_port_budget.get(idx, 1), 1)):
                 wp = mem.write_port()
                 lane_writes.append(wp)
             int_wports[idx] = lane_writes
@@ -184,3 +187,52 @@ class CompiledKernel(Elaboratable):
             ]
             for extra_wp in int_wports[idx][1:]:
                 m.d.comb += extra_wp.en.eq(0)
+
+    def _estimate_port_budgets(self, kernel_ir):
+        from .ir import IRBufLoad, IRBufStore, IROp, IRRegStore
+
+        read_nodes = {}
+        write_budget = {b["idx"]: 1 for b in self.buf_infos}
+
+        def collect_val(v):
+            if isinstance(v, IRBufLoad):
+                read_nodes.setdefault(v.buf_idx, set()).add(id(v))
+                collect_val(v.addr)
+            elif isinstance(v, IROp):
+                for s in v.srcs:
+                    collect_val(s)
+
+        def consume_store_list(stores):
+            per_buf_writes = {}
+            for s in stores:
+                if isinstance(s, IRBufStore):
+                    per_buf_writes[s.buf_idx] = per_buf_writes.get(s.buf_idx, 0) + 1
+                    collect_val(s.addr)
+                    collect_val(s.value)
+                elif isinstance(s, IRRegStore):
+                    collect_val(s.value)
+            for buf_idx, cnt in per_buf_writes.items():
+                write_budget[buf_idx] = max(write_budget.get(buf_idx, 1), cnt)
+
+        levels = []
+        level = kernel_ir.loop_tree.body
+        while level is not None:
+            levels.append(level)
+            level = level.body
+
+        if not levels:
+            root_scalar = kernel_ir.scalar_stores + [
+                s for s in (kernel_ir.loop_tree.prologue + kernel_ir.loop_tree.epilogue)
+                if isinstance(s, IRBufStore)
+            ]
+            consume_store_list(root_scalar)
+        else:
+            for lvl in levels:
+                consume_store_list(lvl.prologue)
+                consume_store_list(lvl.epilogue)
+
+        read_budget = {b["idx"]: 1 for b in self.buf_infos}
+        for buf_idx, nodes in read_nodes.items():
+            read_budget[buf_idx] = max(read_budget.get(buf_idx, 1), len(nodes))
+
+        return read_budget, write_budget

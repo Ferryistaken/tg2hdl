@@ -139,109 +139,112 @@ def run_bench(name: str, build_fn, input_arrays: list, exact: bool = True, *, un
     -------
     BenchResult
     """
-    # ------------------------------------------------------------------
-    # 1. tinygrad CPU reference
-    # ------------------------------------------------------------------
-    # warm up both execution modes outside timing to avoid one-time compile skew
-    _ = build_fn([Tensor(a) for a in input_arrays]).numpy().flatten()
-    with _noopt_scope(1):
+    try:
+        # ------------------------------------------------------------------
+        # 1. tinygrad CPU reference
+        # ------------------------------------------------------------------
+        # warm up both execution modes outside timing to avoid one-time compile skew
         _ = build_fn([Tensor(a) for a in input_arrays]).numpy().flatten()
+        with _noopt_scope(1):
+            _ = build_fn([Tensor(a) for a in input_arrays]).numpy().flatten()
 
-    with _noopt_scope(1):
-        t1 = time.perf_counter()
-        ref_noopt = build_fn([Tensor(a) for a in input_arrays]).numpy().flatten()
-        tg_wall_noopt = time.perf_counter() - t1
+        with _noopt_scope(1):
+            t1 = time.perf_counter()
+            ref_noopt = build_fn([Tensor(a) for a in input_arrays]).numpy().flatten()
+            tg_wall_noopt = time.perf_counter() - t1
 
-    t0 = time.perf_counter()
-    ref_tensors = [Tensor(a) for a in input_arrays]
-    ref_out = build_fn(ref_tensors).numpy().flatten()
-    tg_wall = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        ref_tensors = [Tensor(a) for a in input_arrays]
+        ref_out = build_fn(ref_tensors).numpy().flatten()
+        tg_wall = time.perf_counter() - t0
 
-    is_float_output = np.issubdtype(ref_out.dtype, np.floating)
+        is_float_output = np.issubdtype(ref_out.dtype, np.floating)
 
     # ------------------------------------------------------------------
     # 2. Build symbolic graph and compile
     # ------------------------------------------------------------------
-    syms = [Tensor.empty(a.shape, dtype=Tensor(a).dtype) for a in input_arrays]
-    out_sym = build_fn(syms)
-    with _noopt_scope(1):
-        schedule = out_sym.schedule()
-        compute_items = [si for si in schedule if si.ast.op == Ops.SINK]
-        kernel_specs = compile_model(schedule, options=CompileOptions(unroll_loop=unroll_loop))
+        syms = [Tensor.empty(a.shape, dtype=Tensor(a).dtype) for a in input_arrays]
+        out_sym = build_fn(syms)
+        with _noopt_scope(1):
+            schedule = out_sym.schedule()
+            compute_items = [si for si in schedule if si.ast.op == Ops.SINK]
+            kernel_specs = compile_model(schedule, options=CompileOptions(unroll_loop=unroll_loop))
 
     # ------------------------------------------------------------------
     # 3. Amaranth simulation (integer and float32 paths both go through here)
     # ------------------------------------------------------------------
-    connections, external_slots = _detect_connections(compute_items)
+        connections, external_slots = _detect_connections(compute_items)
 
-    input_map: dict[tuple, np.ndarray] = {}
-    for i, slot in enumerate(external_slots):
-        if i < len(input_arrays):
-            input_map[slot] = input_arrays[i]
+        input_map: dict[tuple, np.ndarray] = {}
+        for i, slot in enumerate(external_slots):
+            if i < len(input_arrays):
+                input_map[slot] = input_arrays[i]
 
-    kernel_outputs: dict[int, np.ndarray] = {}
-    total_cycles = 0
-    t0 = time.perf_counter()
+        kernel_outputs: dict[int, np.ndarray] = {}
+        total_cycles = 0
+        t0 = time.perf_counter()
 
-    for k_idx, ks in enumerate(kernel_specs):
-        kernel_inputs: dict[int, np.ndarray] = {}
-        for (ki, buf_pos), arr in input_map.items():
-            if ki == k_idx:
-                kernel_inputs[buf_pos] = arr
-        for (ki, buf_pos), (src_k, _) in connections.items():
-            if ki == k_idx:
-                kernel_inputs[buf_pos] = kernel_outputs[src_k]
+        for k_idx, ks in enumerate(kernel_specs):
+            kernel_inputs: dict[int, np.ndarray] = {}
+            for (ki, buf_pos), arr in input_map.items():
+                if ki == k_idx:
+                    kernel_inputs[buf_pos] = arr
+            for (ki, buf_pos), (src_k, _) in connections.items():
+                if ki == k_idx:
+                    kernel_inputs[buf_pos] = kernel_outputs[src_k]
 
-        out, cycles, _ = simulate_kernel(ks.kernel, kernel_inputs)
-        kernel_outputs[k_idx] = out
-        total_cycles += cycles
+            out, cycles, _ = simulate_kernel(ks.kernel, kernel_inputs)
+            kernel_outputs[k_idx] = out
+            total_cycles += cycles
 
-    sim_wall = time.perf_counter() - t0
+        sim_wall = time.perf_counter() - t0
 
     # ------------------------------------------------------------------
     # 4. Compare — dtype-aware
     # ------------------------------------------------------------------
-    hdl_raw = kernel_outputs[len(kernel_specs) - 1]
+        hdl_raw = kernel_outputs[len(kernel_specs) - 1]
 
-    if is_float_output:
-        # simulate_kernel returns raw uint32 bit patterns as int32.
-        # Re-interpret as float32 for comparison.
-        hdl_out = hdl_raw.astype(np.uint32).view(np.float32)
-        min_len = min(len(hdl_out), len(ref_out))
-        hdl_out, ref_cmp = hdl_out[:min_len], ref_out[:min_len]
+        if is_float_output:
+            # simulate_kernel returns raw uint32 bit patterns as int32.
+            # Re-interpret as float32 for comparison.
+            hdl_out = hdl_raw.astype(np.uint32).view(np.float32)
+            min_len = min(len(hdl_out), len(ref_out))
+            hdl_out, ref_cmp = hdl_out[:min_len], ref_out[:min_len]
 
-        # Use relative + absolute tolerance (truncation rounding mode)
-        if min_len > 0:
-            max_err = float(np.max(np.abs(hdl_out.astype(np.float64)
-                                          - ref_cmp.astype(np.float64))))
-            # tolerate 1 ULP of relative error from truncation rounding
-            correct = bool(np.allclose(hdl_out, ref_cmp, rtol=1e-5, atol=1e-6))
+            # Use relative + absolute tolerance (truncation rounding mode)
+            if min_len > 0:
+                max_err = float(np.max(np.abs(hdl_out.astype(np.float64)
+                                              - ref_cmp.astype(np.float64))))
+                # tolerate 1 ULP of relative error from truncation rounding
+                correct = bool(np.allclose(hdl_out, ref_cmp, rtol=1e-5, atol=1e-6))
+            else:
+                max_err, correct = 0.0, True
         else:
-            max_err, correct = 0.0, True
-    else:
-        hdl_out = hdl_raw
-        ref_flat = ref_out.astype(np.int64)
-        hdl_flat = hdl_out.astype(np.int64)
-        min_len = min(len(ref_flat), len(hdl_flat))
-        ref_flat, hdl_flat = ref_flat[:min_len], hdl_flat[:min_len]
+            hdl_out = hdl_raw
+            ref_flat = ref_out.astype(np.int64)
+            hdl_flat = hdl_out.astype(np.int64)
+            min_len = min(len(ref_flat), len(hdl_flat))
+            ref_flat, hdl_flat = ref_flat[:min_len], hdl_flat[:min_len]
 
-        max_err_int = int(np.max(np.abs(hdl_flat - ref_flat))) if min_len > 0 else 0
-        max_err = float(max_err_int)
-        correct = (np.array_equal(hdl_flat, ref_flat) if exact
-                   else max_err_int <= 1)
+            max_err_int = int(np.max(np.abs(hdl_flat - ref_flat))) if min_len > 0 else 0
+            max_err = float(max_err_int)
+            correct = (np.array_equal(hdl_flat, ref_flat) if exact
+                       else max_err_int <= 1)
 
-    return BenchResult(
-        name=name,
-        correct=correct,
-        max_abs_error=max_err,
-        hdl_cycles=total_cycles,
-        sim_wall_s=sim_wall,
-        tg_wall=tg_wall,
-        tg_wall_noopt=tg_wall_noopt,
-        float_path=False,
-        output_hdl=hdl_out,
-        output_ref=ref_out,
-    )
+        return BenchResult(
+            name=name,
+            correct=correct,
+            max_abs_error=max_err,
+            hdl_cycles=total_cycles,
+            sim_wall_s=sim_wall,
+            tg_wall=tg_wall,
+            tg_wall_noopt=tg_wall_noopt,
+            float_path=False,
+            output_hdl=hdl_out,
+            output_ref=ref_out,
+        )
+    finally:
+        tg_noopt.value = 1
 
 
 # ---------------------------------------------------------------------------

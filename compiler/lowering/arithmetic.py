@@ -199,14 +199,17 @@ class ArithmeticLowering:
                     "but no read port exists for that buffer index. "
                     "Check that _create_memories() created a port for every buffer."
                 )
-            use_idx = self._buf_read_use.get(val.buf_idx, 0)
-            if use_idx >= len(rps):
-                raise RuntimeError(
-                    f"ArithmeticLowering: buf_idx={val.buf_idx} needs {use_idx + 1} read ports "
-                    f"but only {len(rps)} were created."
-                )
-            rp = rps[use_idx]
-            self._buf_read_use[val.buf_idx] = use_idx + 1
+            if len(rps) == 1:
+                rp = rps[0]
+            else:
+                use_idx = self._buf_read_use.get(val.buf_idx, 0)
+                if use_idx >= len(rps):
+                    raise RuntimeError(
+                        f"ArithmeticLowering: buf_idx={val.buf_idx} needs {use_idx + 1} read ports "
+                        f"but only {len(rps)} were created."
+                    )
+                rp = rps[use_idx]
+                self._buf_read_use[val.buf_idx] = use_idx + 1
             # Wire the read port address
             m.d.comb += rp.addr.eq(addr_sig)
             # Create a signal to hold the read data
