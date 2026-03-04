@@ -80,12 +80,15 @@ class ArithmeticLowering:
         int_rports: dict,       # buf_idx → Amaranth read port
         counter_sigs: dict,     # depth → Signal (from create_counters)
         acc,                    # Amaranth Signal or None
+        unroll_factor: int = 1,
     ):
         self.kernel = kernel
         self.m = m
         self.int_rports = int_rports
         self.counter_sigs = counter_sigs
         self.acc = acc
+        self.unroll_factor = max(1, int(unroll_factor))
+        self._buf_read_use = {}
 
         # Build buf_meta_map for quick lookup
         self.buf_meta_map = {bm.idx: bm for bm in kernel.buffers}
@@ -189,13 +192,21 @@ class ArithmeticLowering:
                     "ordering failure in run() — the address IRValue was not collected "
                     "before the IRBufLoad that references it."
                 )
-            rp = self.int_rports.get(val.buf_idx)
-            if rp is None:
+            rps = self.int_rports.get(val.buf_idx)
+            if not rps:
                 raise RuntimeError(
                     f"ArithmeticLowering: IRBufLoad references buf_idx={val.buf_idx} "
                     "but no read port exists for that buffer index. "
                     "Check that _create_memories() created a port for every buffer."
                 )
+            use_idx = self._buf_read_use.get(val.buf_idx, 0)
+            if use_idx >= len(rps):
+                raise RuntimeError(
+                    f"ArithmeticLowering: buf_idx={val.buf_idx} needs {use_idx + 1} read ports "
+                    f"but only {len(rps)} were created."
+                )
+            rp = rps[use_idx]
+            self._buf_read_use[val.buf_idx] = use_idx + 1
             # Wire the read port address
             m.d.comb += rp.addr.eq(addr_sig)
             # Create a signal to hold the read data

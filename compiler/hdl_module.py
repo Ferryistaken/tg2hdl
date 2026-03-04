@@ -31,6 +31,7 @@ class CompiledKernel(Elaboratable):
         self.buf_infos = buf_infos
         self.compile_options = compile_options
         self.compile_report = {}
+        self._active_unroll = 1
 
         # Control signals
         self.start = Signal()
@@ -63,10 +64,7 @@ class CompiledKernel(Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
-        # --- Pass 0: Create memories ---
-        memories, int_rports, int_wports = self._create_memories(m)
-
-        # --- Pass 1: Build typed IR ---
+        # --- Pass 0: Build typed IR + transforms ---
         from .ir import DType, BufferMeta
         from .uop_to_ir import uop_to_ir
         from .transforms import apply_loop_unroll
@@ -93,6 +91,10 @@ class CompiledKernel(Elaboratable):
             "loop_iterations_per_cycle_est": unroll_info.iterations_per_cycle_est,
             "unroll_fallback_reason": unroll_info.fallback_reason,
         }
+        self._active_unroll = unroll_info.applied_unroll
+
+        # --- Pass 1: Create memories/ports ---
+        memories, int_rports, int_wports = self._create_memories(m)
 
         # --- Pass 2: Create counters + build arithmetic datapath ---
         counter_sigs = create_counters(kernel_ir, m)
@@ -101,7 +103,14 @@ class CompiledKernel(Elaboratable):
         if kernel_ir.acc_dtype is not None:
             acc = Signal(kernel_ir.acc_dtype.amaranth_shape(), name="acc")
 
-        arith = ArithmeticLowering(kernel_ir, m, int_rports, counter_sigs, acc)
+        arith = ArithmeticLowering(
+            kernel_ir,
+            m,
+            int_rports,
+            counter_sigs,
+            acc,
+            unroll_factor=self._active_unroll,
+        )
         arith_result = arith.run()
 
         # --- Pass 3: Wire default write ports + build FSM ---
@@ -131,13 +140,19 @@ class CompiledKernel(Elaboratable):
             m.submodules[f"buf{idx}"] = mem
             memories[idx] = mem
 
-            # Internal combinational read port (for datapath)
-            rp = mem.read_port(domain="comb")
-            int_rports[idx] = rp
+            # Internal combinational read ports (one per active lane)
+            lane_reads = []
+            for lane in range(max(self._active_unroll, 1)):
+                rp = mem.read_port(domain="comb")
+                lane_reads.append(rp)
+            int_rports[idx] = lane_reads
 
-            # Internal write port (shared between external loading and FSM output)
-            wp = mem.write_port()
-            int_wports[idx] = wp
+            # Internal write ports (external loading uses port 0)
+            lane_writes = []
+            for lane in range(max(self._active_unroll, 1)):
+                wp = mem.write_port()
+                lane_writes.append(wp)
+            int_wports[idx] = lane_writes
 
             # External read port wiring
             ext_rp = mem.read_port(domain="comb")
@@ -160,10 +175,12 @@ class CompiledKernel(Elaboratable):
         """
         for info in self.buf_infos:
             idx = info["idx"]
-            wp = int_wports[idx]
+            wp = int_wports[idx][0]
             ext = self.buf_write_ports[idx]
             m.d.comb += [
                 wp.addr.eq(ext["waddr"]),
                 wp.data.eq(ext["wdata"]),
                 wp.en.eq(ext["wen"]),
             ]
+            for extra_wp in int_wports[idx][1:]:
+                m.d.comb += extra_wp.en.eq(0)

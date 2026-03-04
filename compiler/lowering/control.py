@@ -147,6 +147,7 @@ def _emit_stores(m, stores, result: ArithResult, int_wports: dict):
 
     Called within an FSM state context (inside m.State(...)).
     """
+    used_wports = {}
     for store in stores:
         if isinstance(store, IRRegStore):
             # Accumulator register update
@@ -180,13 +181,21 @@ def _emit_stores(m, stores, result: ArithResult, int_wports: dict):
                     f"signal for its value expression {store.value!r}. "
                     "ArithmeticLowering did not emit this IRValue."
                 )
-            wp = int_wports.get(store.buf_idx)
-            if wp is None:
+            wps = int_wports.get(store.buf_idx)
+            if not wps:
                 raise RuntimeError(
                     f"_emit_stores: IRBufStore targets buf_idx={store.buf_idx} "
                     "but no write port exists for that buffer index. "
                     "Check that _create_memories() created a write port for every buffer."
                 )
+            wp_idx = used_wports.get(store.buf_idx, 0)
+            if wp_idx >= len(wps):
+                raise RuntimeError(
+                    f"_emit_stores: IRBufStore targets buf_idx={store.buf_idx} requires "
+                    f"{wp_idx + 1} concurrent write ports but only {len(wps)} exist."
+                )
+            wp = wps[wp_idx]
+            used_wports[store.buf_idx] = wp_idx + 1
             m.d.comb += [
                 wp.addr.eq(addr_sig),
                 wp.data.eq(value_sig),
