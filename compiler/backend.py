@@ -1,7 +1,7 @@
 """HDL backend for tinygrad: UOps → Amaranth hardware.
 
 Provides HDLRenderer (tells tinygrad we're a sequential device),
-compile_kernel (UOps → CompiledKernel), compile_model (schedule → top module),
+compile_kernel (UOps → KernelIR → CompiledKernel), compile_model (schedule → top module),
 and simulate (run on Amaranth simulator).
 """
 
@@ -110,11 +110,14 @@ def analyze_buffers(uops):
 
 
 # ---------------------------------------------------------------------------
-# compile_kernel
+# uops_to_kernel_ir — standalone UOps → KernelIR stage
 # ---------------------------------------------------------------------------
 
-def compile_kernel(uops):
-    """Compile a linearized UOp list into a CompiledKernel (Amaranth Elaboratable).
+def uops_to_kernel_ir(uops):
+    """Convert linearized UOps to typed KernelIR.
+
+    This is the first stage of the compiler pipeline, usable standalone
+    for IR inspection without building any Amaranth hardware.
 
     Parameters
     ----------
@@ -123,9 +126,14 @@ def compile_kernel(uops):
 
     Returns
     -------
-    CompiledKernel
-        Amaranth Elaboratable ready for simulation or synthesis.
+    kernel_ir : KernelIR
+        Typed intermediate representation.
+    buf_infos : list[dict]
+        Buffer descriptors needed by CompiledKernel.
     """
+    from .ir import DType, BufferMeta
+    from .uop_to_ir import uop_to_ir
+
     buf_infos_raw = analyze_buffers(uops)
     buf_infos = [
         {
@@ -137,7 +145,40 @@ def compile_kernel(uops):
         }
         for b in buf_infos_raw
     ]
-    return CompiledKernel(uops, buf_infos)
+    buf_metas = [
+        BufferMeta(
+            idx=b.idx,
+            depth=b.depth,
+            dtype=DType.from_width(b.elem_width, b.is_signed),
+            is_output=b.is_output,
+        )
+        for b in buf_infos_raw
+    ]
+    kernel_ir = uop_to_ir(uops, buf_metas)
+    return kernel_ir, buf_infos
+
+
+# ---------------------------------------------------------------------------
+# compile_kernel
+# ---------------------------------------------------------------------------
+
+def compile_kernel(uops):
+    """Compile a linearized UOp list into a CompiledKernel (Amaranth Elaboratable).
+
+    Pipeline: UOps → KernelIR → CompiledKernel (Amaranth Elaboratable).
+
+    Parameters
+    ----------
+    uops : list[UOp]
+        Linearized UOps from tinygrad (via _get_uops).
+
+    Returns
+    -------
+    CompiledKernel
+        Amaranth Elaboratable ready for simulation or synthesis.
+    """
+    kernel_ir, buf_infos = uops_to_kernel_ir(uops)
+    return CompiledKernel(kernel_ir, buf_infos)
 
 
 # ---------------------------------------------------------------------------
@@ -396,24 +437,12 @@ def count_cycles_from_schedule(schedule):
     int
         Total cycle count across all compute kernels.
     """
-    from .uop_to_ir import uop_to_ir
-    from .ir import BufferMeta, DType
-
     renderer = HDLRenderer()
     total = 0
     for si in schedule:
         if si.ast.op != Ops.SINK:
             continue
         uops = _get_uops(si.ast, renderer)
-        buf_metas = [
-            BufferMeta(
-                idx=b.idx,
-                depth=b.depth,
-                dtype=DType.from_width(b.elem_width, b.is_signed),
-                is_output=b.is_output,
-            )
-            for b in analyze_buffers(uops)
-        ]
-        kernel_ir = uop_to_ir(uops, buf_metas)
+        kernel_ir, _ = uops_to_kernel_ir(uops)
         total += _count_cycles_from_root(kernel_ir.loop_tree)
     return total

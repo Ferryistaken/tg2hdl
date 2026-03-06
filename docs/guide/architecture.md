@@ -2,15 +2,17 @@
 
 ## Compiler pipeline
 
-tinygrad's `schedule()` splits a model into compute kernels. Each kernel is a `list[UOp]` — tinygrad's linearized IR. `compile_kernel()` (`backend.py`) takes that list and returns a `CompiledKernel`: an Amaranth `Elaboratable` built in four passes.
+tinygrad's `schedule()` splits a model into compute kernels. Each kernel is a `list[UOp]` — tinygrad's linearized IR. `compile_kernel()` (`backend.py`) first converts UOps to a typed `KernelIR` via `uop_to_ir()`, then passes it to `CompiledKernel` which lowers it to Amaranth hardware in three passes.
 
 ```
-tinygrad UOps
+compile_kernel()  (backend.py)
     │
-    ├─ Pass 0: _create_memories()      — one Memory per DEFINE_GLOBAL buffer
-    ├─ Pass 1: uop_to_ir()             — UOps → typed KernelIR
-    ├─ Pass 2: ArithmeticLowering      — KernelIR → Amaranth combinational signals
-    └─ Pass 3: build_control()         — KernelIR + signals → FSM
+    ├─ uop_to_ir()                     — UOps → typed KernelIR
+    │
+    └─ CompiledKernel.elaborate()      — KernelIR → Amaranth Module
+        ├─ Pass 0: _create_memories()      — one Memory per DEFINE_GLOBAL buffer
+        ├─ Pass 1: ArithmeticLowering      — KernelIR → Amaranth combinational signals
+        └─ Pass 2: build_control()         — KernelIR + signals → FSM
 ```
 
 ## Pass 0 — Memories (`hdl_module.py`)
@@ -23,7 +25,7 @@ Every `DEFINE_GLOBAL` buffer in the UOps becomes an Amaranth `Memory`:
 
 Default write port wiring routes `buf{N}_wen/waddr/wdata` inputs to the internal write port. FSM states override this with `m.d.comb` when they need to write output.
 
-## Pass 1 — Typed IR (`compiler/ir.py`, `compiler/uop_to_ir.py`)
+## Typed IR (`compiler/ir.py`, `compiler/uop_to_ir.py`)
 
 `uop_to_ir()` walks the UOp list in a single pass and produces a `KernelIR` — a typed intermediate representation that makes all dtype and loop-structure information explicit.
 
@@ -75,7 +77,7 @@ class DType(enum.Enum):
     def from_tinygrad(cls, tg_dtype) -> DType:  # raises ValueError on unsupported dtype
 ```
 
-## Pass 2 — Arithmetic lowering (`compiler/lowering/arithmetic.py`)
+## Pass 1 — Arithmetic lowering (`compiler/lowering/arithmetic.py`)
 
 `ArithmeticLowering.run()` traverses all `IRValue` nodes reachable from stores in the loop tree (in topological order, leaves first) and emits combinational Amaranth logic for each.
 
@@ -103,7 +105,7 @@ Float32 operations use dedicated single-cycle combinational Amaranth modules tha
 
 Known limitations: subnormal numbers flush to zero; rounding is truncation (round-toward-zero) rather than IEEE default round-to-nearest-even; `0 × ∞ = 0` rather than NaN.
 
-## Pass 3 — FSM (`compiler/lowering/control.py`)
+## Pass 2 — FSM (`compiler/lowering/control.py`)
 
 `build_control()` flattens the `LoopIR` tree to a list of `(level, depth)` pairs and creates Amaranth FSM states:
 

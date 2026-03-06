@@ -11,7 +11,7 @@ The compiler operates on tinygrad's linearized UOps — the same IR tinygrad use
 | Path | Role |
 |------|------|
 | `compiler/backend.py` | `HDLRenderer`, `compile_kernel`, `compile_model`, `compile_top_module`, `simulate_kernel`, `count_cycles_from_schedule` |
-| `compiler/hdl_module.py` | `CompiledKernel` — four-pass Amaranth Elaboratable |
+| `compiler/hdl_module.py` | `CompiledKernel` — three-pass Amaranth Elaboratable (KernelIR → hardware) |
 | `compiler/ir.py` | Typed IR: `DType`, `IRConst/Counter/BufLoad/RegLoad/Op`, `IRBufStore/RegStore`, `LoopIR`, `BufferMeta`, `KernelIR` |
 | `compiler/uop_to_ir.py` | `uop_to_ir()` — single-pass UOp list → `KernelIR` conversion |
 | `compiler/lowering/arithmetic.py` | `ArithmeticLowering`, `create_counters()` — combinational signal emission |

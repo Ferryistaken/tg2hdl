@@ -20,6 +20,9 @@ BufferMeta    — descriptor for a DEFINE_GLOBAL buffer
 KernelIR      — top-level typed kernel representation
 """
 
+from __future__ import annotations
+from typing import Any
+
 import enum
 import struct
 from dataclasses import dataclass, field
@@ -219,3 +222,154 @@ class KernelIR:
     acc_dtype: "DType | None"   # None for kernels with no accumulator
     loop_tree: LoopIR           # root LoopIR (axis_type=None)
     scalar_stores: list = field(default_factory=list)  # list[IRBufStore] for no-loop kernels
+    def format(self, kir: KernelIR, *, show_buffers: bool = True) -> str:
+        """
+        Tinygrad-ish dump of KernelIR.
+
+        Produces something visually close to tinygrad's UOp table:
+          - numbered statements
+          - %value ids for loads/ops/counters
+          - explicit RANGE/END
+          - STORE lines in the loop prologue/epilogue order
+        """
+        # ---- value numbering (%0, %1, ...) ----
+        val_ids: dict[int, int] = {}
+        next_val = 0
+
+        def vid(v: Any) -> str:
+            nonlocal next_val
+            if v is None:
+                return "None"
+            key = id(v)
+            if key not in val_ids:
+                val_ids[key] = next_val
+                next_val += 1
+            return f"%{val_ids[key]}"
+
+        def dtype_str(dt: Any) -> str:
+            # DType enum -> "int32"/"fp32"/...
+            return getattr(dt, "name", str(dt)).lower()
+
+        def buf_str(idx: int) -> str:
+            return f"buf{idx}"
+
+        def axis_str(ax: Any) -> str:
+            return str(ax).replace("AxisType.", "")
+
+        def val_expr(v: Any) -> str:
+            # Prefer showing as "%id" with a short suffix so it reads like IR.
+            if isinstance(v, IRConst):
+                return f"{vid(v)}=CONST({v.value})<{dtype_str(v.dtype)}>"
+            if isinstance(v, IRCounter):
+                return f"{vid(v)}=COUNTER(d={v.depth}, bound={v.bound})<i32>"
+            if isinstance(v, IRBufLoad):
+                return f"{vid(v)}=LOAD({buf_str(v.buf_idx)}, {val_ref(v.addr)})"
+            if isinstance(v, IRRegLoad):
+                return f"{vid(v)}=RLOAD<{dtype_str(v.dtype)}>"
+            if isinstance(v, IROp):
+                srcs = ", ".join(val_ref(s) for s in v.srcs)
+                return f"{vid(v)}={v.op.upper()}({srcs})<{dtype_str(v.dtype)}>"
+            # fallback
+            return f"{vid(v)}={type(v).__name__}"
+
+        def val_ref(v: Any) -> str:
+            # Reference to an already-emitted value. If not emitted yet, we still print %id
+            # (like tinygrad does when a value appears before its defining row sometimes).
+            if v is None:
+                return "None"
+            return vid(v)
+
+        # ---- statement numbering (#0, #1, ...) ----
+        stmts: list[str] = []
+        stmt_no = 0
+
+        def emit(indent: int, text: str) -> None:
+            nonlocal stmt_no
+            pad = "  " * indent
+            stmts.append(f"{stmt_no:4d}  {pad}{text}")
+            stmt_no += 1
+
+        # ---- optional buffer header ----
+        if show_buffers:
+            stmts.append("BUFFERS:")
+            for bm in kir.buffers:
+                role = "out" if bm.is_output else "in"
+                stmts.append(f"  - {buf_str(bm.idx)}: depth={bm.depth} dtype={dtype_str(bm.dtype)} role={role}")
+            stmts.append("")
+
+        # ---- ensure value definitions are emitted before use ----
+        def ensure(v: Any, indent: int) -> None:
+            if v is None:
+                return
+            if id(v) in val_ids:
+                return
+            if isinstance(v, (IRConst, IRCounter)):
+                emit(indent, val_expr(v))
+                return
+            if isinstance(v, IRBufLoad):
+                ensure(v.addr, indent)
+                emit(indent, val_expr(v))
+            elif isinstance(v, IROp):
+                for s2 in v.srcs:
+                    ensure(s2, indent)
+                emit(indent, val_expr(v))
+            elif isinstance(v, IRRegLoad):
+                emit(indent, val_expr(v))
+            else:
+                emit(indent, val_expr(v))
+
+        def ensure_store(s, indent: int) -> None:
+            if isinstance(s, IRBufStore):
+                ensure(s.addr, indent)
+                ensure(s.value, indent)
+            elif isinstance(s, IRRegStore):
+                ensure(s.value, indent)
+
+        def emit_store(s, indent: int) -> None:
+            if isinstance(s, IRBufStore):
+                emit(
+                    indent,
+                    f"STORE({buf_str(s.buf_idx)}, {val_ref(s.addr)}, {val_ref(s.value)})<{dtype_str(s.dtype)}>",
+                )
+            elif isinstance(s, IRRegStore):
+                emit(indent, f"RSTORE({val_ref(s.value)})")
+            else:
+                emit(indent, f"{type(s).__name__}")
+
+        # ---- loop tree walk ----
+        def walk_loop(node: LoopIR, indent: int) -> None:
+            # prologue
+            for s in node.prologue:
+                ensure_store(s, indent)
+                emit_store(s, indent)
+
+            # body loop
+            if node.body is not None:
+                lp = node.body
+                emit(indent, f"RANGE {axis_str(lp.axis_type)} bound={lp.bound}")
+
+                walk_loop(lp, indent + 1)
+
+                emit(indent, "END")
+
+            # epilogue
+            for s in node.epilogue:
+                ensure_store(s, indent)
+                emit_store(s, indent)
+
+        # Root-level (no explicit RANGE for root)
+        stmts.append("KERNEL:")
+        emit(0, "KERNEL_BEGIN")
+        walk_loop(kir.loop_tree, 0)
+        emit(0, "KERNEL_END")
+
+        return "\n".join(stmts)
+
+    def pretty(self) -> str:
+        return self.format(self)
+
+    def __str__(self):
+        return self.pretty()
+
+    def __repr__(self):
+        return f"KernelIR(buffers={len(self.buffers)}, acc_dtype={self.acc_dtype})"

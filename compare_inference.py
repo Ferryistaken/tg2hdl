@@ -29,6 +29,7 @@ from tinygrad.uop.ops import Ops
 from compiler import HDLRenderer, compile_kernel, simulate_kernel
 from utils import quantize_int8
 from compiler.backend import _get_uops
+from compiler.utils import synthesis_stats
 
 
 @contextmanager
@@ -39,103 +40,6 @@ def _noopt_scope(value=1):
         yield
     finally:
         tg_noopt.value = old
-
-
-# ---------------------------------------------------------------------------
-# Hardware resource estimation
-# ---------------------------------------------------------------------------
-
-def _rtlil_fp32_units(kernel) -> int:
-    """Count FP32Add/Mul/Cmp submodule instances from RTLIL (no Yosys needed)."""
-    from amaranth.back import rtlil
-    from collections import Counter
-    il = rtlil.convert(kernel, ports=[kernel.start, kernel.done, kernel.busy])
-    cell_counts = Counter()
-    for line in il.split('\n'):
-        s = line.strip()
-        if s.startswith('cell '):
-            cell_counts[s.split()[1]] += 1
-    return sum(v for k, v in cell_counts.items() if k.startswith(r'\top.fp'))
-
-
-def _synthesis_stats(kernel, device="45k", package="CABGA381"):
-    """Run Yosys + nextpnr-ecp5 and return real resource/timing data.
-
-    Returns a dict with:
-      fmax_mhz    -- achieved Fmax in MHz (float), or None if unavailable
-      comb        -- TRELLIS_COMB cells used (LUT equivalent)
-      ff          -- TRELLIS_FF flip-flops used
-      dp16kd      -- DP16KD block RAM tiles used
-      mult18      -- MULT18X18D DSP multiplier tiles used
-      mem_bits    -- total on-chip storage in bits (exact, from buf_infos)
-      fp32_units  -- FP32 submodule count (from RTLIL)
-      from_synth  -- True when Yosys+nextpnr ran successfully
-
-    Falls back gracefully when Yosys or nextpnr-ecp5 is not on PATH.
-    """
-    import shutil, subprocess, tempfile, json
-    from amaranth.back import rtlil
-
-    mem_bits   = sum(b["depth"] * b["elem_width"] for b in kernel.buf_infos)
-    fp32_units = _rtlil_fp32_units(kernel)
-    base = dict(mem_bits=mem_bits, fp32_units=fp32_units,
-                fmax_mhz=None, comb=0, ff=0, dp16kd=0, mult18=0, from_synth=False)
-
-    if not shutil.which("yosys") or not shutil.which("nextpnr-ecp5"):
-        return base
-
-    il = rtlil.convert(kernel, ports=[kernel.start, kernel.done, kernel.busy])
-
-    with tempfile.TemporaryDirectory() as d:
-        il_path     = f"{d}/top.il"
-        json_path   = f"{d}/top.json"
-        report_path = f"{d}/report.json"
-
-        with open(il_path, "w") as f:
-            f.write(il)
-
-        # Yosys: synthesise for ECP5
-        r = subprocess.run(
-            ["yosys", "-q", "-p", f"read_rtlil {il_path}; synth_ecp5 -json {json_path}"],
-            capture_output=True, text=True, timeout=120,
-        )
-        if r.returncode != 0:
-            return base
-
-        # nextpnr-ecp5: place & route, emit timing report
-        r2 = subprocess.run(
-            ["nextpnr-ecp5", f"--{device}", "--package", package,
-             "--json", json_path, "--report", report_path,
-             "--timing-allow-fail", "--quiet"],
-            capture_output=True, text=True, timeout=300,
-        )
-        if r2.returncode != 0:
-            return base
-
-        try:
-            with open(report_path) as f:
-                rep = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            return base
-
-    # Extract Fmax: take minimum achieved over all clocks (most conservative)
-    fmax_mhz = None
-    for clk_data in rep.get("fmax", {}).values():
-        achieved = clk_data.get("achieved")
-        if achieved and (fmax_mhz is None or achieved < fmax_mhz):
-            fmax_mhz = float(achieved)
-
-    util = rep.get("utilization", {})
-    return dict(
-        mem_bits   = mem_bits,
-        fp32_units = fp32_units,
-        fmax_mhz   = fmax_mhz,
-        comb       = util.get("TRELLIS_COMB",  {}).get("used", 0),
-        ff         = util.get("TRELLIS_FF",     {}).get("used", 0),
-        dp16kd     = util.get("DP16KD",         {}).get("used", 0),
-        mult18     = util.get("MULT18X18D",     {}).get("used", 0),
-        from_synth = True,
-    )
 
 
 # Xilinx RAMB36 = 36 Kbits; one block covers up to 36,864 bits of storage.
@@ -466,11 +370,11 @@ def main():
             kernels_fp32 = _compile_kernels(_build_fp32_schedule())
         print(f"  compiled {len(kernels_fp32)} kernels")
         if args.skip_synth:
-            stats_fp32 = [_synthesis_stats(k) | {"from_synth": False} for k in kernels_fp32]
+            stats_fp32 = [synthesis_stats(k) | {"from_synth": False} for k in kernels_fp32]
             print("  synthesis stats skipped by option")
         else:
             print("  synthesising for ECP5 45F...", end=" ", flush=True)
-            stats_fp32 = [_synthesis_stats(k) for k in kernels_fp32]
+            stats_fp32 = [synthesis_stats(k) for k in kernels_fp32]
             print("done" if stats_fp32[0]["from_synth"] else "tools not found, using RTLIL estimates")
 
         w1_fp32 = w1.T.astype(np.float32)
@@ -492,11 +396,11 @@ def main():
             kernels_i8 = _compile_kernels(_build_int8_schedule())
         print(f"  compiled {len(kernels_i8)} kernels")
         if args.skip_synth:
-            stats_i8 = [_synthesis_stats(k) | {"from_synth": False} for k in kernels_i8]
+            stats_i8 = [synthesis_stats(k) | {"from_synth": False} for k in kernels_i8]
             print("  synthesis stats skipped by option")
         else:
             print("  synthesising for ECP5 45F...", end=" ", flush=True)
-            stats_i8 = [_synthesis_stats(k) for k in kernels_i8]
+            stats_i8 = [synthesis_stats(k) for k in kernels_i8]
             print("done" if stats_i8[0]["from_synth"] else "tools not found, using RTLIL estimates")
 
         w1_q, w1_scale = quantize_int8(w1)
