@@ -2,7 +2,8 @@
 
 Public API:
     HDLRenderer             — tinygrad Renderer for sequential hardware
-    compile_kernel          — list[UOp] → CompiledKernel (Amaranth Elaboratable)
+    uops_to_kernel_ir       — list[UOp] → (KernelIR, buf_infos)
+    compile_kernel          — list[UOp] → KernelIR → CompiledKernel (Amaranth Elaboratable)
     compile_model           — tinygrad schedule → list[KernelSpec]
     compile_top_module      — tinygrad schedule → TopModule (auto-connects kernels)
     simulate_kernel         — run a CompiledKernel on Amaranth simulator
@@ -15,6 +16,7 @@ Quantization utilities are in the ``utils`` package, not here:
 
 from .backend import (
     HDLRenderer,
+    uops_to_kernel_ir,
     compile_kernel,
     compile_model,
     compile_top_module,
@@ -24,4 +26,4 @@ from .backend import (
 from .hdl_module import CompiledKernel
 from .top_module import TopModule, simulate_top
 
-from .utils import pretty_print_uops
+from .utils import pretty_print_uops, synthesis_stats, show_hardware

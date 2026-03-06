@@ -22,6 +22,7 @@ from .ir import (
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+
 def _resolve_ptr(ptr_uop) -> int:
     """Walk AFTER chains to find the DEFINE_GLOBAL buf index.
 
@@ -397,9 +398,11 @@ def uop_to_ir(uops, buf_metas: list) -> KernelIR:
         if isinstance(s, IRBufStore)
     ]
 
-    return KernelIR(
+    kir = KernelIR(
         buffers=list(buf_metas),
         acc_dtype=acc_dtype,
         loop_tree=root,
         scalar_stores=scalar_stores,
     )
+
+    return kir

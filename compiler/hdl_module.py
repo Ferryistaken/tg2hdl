@@ -1,14 +1,13 @@
-"""Generated Amaranth module from compiled UOps.
+"""Generated Amaranth module from KernelIR.
 
-CompiledKernel takes analyzed UOp data and builds an FSM-based
-Amaranth module: memories for buffers, counters for loops,
+CompiledKernel takes a fully-built KernelIR and lowers it to an
+FSM-based Amaranth module: memories for buffers, counters for loops,
 combinational datapath, and FSM for sequencing.
 
-Four-pass architecture:
+Three-pass architecture:
   Pass 0: Create memories (one per DEFINE_GLOBAL buffer)
-  Pass 1: Build typed KernelIR via uop_to_ir()
-  Pass 2: Create counters + arithmetic datapath via ArithmeticLowering
-  Pass 3: Wire default write ports + build FSM via build_control()
+  Pass 1: Create counters + arithmetic datapath via ArithmeticLowering
+  Pass 2: Wire default write ports + build FSM via build_control()
 """
 
 from amaranth.hdl import Elaboratable, Module, Signal, signed, unsigned
@@ -16,18 +15,18 @@ from amaranth.lib.memory import Memory
 
 
 class CompiledKernel(Elaboratable):
-    """Hardware module generated from tinygrad UOps.
+    """Hardware module generated from KernelIR.
 
     Parameters
     ----------
-    uops : list[UOp]
-        Linearized UOp list from tinygrad.
+    kernel_ir : KernelIR
+        Typed kernel IR produced by uop_to_ir().
     buf_infos : list[dict]
         Buffer descriptors: {idx, depth, elem_width, is_signed, is_output}.
     """
 
-    def __init__(self, uops, buf_infos):
-        self.uops = uops
+    def __init__(self, kernel_ir, buf_infos):
+        self.kernel_ir = kernel_ir
         self.buf_infos = buf_infos
 
         # Control signals
@@ -64,24 +63,12 @@ class CompiledKernel(Elaboratable):
         # --- Pass 0: Create memories ---
         memories, int_rports, int_wports = self._create_memories(m)
 
-        # --- Pass 1: Build typed IR ---
-        from .ir import DType, BufferMeta
-        from .uop_to_ir import uop_to_ir
         from .lowering.arithmetic import ArithmeticLowering, create_counters
         from .lowering.control import build_control
 
-        buf_metas = [
-            BufferMeta(
-                idx=b["idx"],
-                depth=b["depth"],
-                dtype=DType.from_width(b["elem_width"], b["is_signed"]),
-                is_output=b["is_output"],
-            )
-            for b in self.buf_infos
-        ]
-        kernel_ir = uop_to_ir(self.uops, buf_metas)
+        kernel_ir = self.kernel_ir
 
-        # --- Pass 2: Create counters + build arithmetic datapath ---
+        # --- Pass 1: Create counters + build arithmetic datapath ---
         counter_sigs = create_counters(kernel_ir, m)
 
         acc = None
@@ -91,7 +78,7 @@ class CompiledKernel(Elaboratable):
         arith = ArithmeticLowering(kernel_ir, m, int_rports, counter_sigs, acc)
         arith_result = arith.run()
 
-        # --- Pass 3: Wire default write ports + build FSM ---
+        # --- Pass 2: Wire default write ports + build FSM ---
         self._wire_default_write_ports(m, int_wports)
         build_control(m, kernel_ir, arith_result, int_wports,
                       self.start, self.done, self.busy)
@@ -137,7 +124,7 @@ class CompiledKernel(Elaboratable):
         return memories, int_rports, int_wports
 
     # ------------------------------------------------------------------
-    # Pass 3a: Wire default write ports (external loading)
+    # Pass 2a: Wire default write ports (external loading)
     # ------------------------------------------------------------------
 
     def _wire_default_write_ports(self, m, int_wports):
