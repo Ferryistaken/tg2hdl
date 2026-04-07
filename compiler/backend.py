@@ -162,15 +162,19 @@ def uops_to_kernel_ir(uops):
 # compile_kernel
 # ---------------------------------------------------------------------------
 
-def compile_kernel(uops):
+def compile_kernel(uops, *, unroll_factor=1, reduce_unroll_factor=1):
     """Compile a linearized UOp list into a CompiledKernel (Amaranth Elaboratable).
 
-    Pipeline: UOps → KernelIR → CompiledKernel (Amaranth Elaboratable).
+    Pipeline: UOps → KernelIR → (optional unroll) → CompiledKernel (Amaranth Elaboratable).
 
     Parameters
     ----------
     uops : list[UOp]
         Linearized UOps from tinygrad (via _get_uops).
+    unroll_factor : int
+        LOOP-axis unroll factor (default 1 = no unrolling).
+    reduce_unroll_factor : int
+        REDUCE-axis unroll factor (default 1 = no unrolling).
 
     Returns
     -------
@@ -178,7 +182,26 @@ def compile_kernel(uops):
         Amaranth Elaboratable ready for simulation or synthesis.
     """
     kernel_ir, buf_infos = uops_to_kernel_ir(uops)
+    if unroll_factor > 1:
+        from .transforms import unroll_loop
+        kernel_ir = unroll_loop(kernel_ir, depth=0, factor=unroll_factor)
+    if reduce_unroll_factor > 1:
+        from .transforms import unroll_reduce
+        depth = _find_reduce_depth(kernel_ir)
+        if depth is not None:
+            kernel_ir = unroll_reduce(kernel_ir, depth=depth, factor=reduce_unroll_factor)
     return CompiledKernel(kernel_ir, buf_infos)
+
+
+def _find_reduce_depth(kernel_ir):
+    """Find the depth of the first REDUCE axis in the loop tree, or None."""
+    from tinygrad.uop.ops import AxisType
+    level = kernel_ir.loop_tree.body
+    while level is not None:
+        if level.axis_type == AxisType.REDUCE:
+            return level.depth
+        level = level.body
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -195,13 +218,17 @@ class KernelSpec:
     buf_map: dict  # buf_idx → schedule buffer reference
 
 
-def compile_model(schedule):
+def compile_model(schedule, *, unroll_factor=1, reduce_unroll_factor=1):
     """Compile a tinygrad schedule into a list of KernelSpecs.
 
     Parameters
     ----------
     schedule : list[ExecItem]
         From Tensor.schedule().
+    unroll_factor : int
+        LOOP-axis unroll factor applied to every kernel (default 1).
+    reduce_unroll_factor : int
+        REDUCE-axis unroll factor applied to every kernel (default 1).
 
     Returns
     -------
@@ -217,7 +244,11 @@ def compile_model(schedule):
             continue
         uops = _get_uops(ast, renderer)
         buf_infos = analyze_buffers(uops)
-        kernel = compile_kernel(uops)
+        kernel = compile_kernel(
+            uops,
+            unroll_factor=unroll_factor,
+            reduce_unroll_factor=reduce_unroll_factor,
+        )
         kernels.append(KernelSpec(
             kernel=kernel,
             uops=uops,
@@ -339,7 +370,7 @@ def simulate_kernel(kernel, input_data, clock_period=1e-8):
 # compile_top_module — auto-detect kernel connections and build TopModule
 # ---------------------------------------------------------------------------
 
-def compile_top_module(schedule):
+def compile_top_module(schedule, *, unroll_factor=1, reduce_unroll_factor=1):
     """Compile a tinygrad schedule into a TopModule.
 
     Detects inter-kernel buffer connections automatically by checking Buffer
@@ -350,6 +381,10 @@ def compile_top_module(schedule):
     ----------
     schedule : list[ExecItem]
         From Tensor.schedule().
+    unroll_factor : int
+        LOOP-axis unroll factor applied to every kernel (default 1).
+    reduce_unroll_factor : int
+        REDUCE-axis unroll factor applied to every kernel (default 1).
 
     Returns
     -------
@@ -360,7 +395,11 @@ def compile_top_module(schedule):
     kernel_specs : list[KernelSpec]
         One KernelSpec per compute kernel (same order as in TopModule).
     """
-    kernel_specs = compile_model(schedule)
+    kernel_specs = compile_model(
+        schedule,
+        unroll_factor=unroll_factor,
+        reduce_unroll_factor=reduce_unroll_factor,
+    )
     compute_items = [si for si in schedule if si.ast.op == Ops.SINK]
 
     # Map output buffer id → kernel index

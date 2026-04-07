@@ -291,3 +291,245 @@ def test_perf_10_mnist_layer1():
     _check(r, cycles_exact=expected)
     print(f"\n  MNIST layer1: {r.hdl_cycles:,} cycles "
           f"({r.hdl_cycles * 10 / 1e6:.3f} ms at 100 MHz)")
+
+
+# ===========================================================================
+# Test 11 — REDUCE unroll: GEMV (1,8)@(8,16), factor=2
+# Verifies cycle reduction from REDUCE-axis unrolling (2 MACs/cycle).
+# Baseline: 16*(8+2)+1=161.  Unrolled: 16*(4+2)+1=97.
+# ===========================================================================
+
+def test_perf_11_reduce_unroll_gemv_2x():
+    """GEMV (1,8)@(8,16) with REDUCE unroll factor 2 — 2 MACs/cycle."""
+    M, K = 16, 8
+    x = rng.randint(-4, 4, (1, K)).astype(np.int8)
+    w = rng.randint(-4, 4, (K, M)).astype(np.int8)
+
+    baseline = run_bench(
+        "gemv_K8_M16_baseline",
+        lambda t: (t[0] @ t[1]).cast(dtypes.int32),
+        [x, w],
+    )
+    unrolled = run_bench(
+        "gemv_K8_M16_reduce2x",
+        lambda t: (t[0] @ t[1]).cast(dtypes.int32),
+        [x, w],
+        reduce_unroll_factor=2,
+    )
+
+    _check(baseline, cycles_exact=_expected_gemv_cycles(M, K))
+    _check(unrolled, cycles_exact=_expected_gemv_cycles(M, K // 2))
+    assert unrolled.hdl_cycles < baseline.hdl_cycles, (
+        f"Unrolled ({unrolled.hdl_cycles}) should be fewer cycles "
+        f"than baseline ({baseline.hdl_cycles})"
+    )
+    print(f"\n  Speedup: {baseline.hdl_cycles / unrolled.hdl_cycles:.2f}x")
+
+
+# ===========================================================================
+# Test 12 — REDUCE unroll: GEMV (1,8)@(8,16), factor=4
+# 4 MACs/cycle.  Baseline: 161.  Unrolled: 16*(2+2)+1=65.
+# ===========================================================================
+
+def test_perf_12_reduce_unroll_gemv_4x():
+    """GEMV (1,8)@(8,16) with REDUCE unroll factor 4 — 4 MACs/cycle."""
+    M, K = 16, 8
+    x = rng.randint(-4, 4, (1, K)).astype(np.int8)
+    w = rng.randint(-4, 4, (K, M)).astype(np.int8)
+
+    baseline = run_bench(
+        "gemv_K8_M16_baseline_4x",
+        lambda t: (t[0] @ t[1]).cast(dtypes.int32),
+        [x, w],
+    )
+    unrolled = run_bench(
+        "gemv_K8_M16_reduce4x",
+        lambda t: (t[0] @ t[1]).cast(dtypes.int32),
+        [x, w],
+        reduce_unroll_factor=4,
+    )
+
+    _check(baseline, cycles_exact=_expected_gemv_cycles(M, K))
+    _check(unrolled, cycles_exact=_expected_gemv_cycles(M, K // 4))
+    speedup = baseline.hdl_cycles / unrolled.hdl_cycles
+    assert speedup > 2.0, f"Expected >2x speedup, got {speedup:.2f}x"
+    print(f"\n  Speedup: {speedup:.2f}x")
+
+
+# ===========================================================================
+# Test 13 — REDUCE unroll: linear + bias + relu (1,8)@(8,16) + bias, factor=2
+# Full MNIST-layer pattern with unrolling.
+# ===========================================================================
+
+def test_perf_13_reduce_unroll_linear_relu():
+    """Linear + bias + relu with REDUCE unroll factor 2."""
+    M, K = 16, 8
+    x = rng.randint(-3, 3, (1, K)).astype(np.int8)
+    w = rng.randint(-3, 3, (K, M)).astype(np.int8)
+    b = rng.randint(-15, 15, (1, M)).astype(np.int32)
+
+    baseline = run_bench(
+        "linear_relu_K8_M16_baseline",
+        lambda t: ((t[0] @ t[1]).cast(dtypes.int32) + t[2]).relu(),
+        [x, w, b],
+    )
+    unrolled = run_bench(
+        "linear_relu_K8_M16_reduce2x",
+        lambda t: ((t[0] @ t[1]).cast(dtypes.int32) + t[2]).relu(),
+        [x, w, b],
+        reduce_unroll_factor=2,
+    )
+
+    _check(baseline, cycles_exact=_expected_gemv_cycles(M, K))
+    _check(unrolled, cycles_exact=_expected_gemv_cycles(M, K // 2))
+    assert unrolled.hdl_cycles < baseline.hdl_cycles
+    print(f"\n  Speedup: {baseline.hdl_cycles / unrolled.hdl_cycles:.2f}x")
+
+
+# ===========================================================================
+# Test 14 — REDUCE unroll: 2-layer MLP with unrolling
+# Multi-kernel test: both kernels get REDUCE unrolled.
+# ===========================================================================
+
+def test_perf_14_reduce_unroll_mlp_2layer():
+    """Two-kernel MLP (1,4)→(1,4)→(1,2) with REDUCE unroll factor 2."""
+    K1, M1, M2 = 4, 4, 2
+    x  = rng.randint(-4, 4, (1, K1)).astype(np.int8)
+    w1 = rng.randint(-3, 3, (K1, M1)).astype(np.int8)
+    b1 = rng.randint(-10, 10, (1, M1)).astype(np.int32)
+    w2 = rng.randint(-3, 3, (M1, M2)).astype(np.int8)
+    b2 = rng.randint(-5, 5, (1, M2)).astype(np.int32)
+
+    def build(t):
+        h = ((t[0] @ t[1]).cast(dtypes.int32) + t[2]).relu()
+        return (h.cast(dtypes.int8) @ t[3]).cast(dtypes.int32) + t[4]
+
+    baseline = run_bench("mlp_2layer_baseline", build, [x, w1, b1, w2, b2])
+    unrolled = run_bench(
+        "mlp_2layer_reduce2x", build, [x, w1, b1, w2, b2],
+        reduce_unroll_factor=2,
+    )
+
+    _check(baseline)
+    _check(unrolled)
+    assert unrolled.hdl_cycles < baseline.hdl_cycles, (
+        f"Unrolled ({unrolled.hdl_cycles}) should be fewer than "
+        f"baseline ({baseline.hdl_cycles})"
+    )
+    print(f"\n  Speedup: {baseline.hdl_cycles / unrolled.hdl_cycles:.2f}x")
+
+
+# ===========================================================================
+# Test 15 — LOOP unroll: elementwise ReLU, n=32, factor=4
+# Verifies LOOP-axis unrolling produces correct results.
+# LOOP unroll doesn't reduce cycles (write-port bottleneck), but must stay
+# correct.
+# ===========================================================================
+
+def test_perf_15_loop_unroll_relu():
+    """Elementwise ReLU n=32 with LOOP unroll factor 4 — correctness check."""
+    N = 32
+    a = rng.randint(-20, 20, N).astype(np.int32)
+
+    r = run_bench(
+        "relu_32_loop4x",
+        lambda t: t[0].relu(),
+        [a],
+        unroll_factor=4,
+    )
+    _check(r)
+
+
+# ===========================================================================
+# Test 16 — TopModule + REDUCE unroll: 2-layer MLP through compile_top_module
+# Exercises the full TopModule path (compile_top_module → simulate_top) with
+# unrolling, proving the integration is end-to-end.
+# ===========================================================================
+
+def test_perf_16_topmodule_reduce_unroll():
+    """2-layer MLP through compile_top_module + simulate_top with REDUCE unroll."""
+    from compiler import compile_top_module
+    from compiler.top_module import simulate_top
+
+    K1, M1, M2 = 4, 4, 2
+    x_np  = rng.randint(-4, 4, (1, K1)).astype(np.int8)
+    w1_np = rng.randint(-3, 3, (K1, M1)).astype(np.int8)
+    b1_np = rng.randint(-10, 10, (1, M1)).astype(np.int32)
+    w2_np = rng.randint(-3, 3, (M1, M2)).astype(np.int8)
+    b2_np = rng.randint(-5, 5, (1, M2)).astype(np.int32)
+
+    # --- CPU reference ---
+    ref = (
+        (
+            (Tensor(x_np) @ Tensor(w1_np)).cast(dtypes.int32) + Tensor(b1_np)
+        ).relu().cast(dtypes.int8) @ Tensor(w2_np)
+    ).cast(dtypes.int32) + Tensor(b2_np)
+    ref_out = ref.numpy().flatten()
+
+    # --- Build schedule ---
+    x_sym  = Tensor.empty(1, K1, dtype=dtypes.int8)
+    w1_sym = Tensor.empty(K1, M1, dtype=dtypes.int8)
+    b1_sym = Tensor.empty(1, M1, dtype=dtypes.int32)
+    w2_sym = Tensor.empty(M1, M2, dtype=dtypes.int8)
+    b2_sym = Tensor.empty(1, M2, dtype=dtypes.int32)
+
+    h = ((x_sym @ w1_sym).cast(dtypes.int32) + b1_sym).relu()
+    logits = (h.cast(dtypes.int8) @ w2_sym).cast(dtypes.int32) + b2_sym
+
+    import os
+    old_noopt = os.environ.get("NOOPT")
+    os.environ["NOOPT"] = "1"
+    try:
+        schedule = logits.schedule()
+    finally:
+        if old_noopt is None:
+            os.environ.pop("NOOPT", None)
+        else:
+            os.environ["NOOPT"] = old_noopt
+
+    # --- Baseline (no unroll) via TopModule ---
+    top_base, conns, ks_base = compile_top_module(schedule)
+    input_data_base = _build_top_input(top_base, ks_base,
+                                       [x_np, w1_np, b1_np, w2_np, b2_np])
+    out_base, cyc_base, _ = simulate_top(top_base, input_data_base)
+
+    # --- Unrolled via TopModule ---
+    top_unr, conns_unr, ks_unr = compile_top_module(
+        schedule, reduce_unroll_factor=2,
+    )
+    input_data_unr = _build_top_input(top_unr, ks_unr,
+                                      [x_np, w1_np, b1_np, w2_np, b2_np])
+    out_unr, cyc_unr, _ = simulate_top(top_unr, input_data_unr)
+
+    # Correctness
+    np.testing.assert_array_equal(out_base, ref_out,
+                                  err_msg="Baseline TopModule output wrong")
+    np.testing.assert_array_equal(out_unr, ref_out,
+                                  err_msg="Unrolled TopModule output wrong")
+
+    # Cycle improvement
+    assert cyc_unr < cyc_base, (
+        f"Unrolled TopModule ({cyc_unr} cycles) should be faster than "
+        f"baseline ({cyc_base} cycles)"
+    )
+    print(f"\n  TopModule baseline: {cyc_base} cycles")
+    print(f"  TopModule unrolled: {cyc_unr} cycles")
+    print(f"  Speedup: {cyc_base / cyc_unr:.2f}x")
+
+
+def _build_top_input(top, kernel_specs, arrays_flat):
+    """Map flat input arrays to (k_idx, buf_idx) for simulate_top.
+
+    Assigns arrays to external write ports in natural schedule order.
+    """
+    import numpy as np
+    input_data = {}
+    arr_iter = iter(arrays_flat)
+    # Sort ext_write_ports by (k_idx, buf_idx) for deterministic assignment
+    for k_idx, buf_idx in sorted(top.ext_write_ports.keys()):
+        try:
+            arr = next(arr_iter)
+            input_data[(k_idx, buf_idx)] = arr.flatten()
+        except StopIteration:
+            break
+    return input_data

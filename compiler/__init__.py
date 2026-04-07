@@ -26,4 +26,5 @@ from .backend import (
 from .hdl_module import CompiledKernel
 from .top_module import TopModule, simulate_top
 
+from .transforms import unroll_loop, unroll_reduce
 from .utils import pretty_print_uops, synthesis_stats, show_hardware

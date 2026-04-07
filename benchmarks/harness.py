@@ -118,7 +118,8 @@ def _noopt_scope(value=1):
 # run_bench
 # ---------------------------------------------------------------------------
 
-def run_bench(name: str, build_fn, input_arrays: list, exact: bool = True) -> BenchResult:
+def run_bench(name: str, build_fn, input_arrays: list, exact: bool = True,
+              *, unroll_factor: int = 1, reduce_unroll_factor: int = 1) -> BenchResult:
     """Run *build_fn* on tinygrad CPU and HDL simulation, compare outputs.
 
     Parameters
@@ -133,6 +134,10 @@ def run_bench(name: str, build_fn, input_arrays: list, exact: bool = True) -> Be
     exact : bool
         True  → require bit-exact match (integer path).
         False → allow ±1 absolute error (use for expected truncation effects).
+    unroll_factor : int
+        LOOP-axis unroll factor applied to every kernel (default 1).
+    reduce_unroll_factor : int
+        REDUCE-axis unroll factor applied to every kernel (default 1).
 
     Returns
     -------
@@ -166,7 +171,11 @@ def run_bench(name: str, build_fn, input_arrays: list, exact: bool = True) -> Be
     with _noopt_scope(1):
         schedule = out_sym.schedule()
         compute_items = [si for si in schedule if si.ast.op == Ops.SINK]
-        kernel_specs = compile_model(schedule)
+        kernel_specs = compile_model(
+            schedule,
+            unroll_factor=unroll_factor,
+            reduce_unroll_factor=reduce_unroll_factor,
+        )
 
     # ------------------------------------------------------------------
     # 3. Amaranth simulation (integer and float32 paths both go through here)

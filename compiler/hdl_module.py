@@ -91,8 +91,11 @@ class CompiledKernel(Elaboratable):
 
     def _create_memories(self, m):
         memories = {}
-        int_rports = {}
+        int_rports = {}   # buf_idx → list[read_port]
         int_wports = {}
+
+        # Count how many read ports each buffer needs
+        load_counts = self._count_loads_per_buffer()
 
         for info in self.buf_infos:
             idx = info["idx"]
@@ -105,9 +108,13 @@ class CompiledKernel(Elaboratable):
             m.submodules[f"buf{idx}"] = mem
             memories[idx] = mem
 
-            # Internal combinational read port (for datapath)
-            rp = mem.read_port(domain="comb")
-            int_rports[idx] = rp
+            # Internal combinational read ports (for datapath)
+            n_ports = max(load_counts.get(idx, 1), 1)
+            ports = []
+            for p in range(n_ports):
+                rp = mem.read_port(domain="comb")
+                ports.append(rp)
+            int_rports[idx] = ports
 
             # Internal write port (shared between external loading and FSM output)
             wp = mem.write_port()
@@ -122,6 +129,40 @@ class CompiledKernel(Elaboratable):
             ]
 
         return memories, int_rports, int_wports
+
+    def _count_loads_per_buffer(self):
+        """Count distinct IRBufLoad nodes per buffer index in the KernelIR."""
+        from .ir import IRBufLoad, IRBufStore, IRRegStore, IROp
+
+        counts = {}
+        visited = set()
+
+        def walk(val):
+            if val is None or id(val) in visited:
+                return
+            visited.add(id(val))
+            if isinstance(val, IRBufLoad):
+                counts[val.buf_idx] = counts.get(val.buf_idx, 0) + 1
+                walk(val.addr)
+            elif isinstance(val, IROp):
+                for s in val.srcs:
+                    walk(s)
+
+        def walk_loop(node):
+            for store in node.prologue + node.epilogue:
+                if isinstance(store, (IRBufStore, IRRegStore)):
+                    walk(store.value)
+                if isinstance(store, IRBufStore):
+                    walk(store.addr)
+            if node.body is not None:
+                walk_loop(node.body)
+
+        walk_loop(self.kernel_ir.loop_tree)
+        for s in self.kernel_ir.scalar_stores:
+            walk(s.value)
+            walk(s.addr)
+
+        return counts
 
     # ------------------------------------------------------------------
     # Pass 2a: Wire default write ports (external loading)
