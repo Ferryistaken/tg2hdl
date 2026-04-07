@@ -58,7 +58,7 @@ assert result.correct
 | Generic kernel compilation | ✅ |
 | Scalar / elementwise / GEMV patterns | ✅ |
 | Fused multi-op kernels (matmul + bias + relu) | ✅ |
-| Multi-kernel hardware sequencing (`TopModule`) | ✅ |
+| Multi-kernel hardware sequencing (`TopModule`) | ✅ linear chains, skip connections, fan-out DAGs |
 | Float32 — IEEE 754 hardware simulation | ✅ `FP32Add`, `FP32Mul`, `FP32Cmp` |
 | Float16 / BFloat16 arithmetic | ❌ No dedicated units — compile error in practice |
 | Multi-MAC parallelism (UNROLL) | Planned |

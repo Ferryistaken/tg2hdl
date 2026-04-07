@@ -4,8 +4,8 @@ from typing import List, Optional
 from textwrap import shorten
 
 
-def pretty_print_uops(uops: List["UOp"], full_width: bool = False) -> None:
-    """Print a linearized UOp list in a readable table format.
+def format_uops(uops: List["UOp"], full_width: bool = False) -> str:
+    """Format a linearized UOp list as a readable table.
 
     Each row: index, op name, dtype, arg, sources (by index).
     If full_width is True, columns expand to fit content without truncation.
@@ -62,7 +62,7 @@ def pretty_print_uops(uops: List["UOp"], full_width: bool = False) -> None:
         else:
             return f"{val:>{width}}"
 
-    # ---- 3. Print header and rows ----
+    # ---- 3. Build header and rows ----
     header = rows[0]
     header_line = (
         f"{fmt_cell(header['idx'],   W_IDX,   align_left=False)}  "
@@ -71,8 +71,7 @@ def pretty_print_uops(uops: List["UOp"], full_width: bool = False) -> None:
         f"{fmt_cell(header['arg'],   W_ARG)}  "
         f"{fmt_cell(header['src'],   W_SRC)}"
     )
-    print(header_line)
-    print("-" * len(header_line))
+    lines = [header_line, "-" * len(header_line)]
 
     for r in rows[1:]:
         line = (
@@ -82,7 +81,13 @@ def pretty_print_uops(uops: List["UOp"], full_width: bool = False) -> None:
             f"{fmt_cell(r['arg'],   W_ARG)}  "
             f"{fmt_cell(r['src'],   W_SRC)}"
         )
-        print(line)
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def pretty_print_uops(uops: List["UOp"], full_width: bool = False) -> None:
+    """Print a linearized UOp list in a readable table format."""
+    print(format_uops(uops, full_width=full_width))
 
 
 # ---------------------------------------------------------------------------

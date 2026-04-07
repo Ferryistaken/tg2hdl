@@ -20,12 +20,12 @@ kernel = compile_kernel(uops)
 output, cycles, wall = simulate_kernel(kernel, {1: x_data, 2: w_data})
 ```
 
-Multi-kernel models chain by passing each kernel's output as the next kernel's input — a complete 2-layer MLP compiles and simulates correctly today.
+Multi-kernel models are compiled as a dependency DAG — the compiler detects producer/consumer relationships between kernels, topologically sorts them, and generates an FSM that copies data along every edge (including non-adjacent skip connections and fan-out broadcasts). A residual MLP compiles and simulates correctly today.
 
 ## Quick Start
 
 ```bash
-uv run pytest                      # 39 tests
+uv run pytest                      # 169+ tests
 uv run python compare_inference.py # CPU vs HDL MNIST comparison
 ```
 

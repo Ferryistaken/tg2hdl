@@ -5,7 +5,7 @@ Amaranth cycle-accurate simulation against NumPy ground truth. Integer results a
 ## Test suite
 
 ```bash
-uv run pytest tests/ benchmarks/ -k "not slow" -v   # 93 tests, ~3 s
+uv run pytest tests/ benchmarks/ -k "not slow" -v   # ~160 tests, ~10 s
 uv run pytest tests/ benchmarks/ -v                  # all tests incl. slow
 ```
 
@@ -50,7 +50,7 @@ uv run pytest tests/ benchmarks/ -v                  # all tests incl. slow
 | `test_relu_*` | relu over all-positive, all-negative, mixed int32 |
 | `test_relu_add_bias_*` (4 tests) | `relu(a+b+const)`, N-cycle throughput |
 
-### TopModule (`tests/test_top_module.py`) — 9 tests
+### TopModule (`tests/test_top_module.py`) — 11 tests
 
 | Test | Validates |
 |------|-----------|
@@ -58,6 +58,8 @@ uv run pytest tests/ benchmarks/ -v                  # all tests incl. slow
 | `test_ext_write_ports_exposed` | Non-connected inputs exposed correctly |
 | `test_output_rport_wired` | Final kernel output accessible |
 | `test_simulate_top_*` | End-to-end TopModule simulation with 2-layer MLP |
+| `test_manual_non_adjacent_dependency` | Skip connection: K0 output copied to K2 (not K1) |
+| `test_manual_fanout_dependency` | Fan-out: K0 output broadcast to both K1 and K2 in one copy pass |
 
 ### Benchmark suites
 
