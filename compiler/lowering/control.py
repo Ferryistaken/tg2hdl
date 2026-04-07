@@ -56,17 +56,36 @@ def build_control(
 
     # Scalar kernel (no loops)
     if not levels:
-        root_stores = kernel.scalar_stores + [
-            s for s in (kernel.loop_tree.prologue + kernel.loop_tree.epilogue)
-            if isinstance(s, IRBufStore)
-        ]
+        # De-duplicate: scalar_stores already extracted from root prologue+epilogue
+        seen = set()
+        root_stores = []
+        for s in kernel.scalar_stores:
+            if id(s) not in seen:
+                seen.add(id(s))
+                root_stores.append(s)
+        for s in (kernel.loop_tree.prologue + kernel.loop_tree.epilogue):
+            if isinstance(s, IRBufStore) and id(s) not in seen:
+                seen.add(id(s))
+                root_stores.append(s)
         _build_scalar_fsm(m, root_stores, result, int_wports, start, done)
         return
+
+    # Pre-compute wave groups for innermost levels
+    level_waves = {}  # depth → list of wave groups
+    for lvl, d in levels:
+        if lvl.body is None:  # innermost
+            stores = [s for s in lvl.prologue if isinstance(s, (IRBufStore, IRRegStore))]
+            level_waves[d] = _group_stores_by_wave(stores)
+
+    def body_first_state(d):
+        """Return the first body state name for level d."""
+        waves = level_waves.get(d, [[]])
+        return f"L{d}_BODY_0" if len(waves) > 1 else f"L{d}_BODY"
 
     # Determine first real state after IDLE
     outermost_level = levels[0][0]
     if outermost_level.body is None:
-        first_state = "L0_BODY"
+        first_state = body_first_state(0)
     else:
         first_state = "L0_PRO"
 
@@ -85,24 +104,26 @@ def build_control(
             ctr = result.counter_sigs[d]
 
             if is_innermost:
-                with m.State(f"L{d}_BODY"):
-                    _emit_stores(m, pro_stores, result, int_wports)
-                    with m.If(ctr == lvl.bound - 1):
-                        if d > 0:
-                            m.next = f"L{d-1}_EPI"
-                        else:
-                            # Single-level loop: done when counter wraps
-                            m.d.sync += done.eq(1)
-                            m.next = "IDLE"
-                    with m.Else():
-                        m.d.sync += ctr.eq(ctr + 1)
-                        m.next = f"L{d}_BODY"
+                waves = level_waves[d]
+
+                if len(waves) <= 1:
+                    with m.State(f"L{d}_BODY"):
+                        _emit_stores(m, pro_stores, result, int_wports)
+                        _emit_counter_check(m, ctr, lvl.bound, d, done, f"L{d}_BODY")
+                else:
+                    for wi, wave in enumerate(waves):
+                        with m.State(f"L{d}_BODY_{wi}"):
+                            _emit_stores(m, wave, result, int_wports)
+                            if wi < len(waves) - 1:
+                                m.next = f"L{d}_BODY_{wi + 1}"
+                            else:
+                                _emit_counter_check(m, ctr, lvl.bound, d, done, f"L{d}_BODY_0")
             else:
                 # Non-innermost: PRO (prologue) and EPI (epilogue) states
                 child_level = levels[i + 1][0]
                 child_d = levels[i + 1][1]
                 if child_level.body is None:
-                    child_first = f"L{child_d}_BODY"
+                    child_first = body_first_state(child_d)
                 else:
                     child_first = f"L{child_d}_PRO"
 
@@ -114,32 +135,77 @@ def build_control(
 
                 with m.State(f"L{d}_EPI"):
                     _emit_stores(m, epi_stores, result, int_wports)
-                    with m.If(ctr == lvl.bound - 1):
-                        if d > 0:
-                            m.next = f"L{d-1}_EPI"
-                        else:
-                            m.d.sync += done.eq(1)
-                            m.next = "IDLE"
-                    with m.Else():
-                        m.d.sync += ctr.eq(ctr + 1)
-                        m.next = f"L{d}_PRO"
+                    _emit_counter_check(m, ctr, lvl.bound, d, done, f"L{d}_PRO")
 
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+def _emit_counter_check(m, ctr, bound, d, done, loop_back_state):
+    """Emit the counter check + transition logic (shared by all body states)."""
+    with m.If(ctr == bound - 1):
+        if d > 0:
+            m.next = f"L{d-1}_EPI"
+        else:
+            m.d.sync += done.eq(1)
+            m.next = "IDLE"
+    with m.Else():
+        m.d.sync += ctr.eq(ctr + 1)
+        m.next = loop_back_state
+
+
 def _build_scalar_fsm(m, stores, result, int_wports, start, done):
-    """FSM for scalar kernels (no loops). One compute cycle."""
+    """FSM for scalar kernels (no loops). One or more compute cycles.
+
+    When multiple stores target the same buffer, they are serialized
+    across cycles (one write per buffer per cycle).
+    """
+    waves = _group_stores_by_wave(stores)
+    first = "SCALAR" if len(waves) <= 1 else "SCALAR_0"
+
     with m.FSM(init="IDLE"):
         with m.State("IDLE"):
             m.d.sync += done.eq(0)
             with m.If(start):
-                m.next = "SCALAR"
-        with m.State("SCALAR"):
-            _emit_stores(m, stores, result, int_wports)
-            m.d.sync += done.eq(1)
-            m.next = "IDLE"
+                m.next = first
+
+        for wi, wave in enumerate(waves):
+            name = "SCALAR" if len(waves) <= 1 else f"SCALAR_{wi}"
+            with m.State(name):
+                _emit_stores(m, wave, result, int_wports)
+                if wi == len(waves) - 1:
+                    m.d.sync += done.eq(1)
+                    m.next = "IDLE"
+                else:
+                    m.next = f"SCALAR_{wi + 1}"
+
+
+def _group_stores_by_wave(stores):
+    """Group stores so each wave has at most one IRBufStore per buffer.
+
+    IRRegStores (accumulator writes) are always safe to batch — they all
+    target the single acc register.  Conflict only arises for IRBufStore
+    nodes targeting the same buf_idx (single write port per buffer).
+    """
+    if not stores:
+        return [stores]
+    waves = []
+    current_wave = []
+    current_bufs = set()
+    for store in stores:
+        buf = store.buf_idx if isinstance(store, IRBufStore) else None
+        if buf is not None and buf in current_bufs:
+            waves.append(current_wave)
+            current_wave = [store]
+            current_bufs = {buf}
+        else:
+            current_wave.append(store)
+            if buf is not None:
+                current_bufs.add(buf)
+    if current_wave:
+        waves.append(current_wave)
+    return waves
 
 
 def _emit_stores(m, stores, result: ArithResult, int_wports: dict):

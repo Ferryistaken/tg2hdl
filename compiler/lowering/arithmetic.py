@@ -77,7 +77,7 @@ class ArithmeticLowering:
         self,
         kernel: KernelIR,
         m: Module,
-        int_rports: dict,       # buf_idx → Amaranth read port
+        int_rports: dict,       # buf_idx → list[Amaranth read port]
         counter_sigs: dict,     # depth → Signal (from create_counters)
         acc,                    # Amaranth Signal or None
     ):
@@ -86,6 +86,9 @@ class ArithmeticLowering:
         self.int_rports = int_rports
         self.counter_sigs = counter_sigs
         self.acc = acc
+
+        # Track next available read port index per buffer
+        self._rport_idx = {}  # buf_idx → next port index
 
         # Build buf_meta_map for quick lookup
         self.buf_meta_map = {bm.idx: bm for bm in kernel.buffers}
@@ -189,13 +192,23 @@ class ArithmeticLowering:
                     "ordering failure in run() — the address IRValue was not collected "
                     "before the IRBufLoad that references it."
                 )
-            rp = self.int_rports.get(val.buf_idx)
-            if rp is None:
+            ports = self.int_rports.get(val.buf_idx)
+            if ports is None:
                 raise RuntimeError(
                     f"ArithmeticLowering: IRBufLoad references buf_idx={val.buf_idx} "
-                    "but no read port exists for that buffer index. "
-                    "Check that _create_memories() created a port for every buffer."
+                    "but no read ports exist for that buffer index. "
+                    "Check that _create_memories() created ports for every buffer."
                 )
+            # Assign the next available read port for this buffer
+            pi = self._rport_idx.get(val.buf_idx, 0)
+            if pi >= len(ports):
+                raise RuntimeError(
+                    f"ArithmeticLowering: ran out of read ports for buf_idx={val.buf_idx} "
+                    f"(have {len(ports)}, need {pi+1}). "
+                    "Increase port count in _create_memories()."
+                )
+            rp = ports[pi]
+            self._rport_idx[val.buf_idx] = pi + 1
             # Wire the read port address
             m.d.comb += rp.addr.eq(addr_sig)
             # Create a signal to hold the read data
