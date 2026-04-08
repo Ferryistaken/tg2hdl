@@ -118,6 +118,31 @@ class PipelineView:
         lines.append("}")
         return "\n".join(lines)
 
+    def graph_json(self) -> dict[str, dict]:
+        graph = {}
+        for kv in self.kernel_views:
+            meta = ", ".join(str(m.name if hasattr(m, "name") else m) for m in kv.metadata) if kv.metadata else "no-metadata"
+            graph[f"K{kv.index}"] = {
+                "label": f"K{kv.index}\n{meta}\n{len(kv.uops)} uops",
+                "src": [],
+                "color": "#D8F9E4",
+            }
+        for src_k, src_buf, dst_k, dst_buf in self.connections:
+            graph[f"K{dst_k}"]["src"].append((f"buf{src_buf} -> buf{dst_buf}", f"K{src_k}"))
+        return graph
+
+    def execution_graph_json(self) -> dict[str, dict]:
+        graph = {}
+        for exec_k, orig_k in enumerate(self.execution_kernel_map):
+            graph[f"E{exec_k}"] = {
+                "label": f"exec K{exec_k}\nsrc K{orig_k}",
+                "src": [],
+                "color": "#cef263",
+            }
+        for src_k, src_buf, dst_k, dst_buf in self.execution_connections:
+            graph[f"E{dst_k}"]["src"].append((f"buf{src_buf} -> buf{dst_buf}", f"E{src_k}"))
+        return graph
+
 
 def _escape_dot(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')

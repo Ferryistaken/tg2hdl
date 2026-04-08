@@ -4,6 +4,14 @@ from typing import List, Optional
 from textwrap import shorten
 
 
+def _elaboratable_ports(elab):
+    ports = [elab.start, elab.done]
+    busy = getattr(elab, "busy", None)
+    if busy is not None:
+        ports.append(busy)
+    return ports
+
+
 def format_uops(uops: List["UOp"], full_width: bool = False) -> str:
     """Format a linearized UOp list as a readable table.
 
@@ -141,7 +149,7 @@ def show_hardware(kernel, out_dir: str, *,
     else:
         raise ValueError(f"Unknown stage {stage!r}")
 
-    il = rtlil.convert(kernel, ports=[kernel.start, kernel.done, kernel.busy])
+    il = rtlil.convert(kernel, ports=_elaboratable_ports(kernel))
     prefix = os.path.join(out_dir, f"hardware_{stage}")
     out_path = f"{prefix}.{fmt}"
 
@@ -189,12 +197,25 @@ def synthesis_stats(kernel, device: str = "45k", package: str = "CABGA381"):
     import subprocess
     import tempfile
     import json
+    import time
     from amaranth.back import rtlil
 
-    mem_bits = sum(b["depth"] * b["elem_width"] for b in kernel.buf_infos)
+    if hasattr(kernel, "buf_infos"):
+        mem_bits = sum(b["depth"] * b["elem_width"] for b in kernel.buf_infos)
+    elif hasattr(kernel, "kernels"):
+        mem_bits = sum(
+            b["depth"] * b["elem_width"]
+            for subkernel in kernel.kernels
+            for b in getattr(subkernel, "buf_infos", [])
+        )
+    else:
+        mem_bits = 0
     fp32_units = _rtlil_fp32_units(kernel)
 
     base = dict(
+        fpga_family="Lattice ECP5",
+        fpga_device=device,
+        fpga_package=package,
         mem_bits=mem_bits,
         fp32_units=fp32_units,
         fmax_mhz=None,
@@ -203,12 +224,14 @@ def synthesis_stats(kernel, device: str = "45k", package: str = "CABGA381"):
         dp16kd=0,
         mult18=0,
         from_synth=False,
+        synth_wall_s=None,
     )
 
     if not shutil.which("yosys") or not shutil.which("nextpnr-ecp5"):
         return base
 
-    il = rtlil.convert(kernel, ports=[kernel.start, kernel.done, kernel.busy])
+    il = rtlil.convert(kernel, ports=_elaboratable_ports(kernel))
+    t0 = time.perf_counter()
 
     with tempfile.TemporaryDirectory() as d:
         il_path = f"{d}/top.il"
@@ -248,6 +271,9 @@ def synthesis_stats(kernel, device: str = "45k", package: str = "CABGA381"):
 
     util = rep.get("utilization", {})
     return dict(
+        fpga_family="Lattice ECP5",
+        fpga_device=device,
+        fpga_package=package,
         mem_bits=mem_bits,
         fp32_units=fp32_units,
         fmax_mhz=fmax_mhz,
@@ -256,6 +282,7 @@ def synthesis_stats(kernel, device: str = "45k", package: str = "CABGA381"):
         dp16kd=util.get("DP16KD",     {}).get("used", 0),
         mult18=util.get("MULT18X18D", {}).get("used", 0),
         from_synth=True,
+        synth_wall_s=time.perf_counter() - t0,
     )
 
 
@@ -263,7 +290,7 @@ def _rtlil_fp32_units(kernel) -> int:
     """Count FP32Add/Mul/Cmp submodule instances from RTLIL (no Yosys needed)."""
     from amaranth.back import rtlil
     from collections import Counter
-    il = rtlil.convert(kernel, ports=[kernel.start, kernel.done, kernel.busy])
+    il = rtlil.convert(kernel, ports=_elaboratable_ports(kernel))
     cell_counts = Counter()
     for line in il.split('\n'):
         s = line.strip()
