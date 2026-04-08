@@ -409,25 +409,56 @@ def compile_top_module(schedule, *, unroll_factor=1, reduce_unroll_factor=1):
             output_buf_ids[id(si.bufs[0])] = k_idx
 
     # Detect connections: input buffer of later kernel == output buffer of earlier kernel
-    connections = []
+    raw_connections = []
     for k_idx, si in enumerate(compute_items):
         for buf_pos, buf in enumerate(si.bufs[1:], start=1):
             if buf is not None and id(buf) in output_buf_ids:
                 src_k = output_buf_ids[id(buf)]
-                if src_k < k_idx:  # only forward connections
-                    connections.append((src_k, 0, k_idx, buf_pos))
+                if src_k != k_idx:
+                    raw_connections.append((src_k, 0, k_idx, buf_pos))
+
+    topo_order = _toposort_kernels(len(kernel_specs), raw_connections)
+    new_index = {old_idx: new_idx for new_idx, old_idx in enumerate(topo_order)}
+    kernel_specs = [kernel_specs[old_idx] for old_idx in topo_order]
+    connections = [
+        (new_index[src_k], src_buf, new_index[dst_k], dst_buf)
+        for src_k, src_buf, dst_k, dst_buf in raw_connections
+    ]
+    connections.sort()
 
     # Build buf_depths: depth of each buffer involved in a copy
     buf_depths = {}
-    for ks in kernel_specs:
+    for k_idx, ks in enumerate(kernel_specs):
         for info in ks.buf_infos:
-            # BufferInfo dataclass with .idx and .depth
-            k_idx_for_spec = kernel_specs.index(ks)
-            buf_depths[(k_idx_for_spec, info.idx)] = info.depth
+            buf_depths[(k_idx, info.idx)] = info.depth
 
     kernels = [ks.kernel for ks in kernel_specs]
     top = TopModule(kernels, connections, buf_depths)
     return top, connections, kernel_specs
+
+
+def _toposort_kernels(num_kernels, connections):
+    """Return a stable topological ordering of kernels from dependency edges."""
+    indegree = [0] * num_kernels
+    outgoing = {k_idx: set() for k_idx in range(num_kernels)}
+    for src_k, _src_buf, dst_k, _dst_buf in connections:
+        if dst_k not in outgoing[src_k]:
+            outgoing[src_k].add(dst_k)
+            indegree[dst_k] += 1
+
+    ready = [k_idx for k_idx in range(num_kernels) if indegree[k_idx] == 0]
+    order = []
+    while ready:
+        cur = ready.pop(0)
+        order.append(cur)
+        for dst_k in sorted(outgoing[cur]):
+            indegree[dst_k] -= 1
+            if indegree[dst_k] == 0:
+                ready.append(dst_k)
+
+    if len(order) != num_kernels:
+        raise ValueError("Kernel dependency graph contains a cycle")
+    return order
 
 
 # ---------------------------------------------------------------------------

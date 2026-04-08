@@ -28,3 +28,4 @@ from .top_module import TopModule, simulate_top
 
 from .transforms import unroll_loop, unroll_reduce
 from .utils import pretty_print_uops, synthesis_stats, show_hardware
+from .visualize import analyze_schedule, analyze_tensor, PipelineView, KernelView

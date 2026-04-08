@@ -150,10 +150,38 @@ For K=784: 12,645,136 < 2³¹−1 ✓
 
 ## Multi-kernel hardware (`compiler/top_module.py`)
 
-`TopModule` sequences N `CompiledKernel` instances with a hardware copy FSM:
+`TopModule` sequences N `CompiledKernel` instances with a dependency-driven copy FSM. It supports arbitrary kernel DAGs — linear chains, skip connections (non-adjacent producer→consumer), and fan-out (one producer feeding multiple consumers).
+
+### Execution model
 
 ```
-IDLE → K0_RUN → K0_WAIT → COPY_0_1 → K1_RUN → K1_WAIT → ... → DONE
+IDLE → K0_RUN → K0_WAIT → K0_COPY_0 → K1_RUN → K1_WAIT → K1_COPY_0 → K2_RUN → K2_WAIT → IDLE
 ```
 
-The copy FSM reads from the source kernel's output buffer and writes to the destination kernel's input buffer, one element per cycle. `compile_top_module(schedule)` auto-detects connections by checking tinygrad Buffer object identity across schedule items.
+After each kernel finishes, the FSM runs one copy state per *source buffer group* — connections sharing the same producer buffer are grouped and broadcast in a single pass (same read address, N simultaneous writes). A two-kernel chain has one copy state; a fan-out from K0 to both K1 and K2 also has one copy state, with K0's output buffer read once and written to both destinations in parallel.
+
+### Connection detection and ordering
+
+`compile_top_module(schedule)` detects connections by checking tinygrad Buffer object identity: if a buffer appears as the output of kernel A and as an input of kernel B, an edge `(A, 0, B, j)` is recorded. Any non-self edge is accepted — non-adjacent and skip connections are handled correctly.
+
+Kernels are then reordered by `_toposort_kernels()` (Kahn's algorithm) so that every producer precedes its consumers, regardless of the order tinygrad's scheduler emitted them. A cycle in the dependency graph raises `ValueError` at compile time.
+
+### Copy groups
+
+`_build_copy_groups()` partitions all connections by `(src_kernel, src_buffer)`. Each group becomes one FSM state `K{i}_COPY_{gi}`. Within a state, `copy_ctr` drives `src_rp["raddr"]` and all destination write ports simultaneously:
+
+```
+K{i}_COPY_0:
+    src_rp.raddr  ← copy_ctr
+    dst1_wp.waddr ← copy_ctr,  dst1_wp.wdata ← src_rp.rdata,  dst1_wp.wen ← 1
+    dst2_wp.waddr ← copy_ctr,  dst2_wp.wdata ← src_rp.rdata,  dst2_wp.wen ← 1
+    ...
+    if copy_ctr == depth-1: copy_ctr ← 0, next state
+    else: copy_ctr++
+```
+
+Copy length is taken from `buf_depths[(src_k, src_buf)]` — the source buffer size — which is correct for all destinations since they all receive the same data.
+
+### External write ports
+
+All input buffers not driven by any copy FSM edge are exposed as `ext_write_ports[(k_idx, buf_idx)]` — the testbench or simulation harness writes weights and inputs through these before pulsing `start`.

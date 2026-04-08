@@ -1,8 +1,8 @@
-"""TopModule: sequences N CompiledKernels with a hardware copy FSM.
+"""TopModule: sequences compiled kernels with dependency-driven copy states.
 
 TopModule wires multiple CompiledKernel instances into a single Amaranth
-Elaboratable. A copy FSM transfers each kernel's output into the next
-kernel's input buffer between compute phases.
+Elaboratable. A copy FSM transfers a producer kernel's output buffer into
+the input buffers of whichever later kernels depend on it.
 
 Ports
 -----
@@ -15,19 +15,16 @@ ext_write_ports : dict[(k_idx, buf_idx), {wen, waddr, wdata}]
 output_rport : {raddr, rdata}
     Read port for the final kernel's output buffer.
 
-FSM sequence (two-kernel example)
------------------------------------
-IDLE → K0_RUN → K0_WAIT → COPY_0_1 → K1_RUN → K1_WAIT → DONE → IDLE
+FSM sequence (example)
+----------------------
+IDLE → K0_RUN → K0_WAIT → COPY_K0_G0 → K1_RUN → K1_WAIT → K2_RUN → ...
 """
 
 import time
-from dataclasses import dataclass
 
 import numpy as np
-from amaranth.hdl import Elaboratable, Module, Signal, signed, unsigned
+from amaranth.hdl import Elaboratable, Module, Signal
 from amaranth.sim import Simulator
-
-from .hdl_module import CompiledKernel
 
 
 class TopModule(Elaboratable):
@@ -38,11 +35,9 @@ class TopModule(Elaboratable):
     kernels : list[CompiledKernel]
         Kernels to run in order.
     connections : list[tuple[int, int, int, int]]
-        Each entry is (src_k, src_buf, dst_k, dst_buf):
-        the output buf *src_buf* of kernel *src_k* is DMA-copied into
-        input buf *dst_buf* of kernel *dst_k* between compute phases.
-        For a simple chain this would be [(0, 0, 1, j)] for each input j
-        of kernel 1 that came from kernel 0's output.
+        Each entry is (src_k, src_buf, dst_k, dst_buf): the source buffer of
+        kernel ``src_k`` is DMA-copied into input buffer ``dst_buf`` of kernel
+        ``dst_k`` after ``src_k`` completes.
     buf_depths : dict[tuple[int,int], int]
         Maps (k_idx, buf_idx) → element count for each buffer involved
         in a copy (used to know when the copy counter overflows).
@@ -55,6 +50,8 @@ class TopModule(Elaboratable):
 
         self.start = Signal(name="top_start")
         self.done = Signal(name="top_done")
+
+        self._copy_groups = self._build_copy_groups()
 
         # Buffers driven by the copy FSM (the destination side of each conn)
         internal_bufs = {(dst_k, dst_buf) for _, _, dst_k, dst_buf in connections}
@@ -83,6 +80,25 @@ class TopModule(Elaboratable):
             "raddr": Signal(last_rp["raddr"].shape(), name="top_out_raddr"),
             "rdata": Signal(last_rp["rdata"].shape(), name="top_out_rdata"),
         }
+
+    def _build_copy_groups(self):
+        """Group connections by source kernel and source buffer.
+
+        Each group can be copied in one FSM state because all destinations are
+        driven from the same source read port address.
+        """
+        groups_by_src = {k_idx: [] for k_idx in range(len(self.kernels))}
+        grouped = {}
+        for src_k, src_buf, dst_k, dst_buf in self.connections:
+            key = (src_k, src_buf)
+            grouped.setdefault(key, []).append((src_k, src_buf, dst_k, dst_buf))
+
+        for (src_k, _src_buf), conns in grouped.items():
+            groups_by_src[src_k].append(conns)
+
+        for src_k in groups_by_src:
+            groups_by_src[src_k].sort(key=lambda grp: (grp[0][1], grp[0][2], grp[0][3]))
+        return groups_by_src
 
     # ------------------------------------------------------------------
     # Elaboration
@@ -116,6 +132,14 @@ class TopModule(Elaboratable):
         max_depth = max(self.buf_depths.values(), default=1)
         copy_ctr = Signal(range(max_depth + 1), name="copy_ctr")
 
+        def next_state_after_kernel(i: int) -> str:
+            groups = self._copy_groups.get(i, [])
+            if groups:
+                return f"K{i}_COPY_0"
+            if i < len(self.kernels) - 1:
+                return f"K{i+1}_RUN"
+            return "IDLE"
+
         # ---- FSM ----
         with m.FSM(init="IDLE"):
             with m.State("IDLE"):
@@ -132,41 +156,42 @@ class TopModule(Elaboratable):
                 # K{i}_WAIT: poll done
                 with m.State(f"K{i}_WAIT"):
                     with m.If(kernel.done):
-                        if i < len(self.kernels) - 1:
-                            m.d.sync += copy_ctr.eq(0)
-                            m.next = f"COPY_{i}_{i+1}"
-                        else:
+                        if i == len(self.kernels) - 1 and not self._copy_groups.get(i):
                             m.d.sync += self.done.eq(1)
                             m.next = "IDLE"
+                        else:
+                            m.d.sync += copy_ctr.eq(0)
+                            m.next = next_state_after_kernel(i)
 
-                # COPY_{i}_{i+1}: DMA from kernel i output → kernel i+1 input
-                if i < len(self.kernels) - 1:
-                    conns_here = [
-                        (s_b, d_b)
-                        for (s_k, s_b, d_k, d_b) in self.connections
-                        if s_k == i and d_k == i + 1
-                    ]
+                for gi, group in enumerate(self._copy_groups.get(i, [])):
+                    state_name = f"K{i}_COPY_{gi}"
+                    next_group = gi + 1
+                    if next_group < len(self._copy_groups.get(i, [])):
+                        next_state = f"K{i}_COPY_{next_group}"
+                    elif i < len(self.kernels) - 1:
+                        next_state = f"K{i+1}_RUN"
+                    else:
+                        next_state = "IDLE"
 
-                    with m.State(f"COPY_{i}_{i+1}"):
-                        for src_buf, dst_buf in conns_here:
-                            src_rp = self.kernels[i].buf_read_ports[src_buf]
-                            dst_wp = self.kernels[i + 1].buf_write_ports[dst_buf]
+                    with m.State(state_name):
+                        src_k, src_buf, _, _ = group[0]
+                        src_rp = self.kernels[src_k].buf_read_ports[src_buf]
+                        m.d.comb += src_rp["raddr"].eq(copy_ctr)
+
+                        for _s_k, _s_buf, dst_k, dst_buf in group:
+                            dst_wp = self.kernels[dst_k].buf_write_ports[dst_buf]
                             m.d.comb += [
-                                src_rp["raddr"].eq(copy_ctr),
                                 dst_wp["wen"].eq(1),
                                 dst_wp["waddr"].eq(copy_ctr),
                                 dst_wp["wdata"].eq(src_rp["rdata"]),
                             ]
 
-                        # Advance counter; use depth of first src buffer
-                        if conns_here:
-                            depth = self.buf_depths.get((i, conns_here[0][0]), 1)
-                        else:
-                            depth = 1
-
+                        depth = self.buf_depths.get((src_k, src_buf), 1)
                         with m.If(copy_ctr == depth - 1):
                             m.d.sync += copy_ctr.eq(0)
-                            m.next = f"K{i+1}_RUN"
+                            if next_state == "IDLE":
+                                m.d.sync += self.done.eq(1)
+                            m.next = next_state
                         with m.Else():
                             m.d.sync += copy_ctr.eq(copy_ctr + 1)
 
@@ -216,6 +241,10 @@ def simulate_top(top, input_data, clock_period=1e-8):
             if ports is None:
                 continue
             flat = data.flatten()
+            if np.issubdtype(flat.dtype, np.floating):
+                nbytes = flat.dtype.itemsize
+                uint_dtype = np.uint32 if nbytes == 4 else np.uint16
+                flat = flat.view(uint_dtype)
             for j in range(len(flat)):
                 ctx.set(ports["wen"], 1)
                 ctx.set(ports["waddr"], j)
