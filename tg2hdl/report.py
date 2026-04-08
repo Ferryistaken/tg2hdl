@@ -144,29 +144,29 @@ def _render_html(report: dict) -> str:
   <script src="assets/dagrejs.github.io/project/dagre/latest/dagre.min.js"></script>
   <style>
     :root {{
-      --bg: #101317;
-      --bg2: #171c21;
-      --panel: #1d2329;
-      --panel2: #252d34;
-      --line: #3a464f;
-      --line2: #56616a;
-      --ink: #eef3f6;
-      --muted: #a5b1ba;
-      --accent: #ffb547;
-      --accent2: #71d0ff;
-      --ok: #76d08a;
-      --bad: #ff7e73;
-      --edge: #86929a;
-      --node: #20272d;
+      --bg: #f4f6f8;
+      --bg2: #edf1f4;
+      --panel: #ffffff;
+      --panel2: #fbfcfd;
+      --line: #d7dde3;
+      --line2: #aab6c2;
+      --ink: #182126;
+      --muted: #5b6975;
+      --accent: #d88412;
+      --accent2: #2a7db8;
+      --ok: #1f7a43;
+      --bad: #b13a2e;
+      --edge: #7d8790;
+      --node: #ffffff;
     }}
     * {{ box-sizing: border-box; }}
     body {{
       margin: 0;
       color: var(--ink);
       background:
-        linear-gradient(180deg, rgba(255,181,71,0.06), transparent 240px),
-        linear-gradient(90deg, rgba(255,255,255,0.025) 1px, transparent 1px),
-        linear-gradient(0deg, rgba(255,255,255,0.02) 1px, transparent 1px),
+        linear-gradient(180deg, rgba(216,132,18,0.06), transparent 240px),
+        linear-gradient(90deg, rgba(24,33,38,0.03) 1px, transparent 1px),
+        linear-gradient(0deg, rgba(24,33,38,0.02) 1px, transparent 1px),
         var(--bg);
       background-size: auto, 24px 24px, 24px 24px, auto;
       font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
@@ -187,14 +187,14 @@ def _render_html(report: dict) -> str:
       background: var(--panel);
       border: 1px solid var(--line);
       border-radius: 8px;
-      box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.7);
     }}
     .hero {{
       padding: 18px;
       display: grid;
       gap: 12px;
       background:
-        linear-gradient(180deg, rgba(255,181,71,0.06), transparent 60%),
+        linear-gradient(180deg, rgba(216,132,18,0.05), transparent 60%),
         var(--panel);
     }}
     .metrics {{
@@ -205,7 +205,7 @@ def _render_html(report: dict) -> str:
     .metric {{
       padding: 12px;
       border-radius: 6px;
-      background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(0,0,0,0.06));
+      background: linear-gradient(180deg, rgba(255,255,255,0.96), rgba(244,246,248,0.9));
       border: 1px solid var(--line);
       min-height: 84px;
     }}
@@ -269,7 +269,7 @@ def _render_html(report: dict) -> str:
     }}
     .tab.active {{
       background: var(--accent);
-      color: #161a1f;
+      color: #ffffff;
       border-color: var(--accent);
     }}
     .panel {{
@@ -293,13 +293,53 @@ def _render_html(report: dict) -> str:
     .graph {{
       height: 520px;
       border-radius: 6px;
-      background: #14191e;
+      background:
+        radial-gradient(circle at top left, rgba(42,125,184,0.05), transparent 35%),
+        #ffffff;
       border: 1px solid var(--line);
       overflow: hidden;
+      position: relative;
     }}
     .graph svg {{
       width: 100%;
       height: 100%;
+    }}
+    .graph-toolbar {{
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      display: flex;
+      gap: 6px;
+      z-index: 5;
+    }}
+    .graph-btn {{
+      border: 1px solid var(--line2);
+      background: rgba(255,255,255,0.94);
+      color: var(--ink);
+      border-radius: 4px;
+      padding: 4px 7px;
+      font-size: 11px;
+      cursor: pointer;
+    }}
+    .graph-detail {{
+      position: absolute;
+      left: 10px;
+      bottom: 10px;
+      max-width: 340px;
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,0.97);
+      border-radius: 6px;
+      padding: 8px 10px;
+      font-size: 12px;
+      color: var(--ink);
+      box-shadow: 0 8px 24px rgba(0,0,0,0.08);
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 120ms ease;
+      white-space: pre-wrap;
+    }}
+    .graph-detail.visible {{
+      opacity: 1;
     }}
     pre {{
       margin: 0;
@@ -360,8 +400,8 @@ def _render_html(report: dict) -> str:
       padding: 10px 12px;
       border-radius: 6px;
       border: 1px solid var(--line2);
-      background: #0f1418;
-      color: var(--ink);
+      background: #101317;
+      color: #eef3f6;
       text-transform: none;
       letter-spacing: 0;
       font-size: 12px;
@@ -520,8 +560,11 @@ def _render_html(report: dict) -> str:
     function renderGraph(container, graphData) {{
       const root = d3.select(container);
       root.selectAll("*").remove();
+      const toolbar = root.append("div").attr("class", "graph-toolbar");
+      const detail = root.append("div").attr("class", "graph-detail").text("");
       const svg = root.append("svg");
-      const inner = svg.append("g");
+      const viewport = svg.append("g");
+      const inner = viewport.append("g");
       const graph = new dagre.graphlib.Graph();
       graph.setGraph({{ rankdir: "LR", nodesep: 24, ranksep: 56, marginx: 24, marginy: 24 }});
       graph.setDefaultEdgeLabel(() => ({{}}));
@@ -541,6 +584,25 @@ def _render_html(report: dict) -> str:
       }});
 
       dagre.layout(graph);
+      const zoom = d3.zoom().scaleExtent([0.35, 3]).on("zoom", (event) => {{
+        viewport.attr("transform", event.transform);
+      }});
+      svg.call(zoom);
+
+      function fitGraph() {{
+        const dims = graph.graph();
+        const width = container.clientWidth || 800;
+        const height = container.clientHeight || 520;
+        const scale = Math.min(width / Math.max(dims.width + 48, 1), height / Math.max(dims.height + 48, 1), 1);
+        const tx = (width - dims.width * scale) / 2 + 24;
+        const ty = (height - dims.height * scale) / 2 + 24;
+        svg.transition().duration(250).call(zoom.transform, d3.zoomIdentity.translate(tx, ty).scale(scale));
+      }}
+
+      toolbar.append("button").attr("class", "graph-btn").text("Fit").on("click", fitGraph);
+      toolbar.append("button").attr("class", "graph-btn").text("+").on("click", () => svg.transition().duration(180).call(zoom.scaleBy, 1.2));
+      toolbar.append("button").attr("class", "graph-btn").text("-").on("click", () => svg.transition().duration(180).call(zoom.scaleBy, 0.85));
+
       const defs = svg.append("defs");
       defs.append("marker")
         .attr("id", "arrow")
@@ -561,7 +623,7 @@ def _render_html(report: dict) -> str:
         inner.append("path")
           .attr("d", path(pts))
           .attr("fill", "none")
-          .attr("stroke", "#86929a")
+          .attr("stroke", "#7d8790")
           .attr("stroke-width", 1.6)
           .attr("marker-end", "url(#arrow)");
         const mid = pts[Math.floor(pts.length / 2)];
@@ -569,7 +631,7 @@ def _render_html(report: dict) -> str:
           .attr("x", mid.x)
           .attr("y", mid.y - 8)
           .attr("text-anchor", "middle")
-          .attr("fill", "#a5b1ba")
+          .attr("fill", "#5b6975")
           .style("font-size", "12px")
           .text(e.label || "");
       }});
@@ -577,28 +639,38 @@ def _render_html(report: dict) -> str:
       graph.nodes().forEach(id => {{
         const n = graph.node(id);
         const g = inner.append("g").attr("transform", `translate(${{n.x - n.width/2}}, ${{n.y - n.height/2}})`);
-        g.append("rect")
+        const rect = g.append("rect")
           .attr("rx", 16)
           .attr("ry", 16)
           .attr("width", n.width)
           .attr("height", n.height)
           .attr("fill", n.color)
-          .attr("stroke", "#5b6770")
+          .attr("stroke", "#8b97a1")
           .attr("stroke-width", 1.2);
         const lines = n.label.split("\\n");
         lines.forEach((line, idx) => {{
           g.append("text")
             .attr("x", 16)
             .attr("y", 24 + idx * 18)
-            .attr("fill", "#eef3f6")
+            .attr("fill", "#182126")
             .style("font-size", idx === 0 ? "14px" : "12px")
             .style("font-weight", idx === 0 ? 700 : 500)
             .text(line);
         }});
+        g.style("cursor", "pointer")
+          .on("mouseenter", () => {{
+            rect.attr("stroke", "#2a7db8").attr("stroke-width", 2);
+            detail.classed("visible", true).text(n.label);
+          }})
+          .on("mouseleave", () => {{
+            rect.attr("stroke", "#8b97a1").attr("stroke-width", 1.2);
+            detail.classed("visible", false);
+          }});
       }});
 
       const dims = graph.graph();
       svg.attr("viewBox", `0 0 ${{dims.width + 48}} ${{dims.height + 48}}`);
+      fitGraph();
     }}
 
     function populateOverview() {{
