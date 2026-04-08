@@ -14,7 +14,7 @@ from tinygrad.viz.serve import uop_to_json
 
 from compiler import compile_top_module, show_hardware, synthesis_stats
 from compiler.top_module import simulate_top
-from compiler.visualize import analyze_manual_kernels, analyze_schedule
+from compiler.visualize import analyze_schedule
 
 
 @dataclass
@@ -99,32 +99,6 @@ def _kernel_payload(schedule, pipeline_view, kernel_specs, synth_dir: Path) -> l
             "source_index": orig_k,
             "metadata": [str(m.name if hasattr(m, "name") else m) for m in si.metadata],
             "tinygrad_graph": uop_to_json(si.ast),
-            "kernel_ir": kv.kernel_ir.format(kv.kernel_ir),
-            "synth_svg": svg,
-            "synth_stats": synth,
-        })
-    return payload
-
-
-def _manual_kernel_payload(pipeline_view, kernels, synth_dir: Path, *, tinygrad_graphs=None, metadata=None) -> list[dict]:
-    payload = []
-    tinygrad_graphs = tinygrad_graphs or [None] * len(kernels)
-    metadata = metadata or [()] * len(kernels)
-    kernel_by_orig = {kv.index: kernels[i] for i, kv in enumerate(pipeline_view.kernel_views)}
-    graph_by_orig = {kv.index: tinygrad_graphs[i] for i, kv in enumerate(pipeline_view.kernel_views)}
-    meta_by_orig = {kv.index: metadata[i] for i, kv in enumerate(pipeline_view.kernel_views)}
-    for kv in pipeline_view.kernel_views:
-        kernel = kernel_by_orig[kv.index]
-        svg = None
-        svg_path = show_hardware(kernel, str(synth_dir / f"kernel_{kv.index}"), fmt="svg")
-        if svg_path is not None:
-            svg = Path(svg_path).read_text()
-        synth = synthesis_stats(kernel, device=FPGA_DEVICE, package=FPGA_PACKAGE)
-        payload.append({
-            "exec_index": kv.index,
-            "source_index": kv.index,
-            "metadata": [str(m) for m in meta_by_orig[kv.index]],
-            "tinygrad_graph": graph_by_orig[kv.index] or {},
             "kernel_ir": kv.kernel_ir.format(kv.kernel_ir),
             "synth_svg": svg,
             "synth_stats": synth,
@@ -807,24 +781,28 @@ def _render_html(report: dict) -> str:
 """
 
 
-def benchmark(tensor, *, out_dir: str = "tg2hdl_report") -> BenchmarkArtifact:
+def benchmark(tensor, *extra_outputs, schedule_outputs=None, out_dir: str = "tg2hdl_report") -> BenchmarkArtifact:
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
     _copy_viz_assets(out_path)
 
-    schedule = tensor.schedule()
+    if schedule_outputs is None:
+        schedule = tensor.schedule(*extra_outputs)
+    else:
+        schedule_outputs = tuple(schedule_outputs)
+        assert len(schedule_outputs) > 0, "schedule_outputs must not be empty"
+        schedule = schedule_outputs[0].schedule(*schedule_outputs[1:])
     pipeline_view = analyze_schedule(schedule)
     top, _connections, kernel_specs = compile_top_module(schedule)
     input_data = _infer_input_data(schedule, pipeline_view, top)
 
     t0 = time.perf_counter()
     run_schedule(list(schedule), do_update_stats=False)
-    compute_items = [si for si in schedule if si.ast.op == Ops.SINK]
-    ref_out = np.array(compute_items[-1].bufs[0].numpy(), copy=True)
+    ref_out = np.array(tensor.numpy(), copy=True).reshape(-1)
     tinygrad_wall = time.perf_counter() - t0
 
     sim_out_raw, sim_cycles, sim_wall = simulate_top(top, input_data)
-    sim_out = _decode_sim_output(sim_out_raw, tensor.dtype)
+    sim_out = _decode_sim_output(sim_out_raw, tensor.dtype).reshape(-1)
 
     if np.issubdtype(ref_out.dtype, np.floating):
         correctness = bool(np.allclose(ref_out.reshape(-1), sim_out.reshape(-1), rtol=1e-5, atol=1e-5))
@@ -853,65 +831,6 @@ def benchmark(tensor, *, out_dir: str = "tg2hdl_report") -> BenchmarkArtifact:
         report_path=str(html_path),
         tinygrad_device=str(tensor.device),
         tinygrad_wall_s=tinygrad_wall,
-        tg2hdl_wall_s=sim_wall,
-        tg2hdl_cycles=sim_cycles,
-        correctness=correctness,
-    )
-
-
-def benchmark_manual(*, kernels, connections, input_data, reference_output, reference_wall_s=0.0,
-                     tinygrad_device="CPU", tinygrad_graphs=None, metadata=None,
-                     original_kernel_ids=None, out_dir: str = "tg2hdl_report_manual") -> BenchmarkArtifact:
-    out_path = Path(out_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
-    _copy_viz_assets(out_path)
-
-    if original_kernel_ids is None:
-        original_kernel_ids = list(range(len(kernels)))
-
-    buf_depths = {}
-    for k_idx, kernel in enumerate(kernels):
-        for info in kernel.buf_infos:
-            buf_depths[(k_idx, info["idx"])] = info["depth"]
-
-    from compiler.top_module import TopModule
-
-    top = TopModule(kernels, connections, buf_depths)
-    pipeline_view = analyze_manual_kernels(kernels, connections, original_kernel_ids=original_kernel_ids)
-
-    sim_out_raw, sim_cycles, sim_wall = simulate_top(top, input_data)
-    reference = np.array(reference_output, copy=True).reshape(-1)
-    sim_out = np.array(sim_out_raw, copy=True).reshape(-1)
-    correctness = bool(np.array_equal(reference, sim_out))
-
-    report = {
-        "summary": {
-            "tinygrad_device": tinygrad_device,
-            "tinygrad_wall_s": reference_wall_s,
-            "tg2hdl_wall_s": sim_wall,
-            "tg2hdl_cycles": sim_cycles,
-            "correctness": correctness,
-            "reference_output": reference.tolist(),
-            "sim_output": sim_out.tolist(),
-        },
-        "graphs": _graph_payload(pipeline_view),
-        "top_synth": _top_payload(top, out_path / "synth"),
-        "kernels": _manual_kernel_payload(
-            pipeline_view,
-            kernels,
-            out_path / "synth",
-            tinygrad_graphs=tinygrad_graphs,
-            metadata=metadata,
-        ),
-    }
-
-    html_path = out_path / "index.html"
-    html_path.write_text(_render_html(report))
-    return BenchmarkArtifact(
-        output_dir=str(out_path),
-        report_path=str(html_path),
-        tinygrad_device=str(tinygrad_device),
-        tinygrad_wall_s=reference_wall_s,
         tg2hdl_wall_s=sim_wall,
         tg2hdl_cycles=sim_cycles,
         correctness=correctness,
