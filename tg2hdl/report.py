@@ -144,57 +144,70 @@ def _render_html(report: dict) -> str:
   <script src="assets/dagrejs.github.io/project/dagre/latest/dagre.min.js"></script>
   <style>
     :root {{
-      --bg: linear-gradient(135deg, #f5efe4 0%, #e8dfd0 45%, #d7e4ea 100%);
-      --panel: rgba(255, 252, 247, 0.88);
-      --ink: #182126;
-      --muted: #4b5a61;
-      --accent: #bb4d00;
-      --accent2: #246a73;
-      --ok: #1f7a43;
-      --bad: #9f2d20;
-      --edge: #8d8f91;
-      --node: #fef7ec;
+      --bg: #101317;
+      --bg2: #171c21;
+      --panel: #1d2329;
+      --panel2: #252d34;
+      --line: #3a464f;
+      --line2: #56616a;
+      --ink: #eef3f6;
+      --muted: #a5b1ba;
+      --accent: #ffb547;
+      --accent2: #71d0ff;
+      --ok: #76d08a;
+      --bad: #ff7e73;
+      --edge: #86929a;
+      --node: #20272d;
     }}
     * {{ box-sizing: border-box; }}
     body {{
       margin: 0;
       color: var(--ink);
-      background: var(--bg);
-      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      background:
+        linear-gradient(180deg, rgba(255,181,71,0.06), transparent 240px),
+        linear-gradient(90deg, rgba(255,255,255,0.025) 1px, transparent 1px),
+        linear-gradient(0deg, rgba(255,255,255,0.02) 1px, transparent 1px),
+        var(--bg);
+      background-size: auto, 24px 24px, 24px 24px, auto;
+      font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
       min-height: 100vh;
     }}
     h1, h2, h3 {{
-      font-family: "Iowan Old Style", "Palatino Linotype", Georgia, serif;
       margin: 0;
+      letter-spacing: 0.01em;
+      font-weight: 650;
     }}
     .shell {{
-      width: min(1400px, calc(100vw - 32px));
-      margin: 24px auto;
+      width: min(1480px, calc(100vw - 32px));
+      margin: 16px auto 32px;
       display: grid;
-      gap: 16px;
+      gap: 12px;
     }}
     .hero, .panel {{
       background: var(--panel);
-      backdrop-filter: blur(8px);
-      border: 1px solid rgba(24,33,38,0.12);
-      border-radius: 20px;
-      box-shadow: 0 18px 50px rgba(24,33,38,0.08);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
     }}
     .hero {{
-      padding: 24px;
+      padding: 18px;
       display: grid;
-      gap: 16px;
+      gap: 12px;
+      background:
+        linear-gradient(180deg, rgba(255,181,71,0.06), transparent 60%),
+        var(--panel);
     }}
     .metrics {{
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-      gap: 12px;
+      grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+      gap: 10px;
     }}
     .metric {{
-      padding: 14px;
-      border-radius: 16px;
-      background: rgba(255,255,255,0.58);
-      border: 1px solid rgba(24,33,38,0.08);
+      padding: 12px;
+      border-radius: 6px;
+      background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(0,0,0,0.06));
+      border: 1px solid var(--line);
+      min-height: 84px;
     }}
     .metric .label {{
       font-size: 12px;
@@ -202,30 +215,62 @@ def _render_html(report: dict) -> str:
       letter-spacing: 0.08em;
       color: var(--muted);
       margin-bottom: 6px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
     }}
     .metric .value {{
-      font-size: 22px;
+      font-size: 24px;
       font-weight: 700;
+      line-height: 1.1;
     }}
     .ok {{ color: var(--ok); }}
     .bad {{ color: var(--bad); }}
+    .summary-grid {{
+      display: grid;
+      grid-template-columns: 1.2fr 1fr;
+      gap: 12px;
+    }}
+    .summary-table {{
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }}
+    .summary-table td {{
+      padding: 10px 0;
+      border-bottom: 1px solid var(--line);
+      vertical-align: top;
+    }}
+    .summary-table td:first-child {{
+      width: 220px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      font-size: 11px;
+    }}
     .tabs {{
       display: flex;
       flex-wrap: wrap;
       gap: 8px;
+      border-top: 1px solid var(--line);
+      padding-top: 12px;
     }}
     .tab {{
-      border: 0;
-      padding: 10px 14px;
-      border-radius: 999px;
-      background: rgba(255,255,255,0.65);
+      border: 1px solid var(--line2);
+      padding: 9px 13px;
+      border-radius: 4px;
+      background: var(--panel2);
       color: var(--ink);
       cursor: pointer;
       font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      font-size: 12px;
     }}
     .tab.active {{
-      background: var(--ink);
-      color: white;
+      background: var(--accent);
+      color: #161a1f;
+      border-color: var(--accent);
     }}
     .panel {{
       padding: 18px;
@@ -240,15 +285,16 @@ def _render_html(report: dict) -> str:
     }}
     .card {{
       padding: 14px;
-      border-radius: 16px;
-      border: 1px solid rgba(24,33,38,0.08);
-      background: rgba(255,255,255,0.62);
+      border-radius: 6px;
+      border: 1px solid var(--line);
+      background: var(--panel2);
       overflow: hidden;
     }}
     .graph {{
       height: 520px;
-      border-radius: 14px;
-      background: rgba(255,255,255,0.72);
+      border-radius: 6px;
+      background: #14191e;
+      border: 1px solid var(--line);
       overflow: hidden;
     }}
     .graph svg {{
@@ -274,89 +320,173 @@ def _render_html(report: dict) -> str:
     .muted {{
       color: var(--muted);
     }}
+    .section-head {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 10px;
+    }}
+    .badge {{
+      border: 1px solid var(--line2);
+      border-radius: 4px;
+      padding: 3px 8px;
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }}
+    .help {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 16px;
+      height: 16px;
+      border-radius: 999px;
+      border: 1px solid var(--line2);
+      color: var(--accent);
+      font-size: 11px;
+      font-weight: 700;
+      cursor: help;
+      position: relative;
+      flex: 0 0 auto;
+    }}
+    .help:hover::after {{
+      content: attr(data-help);
+      position: absolute;
+      left: 22px;
+      top: -8px;
+      width: 260px;
+      padding: 10px 12px;
+      border-radius: 6px;
+      border: 1px solid var(--line2);
+      background: #0f1418;
+      color: var(--ink);
+      text-transform: none;
+      letter-spacing: 0;
+      font-size: 12px;
+      line-height: 1.4;
+      white-space: normal;
+      z-index: 20;
+      box-shadow: 0 12px 30px rgba(0,0,0,0.35);
+    }}
+    .methodology {{
+      font-size: 13px;
+      line-height: 1.55;
+    }}
+    .methodology p {{
+      margin: 0 0 10px 0;
+    }}
+    .methodology code {{
+      font-family: "IBM Plex Mono", monospace;
+      font-size: 12px;
+    }}
+    @media (max-width: 980px) {{
+      .summary-grid {{
+        grid-template-columns: 1fr;
+      }}
+    }}
   </style>
 </head>
 <body>
   <div class="shell">
     <section class="hero">
-      <div>
+      <div class="section-head">
         <h1>tg2hdl Benchmark</h1>
-        <p class="muted">Tinygrad execution, tg2hdl compilation, graph scheduling, and FPGA-oriented synthesis in one report.</p>
+        <div class="badge">Hardware Compilation Report</div>
       </div>
-      <div class="metrics">
-        <div class="metric"><div class="label">Correctness</div><div class="value {'ok' if report['summary']['correctness'] else 'bad'}">{'PASS' if report['summary']['correctness'] else 'FAIL'}</div></div>
-        <div class="metric"><div class="label">Tinygrad Device</div><div class="value">{html.escape(report['summary']['tinygrad_device'])}</div></div>
-        <div class="metric"><div class="label">Tinygrad Wall</div><div class="value">{report['summary']['tinygrad_wall_s']:.6f}s</div></div>
-        <div class="metric"><div class="label">tg2hdl Wall</div><div class="value">{report['summary']['tg2hdl_wall_s']:.6f}s</div></div>
-        <div class="metric"><div class="label">tg2hdl Cycles</div><div class="value">{report['summary']['tg2hdl_cycles']}</div></div>
-        <div class="metric"><div class="label">Kernels</div><div class="value">{len(report['kernels'])}</div></div>
-      </div>
-      <div class="grid-2">
+      <p class="muted">Tinygrad reference execution, tg2hdl lowering, top-level scheduling, and FPGA-oriented synthesis collected into a single engineering report.</p>
+      <div class="summary-grid">
         <div class="card">
-          <h2>What This Page Shows</h2>
-          <pre>1. Tinygrad lowers the input tensor expression into one or more compute kernels.
-2. tg2hdl compiles those kernels into KernelIR and Amaranth modules.
-3. tg2hdl builds a top-level execution graph showing kernel dependencies and copies.
-4. Tinygrad is executed as the reference implementation.
-5. The tg2hdl top module is simulated in Amaranth and compared against that reference.
-6. The report synthesizes both the full assembled system and each individual kernel for {FPGA_FAMILY} {FPGA_DEVICE.upper()}-{FPGA_PACKAGE}.</pre>
+          <div class="section-head">
+            <h2>Summary</h2>
+            <div class="badge">At a Glance</div>
+          </div>
+          <table class="summary-table">
+            <tr><td>Status</td><td class="{'ok' if report['summary']['correctness'] else 'bad'}"><strong>{'PASS' if report['summary']['correctness'] else 'FAIL'}</strong></td></tr>
+            <tr><td>Tinygrad Device</td><td>{html.escape(report['summary']['tinygrad_device'])}</td></tr>
+            <tr><td>Kernel Count</td><td>{len(report['kernels'])}</td></tr>
+            <tr><td>FPGA Target</td><td>{FPGA_FAMILY} {FPGA_DEVICE.upper()}-{FPGA_PACKAGE}</td></tr>
+            <tr><td>Report Scope</td><td>Reference execution, compiler graphs, KernelIR, full-system synthesis, per-kernel synthesis</td></tr>
+          </table>
         </div>
         <div class="card">
-          <h2>Provenance</h2>
-          <pre>Tinygrad sections:
-- Reference output and Tinygrad wall time
-- Tinygrad kernel graphs in the "Tinygrad Kernels" tab
-
-tg2hdl sections:
-- Kernel DAG and Execution DAG
-- KernelIR listings
-- tg2hdl simulation wall time and cycle count
-
-Amaranth / FPGA sections:
-- Generated RTL schematic when Yosys + Graphviz are available
-- Resource and Fmax estimates from Yosys + nextpnr for {FPGA_FAMILY} {FPGA_DEVICE.upper()}-{FPGA_PACKAGE}</pre>
+          <div class="section-head">
+            <h2>Primary Metrics</h2>
+            <div class="badge">Measured</div>
+          </div>
+          <div class="metrics">
+            <div class="metric"><div class="label">Correctness <span class="help" data-help="PASS means the final tg2hdl simulated output buffer exactly matched the tinygrad reference output for this run.">?</span></div><div class="value {'ok' if report['summary']['correctness'] else 'bad'}">{'PASS' if report['summary']['correctness'] else 'FAIL'}</div></div>
+            <div class="metric"><div class="label">Tinygrad Wall <span class="help" data-help="Wall-clock time spent executing the captured tinygrad schedule on the selected tinygrad device, measured in Python around schedule execution.">?</span></div><div class="value">{report['summary']['tinygrad_wall_s']:.6f}s</div></div>
+            <div class="metric"><div class="label">tg2hdl Wall <span class="help" data-help="Wall-clock time spent simulating the generated tg2hdl TopModule in Amaranth. This is software simulation time, not predicted FPGA runtime.">?</span></div><div class="value">{report['summary']['tg2hdl_wall_s']:.6f}s</div></div>
+            <div class="metric"><div class="label">tg2hdl Cycles <span class="help" data-help="Clock cycles observed between start and done in the Amaranth TopModule simulation. This is the hardware-style runtime metric for the generated design.">?</span></div><div class="value">{report['summary']['tg2hdl_cycles']}</div></div>
+            <div class="metric"><div class="label">Kernel Count <span class="help" data-help="Number of tinygrad compute kernels present in the scheduled program after lowering and fusion decisions.">?</span></div><div class="value">{len(report['kernels'])}</div></div>
+            <div class="metric"><div class="label">Full-System Fmax <span class="help" data-help="Estimated maximum clock frequency reported by nextpnr for the full assembled tg2hdl TopModule targeting the selected FPGA.">?</span></div><div class="value">{_format_mhz(report['top_synth']['synth_stats']['fmax_mhz'])}</div></div>
+          </div>
         </div>
       </div>
       <div class="tabs">
-        <button class="tab active" data-target="overview">Overview</button>
+        <button class="tab active" data-target="summary">Summary</button>
+        <button class="tab" data-target="overview">Graphs</button>
         <button class="tab" data-target="tinygrad">Tinygrad Kernels</button>
         <button class="tab" data-target="kernelir">KernelIR</button>
         <button class="tab" data-target="synth">Amaranth Synth</button>
+        <button class="tab" data-target="methodology">Methodology</button>
       </div>
     </section>
-    <section class="panel active" id="overview">
+    <section class="panel active" id="summary">
       <div class="grid-2">
         <div class="card">
-          <h2>Kernel DAG</h2>
-          <p class="muted">This graph is built by tg2hdl from the tinygrad schedule. Each node is a compiled kernel. Each edge means one kernel output buffer becomes another kernel input buffer.</p>
+          <div class="section-head">
+            <h2>Outputs</h2>
+            <div class="badge">Comparison</div>
+          </div>
+          <p class="muted">Reference output comes from tinygrad schedule execution. tg2hdl output comes from Amaranth simulation of the generated TopModule.</p>
+          <div class="grid-2">
+            <div>
+              <div class="section-head"><h3>Reference</h3><div class="badge">tinygrad</div></div>
+              <pre id="reference-output"></pre>
+            </div>
+            <div>
+              <div class="section-head"><h3>tg2hdl</h3><div class="badge">simulation</div></div>
+              <pre id="sim-output"></pre>
+            </div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="section-head">
+            <h2>System Summary</h2>
+            <div class="badge">Whole Design</div>
+          </div>
+          <div class="metrics">
+            <div class="metric"><div class="label">FPGA Target <span class="help" data-help="Synthesis target used for both the full-system and per-kernel FPGA estimates.">?</span></div><div class="value" style="font-size:16px;">{FPGA_FAMILY} {FPGA_DEVICE.upper()}-{FPGA_PACKAGE}</div></div>
+            <div class="metric"><div class="label">Synth Wall <span class="help" data-help="Wall-clock time spent running Yosys plus nextpnr for the full TopModule, when available.">?</span></div><div class="value">{_format_seconds(report['top_synth']['synth_stats']['synth_wall_s'])}</div></div>
+            <div class="metric"><div class="label">LUTs <span class="help" data-help="TRELLIS_COMB cells used by the full assembled design according to nextpnr utilization output.">?</span></div><div class="value">{report['top_synth']['synth_stats']['comb']}</div></div>
+            <div class="metric"><div class="label">FFs <span class="help" data-help="TRELLIS_FF cells used by the full assembled design according to nextpnr utilization output.">?</span></div><div class="value">{report['top_synth']['synth_stats']['ff']}</div></div>
+            <div class="metric"><div class="label">BRAM <span class="help" data-help="DP16KD block RAM tiles used by the full assembled design according to nextpnr utilization output.">?</span></div><div class="value">{report['top_synth']['synth_stats']['dp16kd']}</div></div>
+            <div class="metric"><div class="label">DSP <span class="help" data-help="MULT18X18D DSP multiplier tiles used by the full assembled design according to nextpnr utilization output.">?</span></div><div class="value">{report['top_synth']['synth_stats']['mult18']}</div></div>
+          </div>
+        </div>
+      </div>
+    </section>
+    <section class="panel" id="overview">
+      <div class="grid-2">
+        <div class="card">
+          <div class="section-head">
+            <h2>Kernel DAG</h2>
+            <div class="badge">tg2hdl</div>
+          </div>
+          <p class="muted">Logical kernel dependency graph reconstructed by tg2hdl from the tinygrad schedule.</p>
           <div class="graph" id="pipeline-graph"></div>
         </div>
         <div class="card">
-          <h2>Execution DAG</h2>
-          <p class="muted">This graph is also tg2hdl-specific. It shows the execution order after topological sorting plus the buffer-copy edges the top-level executor will actually drive.</p>
+          <div class="section-head">
+            <h2>Execution DAG</h2>
+            <div class="badge">tg2hdl</div>
+          </div>
+          <p class="muted">Top-level execution graph after tg2hdl ordering and copy-group construction.</p>
           <div class="graph" id="execution-graph"></div>
         </div>
-      </div>
-      <div class="grid-2">
-        <div class="card">
-          <h2>Reference Output</h2>
-          <p class="muted">Produced by executing the captured tinygrad schedule on the selected tinygrad device.</p>
-          <pre id="reference-output"></pre>
-        </div>
-        <div class="card">
-          <h2>tg2hdl Output</h2>
-          <p class="muted">Produced by simulating the generated top-level Amaranth module in software and reading back the final output buffer.</p>
-          <pre id="sim-output"></pre>
-        </div>
-      </div>
-      <div class="card">
-        <h2>Reading Guide</h2>
-        <pre>Read left to right:
-- Tinygrad starts with a tensor expression and lowers it into kernels.
-- tg2hdl interprets those kernels and emits KernelIR plus Amaranth hardware.
-- The Kernel DAG shows logical data dependencies.
-- The Execution DAG shows the actual top-level schedule tg2hdl simulates.
-- A PASS means the tg2hdl simulated output matches tinygrad's result for this run.</pre>
       </div>
     </section>
     <section class="panel" id="tinygrad">
@@ -367,6 +497,21 @@ Amaranth / FPGA sections:
     </section>
     <section class="panel" id="synth">
       <div class="kernel-list" id="synth-kernels"></div>
+    </section>
+    <section class="panel" id="methodology">
+      <div class="card methodology">
+        <div class="section-head">
+          <h2>Methodology</h2>
+          <div class="badge">Explanations</div>
+        </div>
+        <p><strong>Tinygrad reference:</strong> the input tensor expression is scheduled by tinygrad and executed through <code>run_schedule(...)</code>. The final realized output buffer is used as the reference result.</p>
+        <p><strong>Kernel graphs:</strong> the “Tinygrad Kernels” tab comes directly from tinygrad’s UOp graph for each scheduled compute kernel.</p>
+        <p><strong>Kernel DAG and Execution DAG:</strong> these are tg2hdl-generated views. The Kernel DAG shows logical producer/consumer dependencies. The Execution DAG shows the actual topological execution order and explicit copy edges the tg2hdl top-level executor will drive.</p>
+        <p><strong>tg2hdl wall time:</strong> this is Python wall-clock time for Amaranth simulation of the generated <code>TopModule</code>. It is not intended as an estimate of FPGA runtime.</p>
+        <p><strong>tg2hdl cycles:</strong> this is the cycle count observed from <code>start</code> to <code>done</code> in the Amaranth simulation. This is the closest report metric to generated hardware runtime.</p>
+        <p><strong>Synth wall / Fmax / utilization:</strong> these come from Yosys plus nextpnr targeting <code>{FPGA_FAMILY} {FPGA_DEVICE.upper()}-{FPGA_PACKAGE}</code>. If these tools are not present, the report still renders but synthesis-specific values appear as unavailable.</p>
+        <p><strong>Full System vs Per-Kernel synthesis:</strong> the top synth block represents the assembled design with all kernels and control logic. The per-kernel blocks are local cost views and do not include full-system orchestration overhead.</p>
+      </div>
     </section>
   </div>
   <script>
@@ -386,7 +531,7 @@ Amaranth / FPGA sections:
           label: node.label,
           width: 220,
           height: 72,
-          color: node.color || "#fef7ec",
+          color: node.color || "#20272d",
         }});
       }});
       Object.entries(graphData).forEach(([id, node]) => {{
@@ -407,7 +552,7 @@ Amaranth / FPGA sections:
         .attr("orient", "auto-start-reverse")
         .append("path")
         .attr("d", "M 0 0 L 10 5 L 0 10 z")
-        .attr("fill", "#8d8f91");
+        .attr("fill", "#86929a");
 
       graph.edges().forEach(edge => {{
         const e = graph.edge(edge);
@@ -416,7 +561,7 @@ Amaranth / FPGA sections:
         inner.append("path")
           .attr("d", path(pts))
           .attr("fill", "none")
-          .attr("stroke", "#8d8f91")
+          .attr("stroke", "#86929a")
           .attr("stroke-width", 1.6)
           .attr("marker-end", "url(#arrow)");
         const mid = pts[Math.floor(pts.length / 2)];
@@ -424,7 +569,7 @@ Amaranth / FPGA sections:
           .attr("x", mid.x)
           .attr("y", mid.y - 8)
           .attr("text-anchor", "middle")
-          .attr("fill", "#4b5a61")
+          .attr("fill", "#a5b1ba")
           .style("font-size", "12px")
           .text(e.label || "");
       }});
@@ -438,14 +583,14 @@ Amaranth / FPGA sections:
           .attr("width", n.width)
           .attr("height", n.height)
           .attr("fill", n.color)
-          .attr("stroke", "#6f6e68")
+          .attr("stroke", "#5b6770")
           .attr("stroke-width", 1.2);
         const lines = n.label.split("\\n");
         lines.forEach((line, idx) => {{
           g.append("text")
             .attr("x", 16)
             .attr("y", 24 + idx * 18)
-            .attr("fill", "#182126")
+            .attr("fill", "#eef3f6")
             .style("font-size", idx === 0 ? "14px" : "12px")
             .style("font-weight", idx === 0 ? 700 : 500)
             .text(line);
@@ -468,7 +613,7 @@ Amaranth / FPGA sections:
       REPORT.kernels.forEach((kernel, idx) => {{
         const card = document.createElement("div");
         card.className = "card";
-        card.innerHTML = `<h2>Kernel ${{idx}}<span class="muted"> · source K${{kernel.source_index}}</span></h2><p class="muted">This graph comes directly from tinygrad's UOp graph for the scheduled kernel.</p><p class="muted">${{kernel.metadata.join(", ") || "no metadata"}}</p><div class="graph" id="tinygrad-graph-${{idx}}"></div>`;
+        card.innerHTML = `<div class="section-head"><h2>Kernel ${{idx}}</h2><div class="badge">tinygrad source K${{kernel.source_index}}</div></div><p class="muted">This graph comes directly from tinygrad's UOp graph for the scheduled kernel.</p><p class="muted">${{kernel.metadata.join(", ") || "no metadata"}}</p><div class="graph" id="tinygrad-graph-${{idx}}"></div>`;
         root.appendChild(card);
         renderGraph(card.querySelector(".graph"), kernel.tinygrad_graph);
       }});
@@ -479,7 +624,7 @@ Amaranth / FPGA sections:
       REPORT.kernels.forEach((kernel, idx) => {{
         const card = document.createElement("div");
         card.className = "card";
-        card.innerHTML = `<h2>KernelIR ${{idx}}</h2><p class="muted">This textual IR is generated by tg2hdl after translating tinygrad UOps into the compiler's own typed kernel representation.</p><pre></pre>`;
+        card.innerHTML = `<div class="section-head"><h2>KernelIR ${{idx}}</h2><div class="badge">tg2hdl</div></div><p class="muted">This textual IR is generated by tg2hdl after translating tinygrad UOps into the compiler's own typed kernel representation.</p><pre></pre>`;
         card.querySelector("pre").textContent = kernel.kernel_ir;
         root.appendChild(card);
       }});
@@ -490,18 +635,18 @@ Amaranth / FPGA sections:
       const topCard = document.createElement("div");
       topCard.className = "card synth";
       const topStats = REPORT.top_synth.synth_stats;
-      topCard.innerHTML = `<h2>Full System</h2>
+      topCard.innerHTML = `<div class="section-head"><h2>Full System</h2><div class="badge">assembled design</div></div>
         <p class="muted">${{REPORT.top_synth.description}}</p>
         <p class="muted">This is the real whole-design synthesis target: one assembled TopModule, not a per-kernel estimate.</p>
         <div class="metrics">
-          <div class="metric"><div class="label">FPGA Target</div><div class="value">${{topStats.fpga_family}} ${{topStats.fpga_device.toUpperCase()}}-${{topStats.fpga_package}}</div></div>
-          <div class="metric"><div class="label">Fmax</div><div class="value">${{topStats.fmax_mhz === null ? "n/a" : topStats.fmax_mhz.toFixed(2) + " MHz"}}</div></div>
-          <div class="metric"><div class="label">Synth Wall</div><div class="value">${{topStats.synth_wall_s === null ? "n/a" : topStats.synth_wall_s.toFixed(3) + "s"}}</div></div>
-          <div class="metric"><div class="label">LUTs</div><div class="value">${{topStats.comb}}</div></div>
-          <div class="metric"><div class="label">FFs</div><div class="value">${{topStats.ff}}</div></div>
-          <div class="metric"><div class="label">BRAM</div><div class="value">${{topStats.dp16kd}}</div></div>
-          <div class="metric"><div class="label">DSP</div><div class="value">${{topStats.mult18}}</div></div>
-          <div class="metric"><div class="label">On-chip Bits</div><div class="value">${{topStats.mem_bits}}</div></div>
+          <div class="metric"><div class="label">FPGA Target <span class="help" data-help="Synthesis target used for the full assembled TopModule.">?</span></div><div class="value" style="font-size:16px;">${{topStats.fpga_family}} ${{topStats.fpga_device.toUpperCase()}}-${{topStats.fpga_package}}</div></div>
+          <div class="metric"><div class="label">Fmax <span class="help" data-help="Estimated maximum clock frequency reported by nextpnr for the full assembled design.">?</span></div><div class="value">${{topStats.fmax_mhz === null ? "n/a" : topStats.fmax_mhz.toFixed(2) + " MHz"}}</div></div>
+          <div class="metric"><div class="label">Synth Wall <span class="help" data-help="Wall-clock time spent running Yosys plus nextpnr for the full assembled TopModule.">?</span></div><div class="value">${{topStats.synth_wall_s === null ? "n/a" : topStats.synth_wall_s.toFixed(3) + "s"}}</div></div>
+          <div class="metric"><div class="label">LUTs <span class="help" data-help="TRELLIS_COMB cells used by the full design according to nextpnr utilization output.">?</span></div><div class="value">${{topStats.comb}}</div></div>
+          <div class="metric"><div class="label">FFs <span class="help" data-help="TRELLIS_FF cells used by the full design according to nextpnr utilization output.">?</span></div><div class="value">${{topStats.ff}}</div></div>
+          <div class="metric"><div class="label">BRAM <span class="help" data-help="DP16KD block RAM tiles used by the full design according to nextpnr utilization output.">?</span></div><div class="value">${{topStats.dp16kd}}</div></div>
+          <div class="metric"><div class="label">DSP <span class="help" data-help="MULT18X18D DSP multiplier tiles used by the full design according to nextpnr utilization output.">?</span></div><div class="value">${{topStats.mult18}}</div></div>
+          <div class="metric"><div class="label">On-chip Bits <span class="help" data-help="Total buffer storage bits across the compiled design, aggregated from compiled kernel buffer definitions.">?</span></div><div class="value">${{topStats.mem_bits}}</div></div>
         </div>`;
       if (REPORT.top_synth.synth_svg) {{
         const wrap = document.createElement("div");
@@ -519,17 +664,17 @@ Amaranth / FPGA sections:
         const card = document.createElement("div");
         card.className = "card synth";
         const stats = kernel.synth_stats;
-        card.innerHTML = `<h2>Synthesis ${{idx}}</h2>
+        card.innerHTML = `<div class="section-head"><h2>Synthesis ${{idx}}</h2><div class="badge">per-kernel</div></div>
           <p class="muted">This is a per-kernel synthesis view. It is useful for localizing cost, but it is not the full assembled design.</p>
           <div class="metrics">
-            <div class="metric"><div class="label">FPGA Target</div><div class="value">${{stats.fpga_family}} ${{stats.fpga_device.toUpperCase()}}-${{stats.fpga_package}}</div></div>
-            <div class="metric"><div class="label">Fmax</div><div class="value">${{stats.fmax_mhz === null ? "n/a" : stats.fmax_mhz.toFixed(2) + " MHz"}}</div></div>
-            <div class="metric"><div class="label">Synth Wall</div><div class="value">${{stats.synth_wall_s === null ? "n/a" : stats.synth_wall_s.toFixed(3) + "s"}}</div></div>
-            <div class="metric"><div class="label">LUTs</div><div class="value">${{stats.comb}}</div></div>
-            <div class="metric"><div class="label">FFs</div><div class="value">${{stats.ff}}</div></div>
-            <div class="metric"><div class="label">BRAM</div><div class="value">${{stats.dp16kd}}</div></div>
-            <div class="metric"><div class="label">DSP</div><div class="value">${{stats.mult18}}</div></div>
-            <div class="metric"><div class="label">On-chip Bits</div><div class="value">${{stats.mem_bits}}</div></div>
+            <div class="metric"><div class="label">FPGA Target <span class="help" data-help="Synthesis target used for this kernel-local estimate.">?</span></div><div class="value" style="font-size:16px;">${{stats.fpga_family}} ${{stats.fpga_device.toUpperCase()}}-${{stats.fpga_package}}</div></div>
+            <div class="metric"><div class="label">Fmax <span class="help" data-help="Estimated maximum clock frequency reported by nextpnr for this compiled kernel alone.">?</span></div><div class="value">${{stats.fmax_mhz === null ? "n/a" : stats.fmax_mhz.toFixed(2) + " MHz"}}</div></div>
+            <div class="metric"><div class="label">Synth Wall <span class="help" data-help="Wall-clock time spent running Yosys plus nextpnr for this compiled kernel alone.">?</span></div><div class="value">${{stats.synth_wall_s === null ? "n/a" : stats.synth_wall_s.toFixed(3) + "s"}}</div></div>
+            <div class="metric"><div class="label">LUTs <span class="help" data-help="TRELLIS_COMB cells used by this kernel according to nextpnr utilization output.">?</span></div><div class="value">${{stats.comb}}</div></div>
+            <div class="metric"><div class="label">FFs <span class="help" data-help="TRELLIS_FF cells used by this kernel according to nextpnr utilization output.">?</span></div><div class="value">${{stats.ff}}</div></div>
+            <div class="metric"><div class="label">BRAM <span class="help" data-help="DP16KD block RAM tiles used by this kernel according to nextpnr utilization output.">?</span></div><div class="value">${{stats.dp16kd}}</div></div>
+            <div class="metric"><div class="label">DSP <span class="help" data-help="MULT18X18D DSP tiles used by this kernel according to nextpnr utilization output.">?</span></div><div class="value">${{stats.mult18}}</div></div>
+            <div class="metric"><div class="label">On-chip Bits <span class="help" data-help="Total buffer storage bits for this compiled kernel.">?</span></div><div class="value">${{stats.mem_bits}}</div></div>
           </div>`;
         if (kernel.synth_svg) {{
           const wrap = document.createElement("div");
