@@ -41,7 +41,6 @@ import time
 from typing import TYPE_CHECKING
 
 import numpy as np
-from amaranth.hdl import Elaboratable, Module, Signal
 from amaranth.sim import Simulator
 
 if TYPE_CHECKING:

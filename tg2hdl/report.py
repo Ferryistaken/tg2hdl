@@ -17,6 +17,7 @@ from compiler import compile_top_module, show_hardware, synthesis_stats
 from compiler.pcie_dma import simulate_top_with_pcie
 from compiler.top_module import simulate_top
 from compiler.visualize import analyze_schedule
+from compiler.wishbone_wrapper import simulate_wishbone
 from tg2hdl.fpga_card import FPGACard, load_card
 
 
@@ -40,6 +41,11 @@ class BenchmarkArtifact:
     dma_readback_cycles: int | None = None  # DMA readback cycles (cycle-accurate)
     dma_total_cycles: int | None = None     # total cycles including DMA (cycle-accurate)
     dma_wall_s: float | None = None         # total DMA-aware wall time
+    # Wishbone bus simulation results
+    wb_load_cycles: int | None = None       # Wishbone input write cycles
+    wb_readback_cycles: int | None = None   # Wishbone output read cycles
+    wb_total_cycles: int | None = None      # total Wishbone cycles (load+start+compute+readback)
+    wb_wall_s: float | None = None          # total Wishbone-aware wall time
 
 
 def _copy_viz_assets(out_dir: Path) -> None:
@@ -664,6 +670,20 @@ def _estimates_for_card(card: FPGACard) -> list[dict]:
             ),
         },
         {
+            "id": "wishbone_simulation",
+            "scope": card.name,
+            "title": "Wishbone bus simulation (synthesizable wrapper)",
+            "description": (
+                "A WishboneTopWrapper (Amaranth Elaboratable) wraps TopModule "
+                "as a Wishbone B4 slave. The simulation drives all data through "
+                "the bus interface: each word write/read is a 2-cycle Wishbone "
+                "transaction (strobe + ack). Compute status is polled via the "
+                "bus. This wrapper is synthesizable and goes through "
+                "Yosys/nextpnr, so its resource cost is included in "
+                "utilisation reports. It models a LiteX SoC integration path."
+            ),
+        },
+        {
             "id": "fpga_wall_from_fmax",
             "scope": card.name,
             "title": "FPGA wall time = cycles / Fmax",
@@ -855,6 +875,22 @@ def _render_html(report: dict, flamegraph_svg: str = "",
         <td>{tf(t.get('dma_wall_s', 0) * t.get('dma_readback_cycles', 0) / max(t.get('dma_total_cycles', 1), 1)) if t.get('dma_total_cycles') else 'n/a'}</td></tr>
     <tr><td><b>Total (DMA-aware)</b></td><td><b>{t.get('dma_total_cycles', 'n/a')}</b></td>
         <td><b>{tf(t.get('dma_wall_s'))}</b></td></tr>
+  </table>
+
+  <h3>Wishbone Bus Simulation (synthesizable wrapper)</h3>
+  <p style="margin-bottom:6px">End-to-end timing through a Wishbone B4 slave that wraps TopModule. Every input write, control register poke, status poll, and output read is a real bus transaction (2 cycles each: strobe + ack). This wrapper is synthesizable and goes through Yosys/nextpnr.</p>
+  <table>
+    <tr><th>Phase</th><th>Cycles</th><th>Time (est.)</th></tr>
+    <tr><td>WB input writes</td><td>{t.get('wb_load_cycles', 'n/a')}</td>
+        <td>{tf(t.get('wb_wall_s', 0) * t.get('wb_load_cycles', 0) / max(t.get('wb_total_cycles', 1), 1)) if t.get('wb_total_cycles') else 'n/a'}</td></tr>
+    <tr><td>WB start (CTRL write)</td><td>{t.get('wb_start_cycles', 'n/a')}</td>
+        <td>{tf(t.get('wb_wall_s', 0) * t.get('wb_start_cycles', 0) / max(t.get('wb_total_cycles', 1), 1)) if t.get('wb_total_cycles') else 'n/a'}</td></tr>
+    <tr><td>Compute (polled via WB)</td><td>{t.get('wb_compute_cycles', 'n/a')}</td>
+        <td>{tf(t.get('wb_wall_s', 0) * t.get('wb_compute_cycles', 0) / max(t.get('wb_total_cycles', 1), 1)) if t.get('wb_total_cycles') else 'n/a'}</td></tr>
+    <tr><td>WB output reads</td><td>{t.get('wb_readback_cycles', 'n/a')}</td>
+        <td>{tf(t.get('wb_wall_s', 0) * t.get('wb_readback_cycles', 0) / max(t.get('wb_total_cycles', 1), 1)) if t.get('wb_total_cycles') else 'n/a'}</td></tr>
+    <tr><td><b>Total (Wishbone)</b></td><td><b>{t.get('wb_total_cycles', 'n/a')}</b></td>
+        <td><b>{tf(t.get('wb_wall_s'))}</b></td></tr>
   </table>
   {timing_svg}
 
@@ -1236,6 +1272,11 @@ def benchmark(tensor, *extra_outputs, schedule_outputs=None, out_dir: str = "tg2
         top, input_data, card,
     )
 
+    # Wishbone bus simulation (synthesizable bus wrapper)
+    _wb_out_raw, wb_cycle_counts, _wb_sim_wall = simulate_wishbone(
+        top, input_data, card,
+    )
+
     if np.issubdtype(ref_out.dtype, np.floating):
         correctness = bool(np.allclose(ref_out.reshape(-1), sim_out.reshape(-1), rtol=1e-5, atol=1e-5))
     else:
@@ -1284,6 +1325,10 @@ def benchmark(tensor, *extra_outputs, schedule_outputs=None, out_dir: str = "tg2
     dma_fmax_hz = card.synth_typical_fmax_mhz * 1e6
     dma_wall_s = dma_cycle_counts["total"] / dma_fmax_hz
 
+    # Wishbone wall time
+    wb_fmax_hz = (fmax_mhz * 1e6) if (fmax_mhz and fmax_mhz > 0) else dma_fmax_hz
+    wb_wall_s = wb_cycle_counts["wb_total"] / wb_fmax_hz
+
     report["timing"] = {
         "cpu_compute_s":    cpu_compute_wall,
         "cpu_readback_s":   cpu_readback_wall,
@@ -1311,6 +1356,13 @@ def benchmark(tensor, *extra_outputs, schedule_outputs=None, out_dir: str = "tg2
         "dma_total_cycles":    dma_cycle_counts["total"],
         "dma_wall_s":          dma_wall_s,
         "dma_pcie_model":      dma_cycle_counts.get("pcie_model", {}),
+        # Wishbone bus simulation (synthesizable wrapper)
+        "wb_load_cycles":     wb_cycle_counts["wb_load"],
+        "wb_start_cycles":    wb_cycle_counts["wb_start"],
+        "wb_compute_cycles":  wb_cycle_counts["compute"],
+        "wb_readback_cycles": wb_cycle_counts["wb_readback"],
+        "wb_total_cycles":    wb_cycle_counts["wb_total"],
+        "wb_wall_s":          wb_wall_s,
     }
 
     # Flame graph
@@ -1343,4 +1395,8 @@ def benchmark(tensor, *extra_outputs, schedule_outputs=None, out_dir: str = "tg2
         dma_readback_cycles=dma_cycle_counts["dma_readback"],
         dma_total_cycles=dma_cycle_counts["total"],
         dma_wall_s=dma_wall_s,
+        wb_load_cycles=wb_cycle_counts["wb_load"],
+        wb_readback_cycles=wb_cycle_counts["wb_readback"],
+        wb_total_cycles=wb_cycle_counts["wb_total"],
+        wb_wall_s=wb_wall_s,
     )
