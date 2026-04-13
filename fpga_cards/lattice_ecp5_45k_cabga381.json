@@ -1,0 +1,115 @@
+{
+  "$schema": "fpga_card_schema.json",
+  "name": "Lattice ECP5 45K-CABGA381",
+  "description": "Lattice ECP5 (LFE5UM-45F) in CABGA-381 package with dual SERDES channels for PCIe Gen1 x1. Mid-range FPGA optimized for low cost, small form factor, and low power consumption.",
+
+  "identity": {
+    "family": "Lattice ECP5",
+    "part_number": "LFE5UM-45F-8BG381C",
+    "device": "LFE5UM-45F",
+    "package": "CABGA381",
+    "technology_nm": 40,
+    "datasheet": "FPGA-DS-02012-3.4",
+    "datasheet_url": "https://www.latticesemi.com/view_document?document_id=50461"
+  },
+
+  "fabric": {
+    "luts": 44184,
+    "lut_type": "LUT4",
+    "ffs": 44184,
+    "ff_type": "TRELLIS_FF",
+    "logic_cells": 44000,
+    "notes": "ECP5 PFU blocks contain 4 slices, each slice has a LUT4 and a FF. LUT4 count and FF count are from the ECP5 Family Data Sheet Table 1.1."
+  },
+
+  "bram": {
+    "type": "DP16KD",
+    "blocks": 108,
+    "bits_per_block": 18432,
+    "data_bits_per_block": 16384,
+    "total_kbits": 1944,
+    "total_data_kbits": 1728,
+    "notes": "sysMEM embedded block RAM. Each DP16KD block provides 16 Kbits of data storage plus 2 Kbits of parity (18 Kbits total). Supports single-port, dual-port, and pseudo-dual-port modes."
+  },
+
+  "dsp": {
+    "type": "MULT18X18D",
+    "slices": 56,
+    "multiplier_width": 18,
+    "multipliers_18x18": 112,
+    "ddr_capable": true,
+    "max_frequency_mhz": 300,
+    "notes": "sysDSP slices. Each slice contains two 18x18 multipliers. DDR mode doubles effective throughput. 56 slices yield 112 MULT18X18D primitives. Max DSP frequency from ECP5 Family Data Sheet Section 2.9."
+  },
+
+  "clocking": {
+    "plls": 4,
+    "pll_type": "sysCLOCK",
+    "max_input_mhz": 400,
+    "max_output_mhz": 400,
+    "notes": "4 sysCLOCK PLLs with programmable frequency synthesis. Max VCO frequency 800 MHz."
+  },
+
+  "io": {
+    "user_ios": 245,
+    "io_banks": 8,
+    "supports_lvds": true,
+    "supports_ddr3": true,
+    "supported_standards": [
+      "LVCMOS33", "LVCMOS25", "LVCMOS18", "LVCMOS15", "LVCMOS12",
+      "LVTTL", "SSTL18", "SSTL15", "SSTL135", "HSUL12",
+      "LVDS", "SUBLVDS", "LVPECL", "BLVDS", "MLVDS",
+      "MIPI_DPHY"
+    ],
+    "notes": "245 user I/Os for LFE5UM-45F in BG381 package. From ECP5 Family Data Sheet Table 1.3."
+  },
+
+  "serdes": {
+    "channels": 2,
+    "max_rate_gbps": 3.2,
+    "min_rate_gbps": 0.6,
+    "protocols": ["PCIe Gen1", "GbE", "SGMII", "XAUI"],
+    "power_per_channel_w": 0.25,
+    "notes": "2 SERDES channels at up to 3.2 Gbps each (ECP5, non-5G). ECP5-5G variants support up to 5 Gbps. From ECP5 Product Brief and SerDes/PCS User Guide FPGA-TN-02206."
+  },
+
+  "pcie": {
+    "gen": 1,
+    "lanes": 1,
+    "link_rate_gts": 2.5,
+    "encoding": "8b/10b",
+    "theoretical_bw_bytes_s": 250000000,
+    "practical_bw_bytes_s": 200000000,
+    "practical_efficiency": 0.80,
+    "dma_latency_s": 2.5e-6,
+    "max_payload_bytes": 128,
+    "max_read_request_bytes": 512,
+    "ip_core": "Lattice PCIe x1 Endpoint IP",
+    "ip_core_doc": "FPGA-IPUG-02091-2.2",
+    "notes": "PCIe Gen1 x1 via embedded SERDES. Theoretical BW = 2.5 GT/s × (8/10) = 2.0 Gbps = 250 MB/s. Practical BW ~80% due to TLP overhead, MPS/MRRS settings, and protocol framing. DMA latency measured from Lattice PCI Express Scatter-Gather DMA demo (UG106). Max payload and read request sizes from PCIe IP Core User Guide."
+  },
+
+  "power": {
+    "vcc_core_v": 1.1,
+    "vccaux_v": 2.5,
+    "static_power_w": 0.120,
+    "typical_dynamic_power_w": 0.280,
+    "typical_total_power_w": 0.400,
+    "notes": "Power estimates from Lattice Power Consumption TN-02210. Static power is quiescent at 25°C. Dynamic power is for a moderately utilized design (~50% toggle rate). Actual power varies with design complexity, clock frequency, and I/O configuration."
+  },
+
+  "synthesis": {
+    "toolchain": "yosys + nextpnr-ecp5",
+    "device_flag": "45k",
+    "package_flag": "CABGA381",
+    "yosys_target": "synth_ecp5",
+    "resource_types": {
+      "lut": "TRELLIS_COMB",
+      "ff": "TRELLIS_FF",
+      "bram": "DP16KD",
+      "dsp": "MULT18X18D"
+    },
+    "typical_fmax_mhz": 125,
+    "notes": "Open-source synthesis via Yosys + nextpnr-ecp5 (Project Trellis). Typical Fmax of 100-150 MHz for moderately complex designs. Resource type names match nextpnr utilization report keys."
+  }
+}
