@@ -91,6 +91,7 @@ def build_control(
                        if isinstance(s, (IRBufStore, IRRegStore))]
     has_root_pro = len(root_pro_stores) > 0
     has_root_epi = len(root_epi_stores) > 0
+    root_epi_waves = _group_stores_by_wave(root_epi_stores) if has_root_epi else []
 
     # Determine first real state after IDLE
     outermost_level = levels[0][0]
@@ -122,7 +123,10 @@ def build_control(
                 m.next = loop_first_state
 
         # Determine where to go when the outermost loop (d==0) finishes
-        outermost_exit = "ROOT_EPI" if has_root_epi else None
+        if has_root_epi:
+            outermost_exit = "ROOT_EPI" if len(root_epi_waves) <= 1 else "ROOT_EPI_0"
+        else:
+            outermost_exit = None
 
         for i, (lvl, d) in enumerate(levels):
             is_innermost = (lvl.body is None)
@@ -175,7 +179,6 @@ def build_control(
 
         # Root-level epilogue (e.g. output write for pure reductions)
         if has_root_epi:
-            root_epi_waves = _group_stores_by_wave(root_epi_stores)
             if len(root_epi_waves) <= 1:
                 with m.State("ROOT_EPI"):
                     _emit_stores(m, root_epi_stores, result, int_wports)
