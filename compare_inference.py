@@ -369,14 +369,12 @@ def main():
             kernels_fp32 = _compile_kernels(_build_fp32_schedule())
         print(f"  compiled {len(kernels_fp32)} kernels")
         if args.skip_synth:
-            stats_fp32 = [synthesis_stats(k, device=card.synth_device_flag,
-                                          package=card.synth_package_flag)
+            stats_fp32 = [synthesis_stats(k, card=card)
                           | {"from_synth": False} for k in kernels_fp32]
             print("  synthesis stats skipped by option")
         else:
             print(f"  synthesising for {card.fpga_target_label()}...", end=" ", flush=True)
-            stats_fp32 = [synthesis_stats(k, device=card.synth_device_flag,
-                                          package=card.synth_package_flag)
+            stats_fp32 = [synthesis_stats(k, card=card)
                           for k in kernels_fp32]
             print("done" if stats_fp32[0]["from_synth"] else "tools not found, using RTLIL estimates")
 
@@ -399,14 +397,12 @@ def main():
             kernels_i8 = _compile_kernels(_build_int8_schedule())
         print(f"  compiled {len(kernels_i8)} kernels")
         if args.skip_synth:
-            stats_i8 = [synthesis_stats(k, device=card.synth_device_flag,
-                                        package=card.synth_package_flag)
+            stats_i8 = [synthesis_stats(k, card=card)
                         | {"from_synth": False} for k in kernels_i8]
             print("  synthesis stats skipped by option")
         else:
             print(f"  synthesising for {card.fpga_target_label()}...", end=" ", flush=True)
-            stats_i8 = [synthesis_stats(k, device=card.synth_device_flag,
-                                        package=card.synth_package_flag)
+            stats_i8 = [synthesis_stats(k, card=card)
                         for k in kernels_i8]
             print("done" if stats_i8[0]["from_synth"] else "tools not found, using RTLIL estimates")
 

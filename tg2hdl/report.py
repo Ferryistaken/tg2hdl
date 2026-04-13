@@ -145,8 +145,7 @@ def _kernel_payload(schedule, pipeline_view, kernel_specs, synth_dir: Path,
         svg_path = show_hardware(kernel, str(synth_dir / f"kernel_{exec_k}"), fmt="svg")
         if svg_path is not None:
             svg = Path(svg_path).read_text()
-        synth = synthesis_stats(kernel, device=card.synth_device_flag,
-                                package=card.synth_package_flag)
+        synth = synthesis_stats(kernel, card=card)
         payload.append({
             "exec_index": exec_k,
             "source_index": orig_k,
@@ -164,8 +163,7 @@ def _top_payload(top, synth_dir: Path, card: FPGACard) -> dict:
     svg_path = show_hardware(top, str(synth_dir / "top_module"), fmt="svg")
     if svg_path is not None:
         svg = Path(svg_path).read_text()
-    synth = synthesis_stats(top, device=card.synth_device_flag,
-                            package=card.synth_package_flag)
+    synth = synthesis_stats(top, card=card)
     return {
         "name": "TopModule",
         "description": "Full assembled tg2hdl system including all compiled kernels, top-level control FSM, inter-kernel copies, and exposed I/O wiring.",
