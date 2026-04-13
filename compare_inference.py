@@ -42,7 +42,8 @@ def _noopt_scope(value=1):
         tg_noopt.value = old
 
 
-# Xilinx RAMB36 = 36 Kbits; one block covers up to 36,864 bits of storage.
+# FIXME: RAMB36 constant is Xilinx-specific and may not apply to other FPGA
+# families (e.g., Lattice ECP5 uses DP16KD with 16 Kbit blocks).
 _RAMB36_BITS = 36 * 1024
 
 

@@ -491,7 +491,8 @@ def test_perf_16_topmodule_reduce_unroll():
     top_base, conns, ks_base = compile_top_module(schedule)
     input_data_base = _build_top_input(top_base, ks_base,
                                        [x_np, w1_np, b1_np, w2_np, b2_np])
-    out_base, cyc_base, _ = simulate_top(top_base, input_data_base)
+    out_base, cc_base, _ = simulate_top(top_base, input_data_base)
+    cyc_base = cc_base["compute"]
 
     # --- Unrolled via TopModule ---
     top_unr, conns_unr, ks_unr = compile_top_module(
@@ -499,7 +500,8 @@ def test_perf_16_topmodule_reduce_unroll():
     )
     input_data_unr = _build_top_input(top_unr, ks_unr,
                                       [x_np, w1_np, b1_np, w2_np, b2_np])
-    out_unr, cyc_unr, _ = simulate_top(top_unr, input_data_unr)
+    out_unr, cc_unr, _ = simulate_top(top_unr, input_data_unr)
+    cyc_unr = cc_unr["compute"]
 
     # Correctness
     np.testing.assert_array_equal(out_base, ref_out,

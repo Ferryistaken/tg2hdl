@@ -52,6 +52,8 @@ class TopModule(Elaboratable):
         self.done = Signal(name="top_done")
 
         self._copy_groups = self._build_copy_groups()
+        self.state_names = self._build_state_names()
+        self.state_id = Signal(range(max(len(self.state_names), 1)), name="top_state_id")
 
         # Buffers driven by the copy FSM (the destination side of each conn)
         internal_bufs = {(dst_k, dst_buf) for _, _, dst_k, dst_buf in connections}
@@ -100,6 +102,15 @@ class TopModule(Elaboratable):
             groups_by_src[src_k].sort(key=lambda grp: (grp[0][1], grp[0][2], grp[0][3]))
         return groups_by_src
 
+    def _build_state_names(self):
+        names = ["IDLE"]
+        for i in range(len(self.kernels)):
+            names.append(f"K{i}_RUN")
+            names.append(f"K{i}_WAIT")
+            for gi, _group in enumerate(self._copy_groups.get(i, [])):
+                names.append(f"K{i}_COPY_{gi}")
+        return names
+
     # ------------------------------------------------------------------
     # Elaboration
     # ------------------------------------------------------------------
@@ -143,6 +154,7 @@ class TopModule(Elaboratable):
         # ---- FSM ----
         with m.FSM(init="IDLE"):
             with m.State("IDLE"):
+                m.d.comb += self.state_id.eq(self.state_names.index("IDLE"))
                 m.d.sync += self.done.eq(0)
                 with m.If(self.start):
                     m.next = "K0_RUN"
@@ -150,11 +162,13 @@ class TopModule(Elaboratable):
             for i, kernel in enumerate(self.kernels):
                 # K{i}_RUN: pulse start for one cycle, then wait
                 with m.State(f"K{i}_RUN"):
+                    m.d.comb += self.state_id.eq(self.state_names.index(f"K{i}_RUN"))
                     m.d.comb += kernel.start.eq(1)
                     m.next = f"K{i}_WAIT"
 
                 # K{i}_WAIT: poll done
                 with m.State(f"K{i}_WAIT"):
+                    m.d.comb += self.state_id.eq(self.state_names.index(f"K{i}_WAIT"))
                     with m.If(kernel.done):
                         if i == len(self.kernels) - 1 and not self._copy_groups.get(i):
                             m.d.sync += self.done.eq(1)
@@ -174,6 +188,7 @@ class TopModule(Elaboratable):
                         next_state = "IDLE"
 
                     with m.State(state_name):
+                        m.d.comb += self.state_id.eq(self.state_names.index(state_name))
                         src_k, src_buf, _, _ = group[0]
                         src_rp = self.kernels[src_k].buf_read_ports[src_buf]
                         m.d.comb += src_rp["raddr"].eq(copy_ctr)
@@ -218,8 +233,13 @@ def simulate_top(top, input_data, clock_period=1e-8):
     -------
     output : np.ndarray
         Contents of the final kernel's output buffer (int32).
-    total_cycles : int
-        Clock cycles from start-pulse to done-pulse.
+    cycle_counts : dict
+        Breakdown of clock cycles:
+          - "load":    cycles spent writing input data into BRAM
+          - "compute": cycles from start-pulse to done-pulse
+          - "readback": cycles spent reading output data from BRAM
+          - "total":   sum of all three
+          - "states":  cycles spent in each top-level FSM state during compute
     wall_s : float
         Wall-clock seconds for the simulation.
     """
@@ -232,7 +252,10 @@ def simulate_top(top, input_data, clock_period=1e-8):
     out_depth = out_info["depth"]
 
     results = {}
-    cycle_count = [0]
+    load_cycles = [0]
+    compute_cycles = [0]
+    readback_cycles = [0]
+    state_cycles = {name: 0 for name in top.state_names}
 
     async def testbench(ctx):
         # Load all external input buffers
@@ -250,8 +273,10 @@ def simulate_top(top, input_data, clock_period=1e-8):
                 ctx.set(ports["waddr"], j)
                 ctx.set(ports["wdata"], int(flat[j]))
                 await ctx.tick()
+                load_cycles[0] += 1
             ctx.set(ports["wen"], 0)
         await ctx.tick()
+        load_cycles[0] += 1  # final settle tick
 
         # Pulse start
         ctx.set(top.start, 1)
@@ -265,8 +290,14 @@ def simulate_top(top, input_data, clock_period=1e-8):
         )
 
         for _ in range(int(max_cycles)):
+            # Read state_id BEFORE the tick so we attribute the cycle to the
+            # state that was active during the clock edge, not the post-
+            # transition state.
+            prev_state = ctx.get(top.state_id)
             await ctx.tick()
-            cycle_count[0] += 1
+            compute_cycles[0] += 1
+            state_name = top.state_names[prev_state]
+            state_cycles[state_name] = state_cycles.get(state_name, 0) + 1
             if ctx.get(top.done):
                 break
 
@@ -275,6 +306,7 @@ def simulate_top(top, input_data, clock_period=1e-8):
         for j in range(out_depth):
             ctx.set(rp["raddr"], j)
             await ctx.tick()
+            readback_cycles[0] += 1
             results[j] = ctx.get(rp["rdata"])
 
     sim.add_testbench(testbench)
@@ -283,5 +315,12 @@ def simulate_top(top, input_data, clock_period=1e-8):
     sim.run()
     wall = time.perf_counter() - t0
 
+    cycle_counts = {
+        "load": load_cycles[0],
+        "compute": compute_cycles[0],
+        "readback": readback_cycles[0],
+        "total": load_cycles[0] + compute_cycles[0] + readback_cycles[0],
+        "states": state_cycles,
+    }
     output = np.array([results.get(i, 0) for i in range(out_depth)], dtype=np.int32)
-    return output, cycle_count[0], wall
+    return output, cycle_counts, wall

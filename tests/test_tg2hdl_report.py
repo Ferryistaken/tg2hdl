@@ -20,5 +20,5 @@ def test_benchmark_generates_html_report(tmp_path):
     assert artifact.correctness
     assert (tmp_path / "report" / "index.html").exists()
     html = (tmp_path / "report" / "index.html").read_text()
-    assert "tg2hdl Benchmark" in html
-    assert "Tinygrad Kernels" in html
+    assert "tg2hdl Report" in html
+    assert "Kernel DAG" in html

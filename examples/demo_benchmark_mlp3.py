@@ -46,6 +46,8 @@ def main() -> None:
     print(f"tinygrad_wall_s: {artifact.tinygrad_wall_s:.6f}")
     print(f"tg2hdl_wall_s: {artifact.tg2hdl_wall_s:.6f}")
     print(f"tg2hdl_cycles: {artifact.tg2hdl_cycles}")
+    print(f"tg2hdl_total_cycles: {artifact.tg2hdl_total_cycles}")
+    print(f"fpga_wall_s: {artifact.fpga_wall_s}")
     print(f"report_exists: {Path(artifact.report_path).exists()}")
 
 
