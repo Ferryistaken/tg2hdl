@@ -290,9 +290,13 @@ def simulate_top(top, input_data, clock_period=1e-8):
         )
 
         for _ in range(int(max_cycles)):
+            # Read state_id BEFORE the tick so we attribute the cycle to the
+            # state that was active during the clock edge, not the post-
+            # transition state.
+            prev_state = ctx.get(top.state_id)
             await ctx.tick()
             compute_cycles[0] += 1
-            state_name = top.state_names[ctx.get(top.state_id)]
+            state_name = top.state_names[prev_state]
             state_cycles[state_name] = state_cycles.get(state_name, 0) + 1
             if ctx.get(top.done):
                 break
