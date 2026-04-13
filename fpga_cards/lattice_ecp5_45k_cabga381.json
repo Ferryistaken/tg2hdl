@@ -100,6 +100,7 @@
 
   "synthesis": {
     "toolchain": "yosys + nextpnr-ecp5",
+    "nextpnr_binary": "nextpnr-ecp5",
     "device_flag": "45k",
     "package_flag": "CABGA381",
     "yosys_target": "synth_ecp5",

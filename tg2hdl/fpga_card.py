@@ -94,6 +94,8 @@ class FPGACard:
     typical_total_power_w: float
 
     # -- synthesis toolchain --
+    synth_toolchain: str
+    synth_nextpnr_binary: str
     synth_device_flag: str
     synth_package_flag: str
     synth_yosys_target: str
@@ -202,6 +204,8 @@ def _parse_card(data: dict) -> FPGACard:
         typical_dynamic_power_w=pwr["typical_dynamic_power_w"],
         typical_total_power_w=pwr["typical_total_power_w"],
 
+        synth_toolchain=synth["toolchain"],
+        synth_nextpnr_binary=synth["nextpnr_binary"],
         synth_device_flag=synth["device_flag"],
         synth_package_flag=synth["package_flag"],
         synth_yosys_target=synth["yosys_target"],

@@ -466,7 +466,7 @@ def main():
 
     if stats_fp32 or stats_i8:
         from_synth = (stats_fp32[0]["from_synth"] if stats_fp32 else stats_i8[0]["from_synth"])
-        src_label = (f"{card.fpga_target_label()} — Yosys + nextpnr-ecp5"
+        src_label = (f"{card.fpga_target_label()} — {card.synth_toolchain}"
                      if from_synth else "RTLIL pre-synthesis estimates")
         fp32_total_mem = sum(s["mem_bits"] for s in stats_fp32)
         i8_total_mem = sum(s["mem_bits"] for s in stats_i8)

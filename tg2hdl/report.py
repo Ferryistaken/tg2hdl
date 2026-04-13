@@ -14,6 +14,7 @@ from tinygrad.uop.ops import Ops
 from tinygrad.viz.serve import uop_to_json
 
 from compiler import compile_top_module, show_hardware, synthesis_stats
+from compiler.pcie_dma import simulate_top_with_pcie
 from compiler.top_module import simulate_top
 from compiler.visualize import analyze_schedule
 from tg2hdl.fpga_card import FPGACard, load_card
@@ -31,9 +32,14 @@ class BenchmarkArtifact:
     correctness: bool
     fpga_card: str = ""                     # name of FPGA card used
     fpga_wall_s: float | None = None        # tg2hdl_total_cycles / fmax_hz; None if synthesis unavailable
-    pcie_in_s: float | None = None          # PCIe host→FPGA transfer time
-    pcie_out_s: float | None = None         # PCIe FPGA→host transfer time
-    fpga_with_pcie_s: float | None = None   # fpga_wall_s + pcie_in_s + pcie_out_s
+    pcie_in_s: float | None = None          # PCIe host→FPGA transfer time (analytical model)
+    pcie_out_s: float | None = None         # PCIe FPGA→host transfer time (analytical model)
+    fpga_with_pcie_s: float | None = None   # fpga_wall_s + pcie_in_s + pcie_out_s (analytical)
+    # Cycle-accurate PCIe DMA simulation results
+    dma_load_cycles: int | None = None      # DMA load cycles (cycle-accurate)
+    dma_readback_cycles: int | None = None  # DMA readback cycles (cycle-accurate)
+    dma_total_cycles: int | None = None     # total cycles including DMA (cycle-accurate)
+    dma_wall_s: float | None = None         # total DMA-aware wall time
 
 
 def _copy_viz_assets(out_dir: Path) -> None:
@@ -632,7 +638,7 @@ def _estimates_for_card(card: FPGACard) -> list[dict]:
         {
             "id": "pcie_transfer_model",
             "scope": card.name,
-            "title": "PCIe transfer time",
+            "title": "PCIe transfer time (analytical model)",
             "description": (
                 f"PCIe Gen{card.pcie_gen} x{card.pcie_lanes} transfer times use "
                 f"{card.pcie_practical_efficiency:.0%} of theoretical link rate "
@@ -641,6 +647,20 @@ def _estimates_for_card(card: FPGACard) -> list[dict]:
                 f"from the {card.part_number} datasheet. Real throughput depends on "
                 f"TLP payload size (max {card.pcie_max_payload_bytes} B), MPS/MRRS "
                 f"settings, and host chipset."
+            ),
+        },
+        {
+            "id": "dma_pcie_simulation",
+            "scope": card.name,
+            "title": "DMA + PCIe cycle-accurate simulation",
+            "description": (
+                "A second Amaranth simulation throttles input loading and output "
+                "readback to match the card\u2019s practical PCIe bandwidth "
+                f"({card.pcie_practical_bw_bytes_s / 1e6:.0f} MB/s) at "
+                f"{card.synth_typical_fmax_mhz:.0f} MHz Fmax. DMA setup latency "
+                f"({card.pcie_dma_latency_s * 1e6:.1f} \u00b5s) is added per direction. "
+                "This gives cycle-accurate end-to-end timing including bus "
+                "transfer overhead."
             ),
         },
         {
@@ -821,6 +841,20 @@ def _render_html(report: dict, flamegraph_svg: str = "",
         <td>{tf(t.get('pcie_out_s'))}</td></tr>
     <tr><td><b>Total</b></td><td><b>{tf(t['cpu_wall_s'])}</b></td>
         <td><b>{t['total_cycles']}</b></td><td><b>{tf(t.get('fpga_with_pcie_s'))}</b></td></tr>
+  </table>
+
+  <h3>DMA + PCIe Cycle-Accurate Simulation</h3>
+  <p style="margin-bottom:6px">End-to-end timing with cycle-accurate PCIe DMA throttling (bandwidth-gated word transfers + per-direction DMA setup latency).</p>
+  <table>
+    <tr><th>Phase</th><th>Cycles</th><th>Time (est.)</th></tr>
+    <tr><td>DMA load (host→FPGA)</td><td>{t.get('dma_load_cycles', 'n/a')}</td>
+        <td>{tf(t.get('dma_wall_s', 0) * t.get('dma_load_cycles', 0) / max(t.get('dma_total_cycles', 1), 1)) if t.get('dma_total_cycles') else 'n/a'}</td></tr>
+    <tr><td>Compute</td><td>{t.get('dma_compute_cycles', 'n/a')}</td>
+        <td>{tf(t.get('dma_wall_s', 0) * t.get('dma_compute_cycles', 0) / max(t.get('dma_total_cycles', 1), 1)) if t.get('dma_total_cycles') else 'n/a'}</td></tr>
+    <tr><td>DMA readback (FPGA→host)</td><td>{t.get('dma_readback_cycles', 'n/a')}</td>
+        <td>{tf(t.get('dma_wall_s', 0) * t.get('dma_readback_cycles', 0) / max(t.get('dma_total_cycles', 1), 1)) if t.get('dma_total_cycles') else 'n/a'}</td></tr>
+    <tr><td><b>Total (DMA-aware)</b></td><td><b>{t.get('dma_total_cycles', 'n/a')}</b></td>
+        <td><b>{tf(t.get('dma_wall_s'))}</b></td></tr>
   </table>
   {timing_svg}
 
@@ -1197,12 +1231,17 @@ def benchmark(tensor, *extra_outputs, schedule_outputs=None, out_dir: str = "tg2
     sim_out_raw, cycle_counts, sim_wall = simulate_top(top, input_data)
     sim_out = _decode_sim_output(sim_out_raw, tensor.dtype).reshape(-1)
 
+    # Cycle-accurate PCIe DMA simulation
+    _dma_out_raw, dma_cycle_counts, _dma_sim_wall = simulate_top_with_pcie(
+        top, input_data, card,
+    )
+
     if np.issubdtype(ref_out.dtype, np.floating):
         correctness = bool(np.allclose(ref_out.reshape(-1), sim_out.reshape(-1), rtol=1e-5, atol=1e-5))
     else:
         correctness = bool(np.array_equal(ref_out.reshape(-1), sim_out.reshape(-1)))
 
-    # PCIe transfer times — from the FPGA card specification
+    # PCIe transfer times — analytical model from FPGA card specification
     input_bytes  = sum(arr.nbytes for arr in input_data.values())
     output_bytes = sim_out_raw.nbytes
     pcie_in_s    = card.pcie_xfer_s(input_bytes)
@@ -1218,6 +1257,11 @@ def benchmark(tensor, *extra_outputs, schedule_outputs=None, out_dir: str = "tg2
             "tg2hdl_load_cycles": cycle_counts["load"],
             "tg2hdl_readback_cycles": cycle_counts["readback"],
             "tg2hdl_total_cycles": cycle_counts["total"],
+            # Cycle-accurate DMA simulation
+            "dma_load_cycles": dma_cycle_counts["dma_load"],
+            "dma_compute_cycles": dma_cycle_counts["compute"],
+            "dma_readback_cycles": dma_cycle_counts["dma_readback"],
+            "dma_total_cycles": dma_cycle_counts["total"],
             "correctness": correctness,
             "reference_output": ref_out.reshape(-1).tolist(),
             "sim_output": sim_out.reshape(-1).tolist(),
@@ -1236,6 +1280,10 @@ def benchmark(tensor, *extra_outputs, schedule_outputs=None, out_dir: str = "tg2
     def _cycles_to_s(c):
         return (c / (fmax_mhz * 1e6)) if (fmax_mhz and fmax_mhz > 0) else None
 
+    # DMA-aware wall time (cycle-accurate, uses card typical Fmax)
+    dma_fmax_hz = card.synth_typical_fmax_mhz * 1e6
+    dma_wall_s = dma_cycle_counts["total"] / dma_fmax_hz
+
     report["timing"] = {
         "cpu_compute_s":    cpu_compute_wall,
         "cpu_readback_s":   cpu_readback_wall,
@@ -1249,13 +1297,20 @@ def benchmark(tensor, *extra_outputs, schedule_outputs=None, out_dir: str = "tg2
         "compute_cycles":   cycle_counts["compute"],
         "readback_cycles":  cycle_counts["readback"],
         "total_cycles":     total_cycles,
-        # PCIe — values from FPGA card
+        # PCIe — analytical model from FPGA card
         "pcie_in_s":        pcie_in_s,
         "pcie_out_s":       pcie_out_s,
         "fpga_with_pcie_s": fpga_with_pcie_s,
         "pcie_in_bytes":    input_bytes,
         "pcie_out_bytes":   output_bytes,
         "pcie_label":       card.pcie_label(),
+        # Cycle-accurate DMA simulation
+        "dma_load_cycles":     dma_cycle_counts["dma_load"],
+        "dma_compute_cycles":  dma_cycle_counts["compute"],
+        "dma_readback_cycles": dma_cycle_counts["dma_readback"],
+        "dma_total_cycles":    dma_cycle_counts["total"],
+        "dma_wall_s":          dma_wall_s,
+        "dma_pcie_model":      dma_cycle_counts.get("pcie_model", {}),
     }
 
     # Flame graph
@@ -1284,4 +1339,8 @@ def benchmark(tensor, *extra_outputs, schedule_outputs=None, out_dir: str = "tg2
         pcie_in_s=pcie_in_s,
         pcie_out_s=pcie_out_s,
         fpga_with_pcie_s=fpga_with_pcie_s,
+        dma_load_cycles=dma_cycle_counts["dma_load"],
+        dma_readback_cycles=dma_cycle_counts["dma_readback"],
+        dma_total_cycles=dma_cycle_counts["total"],
+        dma_wall_s=dma_wall_s,
     )

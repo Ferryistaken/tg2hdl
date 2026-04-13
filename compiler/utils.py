@@ -204,6 +204,8 @@ def synthesis_stats(kernel, device: str = "45k", package: str = "CABGA381",
       mem_bits    -- total on-chip storage in bits (from buf_infos)
       fp32_units  -- FP32 submodule count (from RTLIL)
       fmax_mhz    -- achieved Fmax in MHz (float), or None if unavailable
+      target_mhz  -- target clock frequency used for timing closure check
+      timing_met  -- True if fmax_mhz >= target_mhz, None if unknown
       comb        -- LUT-equivalent cells used
       ff          -- flip-flops used
       dp16kd      -- block RAM tiles used
@@ -225,10 +227,12 @@ def synthesis_stats(kernel, device: str = "45k", package: str = "CABGA381",
         device = card.synth_device_flag
         package = card.synth_package_flag
         yosys_target = card.synth_yosys_target
+        nextpnr_bin = card.synth_nextpnr_binary
         res_types = card.synth_resource_types
         fpga_family = card.family
     else:
         yosys_target = "synth_ecp5"
+        nextpnr_bin = "nextpnr-ecp5"
         res_types = {
             "lut": "TRELLIS_COMB",
             "ff": "TRELLIS_FF",
@@ -249,6 +253,10 @@ def synthesis_stats(kernel, device: str = "45k", package: str = "CABGA381",
         mem_bits = 0
     fp32_units = _rtlil_fp32_units(kernel)
 
+    # Target frequency for timing closure check.  When the card provides a
+    # typical Fmax we use that; otherwise fall back to 100 MHz.
+    target_mhz = (card.synth_typical_fmax_mhz if card is not None else 100.0)
+
     base = dict(
         fpga_family=fpga_family,
         fpga_device=device,
@@ -256,6 +264,8 @@ def synthesis_stats(kernel, device: str = "45k", package: str = "CABGA381",
         mem_bits=mem_bits,
         fp32_units=fp32_units,
         fmax_mhz=None,
+        target_mhz=target_mhz,
+        timing_met=None,
         comb=0,
         ff=0,
         dp16kd=0,
@@ -264,7 +274,7 @@ def synthesis_stats(kernel, device: str = "45k", package: str = "CABGA381",
         synth_wall_s=None,
     )
 
-    if not shutil.which("yosys") or not shutil.which("nextpnr-ecp5"):
+    if not shutil.which("yosys") or not shutil.which(nextpnr_bin):
         return base
 
     il = rtlil.convert(kernel, ports=_elaboratable_ports(kernel))
@@ -287,7 +297,7 @@ def synthesis_stats(kernel, device: str = "45k", package: str = "CABGA381",
             return base
 
         r2 = subprocess.run(
-            ["nextpnr-ecp5", f"--{device}", "--package", package,
+            [nextpnr_bin, f"--{device}", "--package", package,
              "--json", json_path, "--report", report_path,
              "--timing-allow-fail", "--quiet"],
             capture_output=True, text=True, timeout=300,
@@ -307,6 +317,8 @@ def synthesis_stats(kernel, device: str = "45k", package: str = "CABGA381",
         if achieved and (fmax_mhz is None or achieved < fmax_mhz):
             fmax_mhz = float(achieved)
 
+    timing_met = (fmax_mhz >= target_mhz) if fmax_mhz is not None else None
+
     util = rep.get("utilization", {})
     return dict(
         fpga_family=fpga_family,
@@ -315,6 +327,8 @@ def synthesis_stats(kernel, device: str = "45k", package: str = "CABGA381",
         mem_bits=mem_bits,
         fp32_units=fp32_units,
         fmax_mhz=fmax_mhz,
+        target_mhz=target_mhz,
+        timing_met=timing_met,
         comb=util.get(res_types.get("lut", "TRELLIS_COMB"),  {}).get("used", 0),
         ff=util.get(res_types.get("ff", "TRELLIS_FF"),     {}).get("used", 0),
         dp16kd=util.get(res_types.get("bram", "DP16KD"),     {}).get("used", 0),

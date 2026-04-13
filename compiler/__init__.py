@@ -8,6 +8,7 @@ Public API:
     compile_top_module      — tinygrad schedule → TopModule (auto-connects kernels)
     simulate_kernel         — run a CompiledKernel on Amaranth simulator
     simulate_top            — run a TopModule on Amaranth simulator
+    simulate_top_with_pcie  — run TopModule with cycle-accurate PCIe DMA
     count_cycles_from_schedule — analytical cycle estimator (no simulation)
 
 Quantization utilities are in the ``utils`` package, not here:
@@ -25,6 +26,7 @@ from .backend import (
 )
 from .hdl_module import CompiledKernel
 from .top_module import TopModule, simulate_top
+from .pcie_dma import simulate_top_with_pcie
 
 from .transforms import unroll_loop, unroll_reduce
 from .utils import pretty_print_uops, synthesis_stats, show_hardware
