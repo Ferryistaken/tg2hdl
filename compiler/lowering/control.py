@@ -7,9 +7,11 @@ accepts typed IR nodes instead of raw UOps and an untyped sig dict.
 
 State naming (unchanged from old design):
   IDLE         — wait for start
+  ROOT_PRO     — root-level prologue (e.g. acc init for pure reductions)
   L{d}_PRO     — non-innermost level prologue (e.g. acc reset)
   L{d}_BODY    — innermost level body (e.g. MAC)
   L{d}_EPI     — non-innermost level epilogue (e.g. output write)
+  ROOT_EPI     — root-level epilogue (e.g. output write for pure reductions)
   SCALAR       — single compute cycle for no-loop kernels
 """
 
@@ -82,12 +84,28 @@ def build_control(
         waves = level_waves.get(d, [[]])
         return f"L{d}_BODY_0" if len(waves) > 1 else f"L{d}_BODY"
 
+    # Collect root-level prologue/epilogue stores
+    root_pro_stores = [s for s in kernel.loop_tree.prologue
+                       if isinstance(s, (IRBufStore, IRRegStore))]
+    root_epi_stores = [s for s in kernel.loop_tree.epilogue
+                       if isinstance(s, (IRBufStore, IRRegStore))]
+    has_root_pro = len(root_pro_stores) > 0
+    has_root_epi = len(root_epi_stores) > 0
+
     # Determine first real state after IDLE
     outermost_level = levels[0][0]
-    if outermost_level.body is None:
+    if has_root_pro:
+        first_state = "ROOT_PRO"
+    elif outermost_level.body is None:
         first_state = body_first_state(0)
     else:
         first_state = "L0_PRO"
+
+    # Determine the state that the outermost loop body enters after ROOT_PRO
+    if outermost_level.body is None:
+        loop_first_state = body_first_state(0)
+    else:
+        loop_first_state = "L0_PRO"
 
     with m.FSM(init="IDLE"):
         with m.State("IDLE"):
@@ -96,6 +114,15 @@ def build_control(
                 ctr = result.counter_sigs[levels[0][1]]
                 m.d.sync += ctr.eq(0)
                 m.next = first_state
+
+        # Root-level prologue (e.g. acc init for pure reductions)
+        if has_root_pro:
+            with m.State("ROOT_PRO"):
+                _emit_stores(m, root_pro_stores, result, int_wports)
+                m.next = loop_first_state
+
+        # Determine where to go when the outermost loop (d==0) finishes
+        outermost_exit = "ROOT_EPI" if has_root_epi else None
 
         for i, (lvl, d) in enumerate(levels):
             is_innermost = (lvl.body is None)
@@ -109,7 +136,10 @@ def build_control(
                 if len(waves) <= 1:
                     with m.State(f"L{d}_BODY"):
                         _emit_stores(m, pro_stores, result, int_wports)
-                        _emit_counter_check(m, ctr, lvl.bound, d, done, f"L{d}_BODY")
+                        _emit_counter_check_with_root(
+                            m, ctr, lvl.bound, d, done, f"L{d}_BODY",
+                            outermost_exit,
+                        )
                 else:
                     for wi, wave in enumerate(waves):
                         with m.State(f"L{d}_BODY_{wi}"):
@@ -117,7 +147,10 @@ def build_control(
                             if wi < len(waves) - 1:
                                 m.next = f"L{d}_BODY_{wi + 1}"
                             else:
-                                _emit_counter_check(m, ctr, lvl.bound, d, done, f"L{d}_BODY_0")
+                                _emit_counter_check_with_root(
+                                    m, ctr, lvl.bound, d, done,
+                                    f"L{d}_BODY_0", outermost_exit,
+                                )
             else:
                 # Non-innermost: PRO (prologue) and EPI (epilogue) states
                 child_level = levels[i + 1][0]
@@ -135,18 +168,50 @@ def build_control(
 
                 with m.State(f"L{d}_EPI"):
                     _emit_stores(m, epi_stores, result, int_wports)
-                    _emit_counter_check(m, ctr, lvl.bound, d, done, f"L{d}_PRO")
+                    _emit_counter_check_with_root(
+                        m, ctr, lvl.bound, d, done, f"L{d}_PRO",
+                        outermost_exit if d == 0 else None,
+                    )
+
+        # Root-level epilogue (e.g. output write for pure reductions)
+        if has_root_epi:
+            root_epi_waves = _group_stores_by_wave(root_epi_stores)
+            if len(root_epi_waves) <= 1:
+                with m.State("ROOT_EPI"):
+                    _emit_stores(m, root_epi_stores, result, int_wports)
+                    m.d.sync += done.eq(1)
+                    m.next = "IDLE"
+            else:
+                for wi, wave in enumerate(root_epi_waves):
+                    with m.State(f"ROOT_EPI_{wi}"):
+                        _emit_stores(m, wave, result, int_wports)
+                        if wi == len(root_epi_waves) - 1:
+                            m.d.sync += done.eq(1)
+                            m.next = "IDLE"
+                        else:
+                            m.next = f"ROOT_EPI_{wi + 1}"
 
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _emit_counter_check(m, ctr, bound, d, done, loop_back_state):
-    """Emit the counter check + transition logic (shared by all body states)."""
+def _emit_counter_check_with_root(m, ctr, bound, d, done, loop_back_state,
+                                   outermost_exit=None):
+    """Emit the counter check + transition logic.
+
+    Parameters
+    ----------
+    outermost_exit : str | None
+        If this is the outermost loop (d==0) and there are root epilogue
+        stores, this is the state to transition to instead of going directly
+        to IDLE.  When None and d==0, transition to IDLE with done=1.
+    """
     with m.If(ctr == bound - 1):
         if d > 0:
             m.next = f"L{d-1}_EPI"
+        elif outermost_exit is not None:
+            m.next = outermost_exit
         else:
             m.d.sync += done.eq(1)
             m.next = "IDLE"

@@ -86,11 +86,21 @@ def _compile_and_simulate(build_fn, input_arrays, *, is_float=False, rtol=1e-5, 
         if (k_idx, buf_pos) not in connections
     ]
 
-    # Assign input arrays to external slots
+    # Assign input arrays to external slots.  Multiple kernels may reference
+    # the same external buffer (e.g. softmax reads x in all 3 kernels).
+    # Group by buffer identity so every slot sharing a buffer gets the same array.
+    buf_id_to_input = {}
+    input_idx = 0
     input_map = {}
-    for i, slot in enumerate(external_slots):
-        if i < len(input_arrays):
-            input_map[slot] = input_arrays[i]
+    for k_idx, buf_pos in external_slots:
+        buf_obj = compute_items[k_idx].bufs[buf_pos]
+        bid = id(buf_obj)
+        if bid not in buf_id_to_input:
+            if input_idx < len(input_arrays):
+                buf_id_to_input[bid] = input_arrays[input_idx]
+                input_idx += 1
+        if bid in buf_id_to_input:
+            input_map[(k_idx, buf_pos)] = buf_id_to_input[bid]
 
     # Simulate kernels sequentially
     kernel_outputs = {}
@@ -366,16 +376,47 @@ class TestPooling:
 # Test: Softmax
 # ---------------------------------------------------------------------------
 
+class TestStandaloneReductions:
+    """Test standalone reductions (single-level reduce, no outer LOOP).
+
+    These exercise the ROOT_PRO/ROOT_EPI FSM states that initialize
+    the accumulator and write the final result at the root level.
+    """
+
+    def test_max_fp32(self):
+        """max() over a small float32 tensor."""
+        x = np.array([[1.0, 4.0, 2.0, 3.0]], dtype=np.float32)
+
+        def build(t):
+            return t[0].max()
+
+        result = run_bench("reduce_max_fp32", build, [x])
+        assert result.correct, f"max reduce failed: {result}"
+
+    def test_sum_fp32(self):
+        """sum() over a small float32 tensor."""
+        x = np.array([[1.0, 2.0, 3.0, 4.0]], dtype=np.float32)
+
+        def build(t):
+            return t[0].sum()
+
+        result = run_bench("reduce_sum_fp32", build, [x])
+        assert result.correct, f"sum reduce failed: {result}"
+
+    def test_max_int32(self):
+        """max() over a small int tensor (cast to int32)."""
+        x = np.array([[5, 1, 8, 3]], dtype=np.int8)
+
+        def build(t):
+            return t[0].cast(dtypes.int32).max()
+
+        result = run_bench("reduce_max_int32", build, [x])
+        assert result.correct, f"max int32 reduce failed: {result}"
+
+
 class TestSoftmax:
     """Test softmax operation (requires exp2, reduction, reciprocal)."""
 
-    @pytest.mark.xfail(
-        reason="Softmax produces inf in HDL simulation — likely a bug in the "
-               "multi-kernel EXP2 polynomial or inter-kernel data passing. "
-               "The 3-kernel chain (max-reduce → exp+sum-reduce → exp*recip) "
-               "compiles but produces incorrect intermediate values.",
-        strict=True,
-    )
     def test_softmax_fp32_small(self):
         """Small softmax over 4 elements, float32."""
         x = np.array([[1.0, 2.0, 3.0, 4.0]], dtype=np.float32)
@@ -386,10 +427,6 @@ class TestSoftmax:
         result = run_bench("softmax_fp32_4", build, [x])
         assert result.correct, f"Softmax failed: {result}"
 
-    @pytest.mark.xfail(
-        reason="Softmax produces inf — same root cause as test_softmax_fp32_small.",
-        strict=True,
-    )
     def test_softmax_fp32_8(self):
         """Softmax over 8 elements, float32."""
         rng = np.random.RandomState(42)
