@@ -362,7 +362,7 @@ def _flamegraph_payload(schedule, pipeline_view, top, kernel_specs,
         # Inter-kernel copy groups that follow this kernel
         for gi, group in enumerate(top._copy_groups.get(exec_k, [])):
             src_buf = group[0][1]
-            depth = top.buf_depths.get((exec_k, src_buf), 0)
+            depth = top.buf_depths.get((exec_k, src_buf), 1)
             # FIXME: Copy cycle count equals buffer depth (one element per clock).
             # Real DMA copies may have additional setup latency or burst overhead
             # not captured here.
@@ -406,13 +406,15 @@ def _flamegraph_payload(schedule, pipeline_view, top, kernel_specs,
     # estimated compute cost (total buffer bytes) as a rough approximation.
     weights = []
     labels = []
+    compute_idx = 0
     for idx, si in enumerate(schedule):
         bufs = getattr(si, "bufs", [])
         weight = sum(getattr(b, "nbytes", 0) for b in bufs if b is not None) or 1
         weights.append(weight)
         if si.ast.op == Ops.SINK:
             meta = [str(m.name if hasattr(m, "name") else m) for m in getattr(si, "metadata", ())]
-            labels.append(f"K{idx}" + (f" ({', '.join(meta)})" if meta else ""))
+            labels.append(f"K{compute_idx}" + (f" ({', '.join(meta)})" if meta else ""))
+            compute_idx += 1
         elif si.ast.op == Ops.COPY:
             labels.append(f"Copy {idx}")
         else:
