@@ -218,8 +218,12 @@ def simulate_top(top, input_data, clock_period=1e-8):
     -------
     output : np.ndarray
         Contents of the final kernel's output buffer (int32).
-    total_cycles : int
-        Clock cycles from start-pulse to done-pulse.
+    cycle_counts : dict
+        Breakdown of clock cycles:
+          - "load":    cycles spent writing input data into BRAM
+          - "compute": cycles from start-pulse to done-pulse
+          - "readback": cycles spent reading output data from BRAM
+          - "total":   sum of all three
     wall_s : float
         Wall-clock seconds for the simulation.
     """
@@ -232,7 +236,9 @@ def simulate_top(top, input_data, clock_period=1e-8):
     out_depth = out_info["depth"]
 
     results = {}
-    cycle_count = [0]
+    load_cycles = [0]
+    compute_cycles = [0]
+    readback_cycles = [0]
 
     async def testbench(ctx):
         # Load all external input buffers
@@ -250,8 +256,10 @@ def simulate_top(top, input_data, clock_period=1e-8):
                 ctx.set(ports["waddr"], j)
                 ctx.set(ports["wdata"], int(flat[j]))
                 await ctx.tick()
+                load_cycles[0] += 1
             ctx.set(ports["wen"], 0)
         await ctx.tick()
+        load_cycles[0] += 1  # final settle tick
 
         # Pulse start
         ctx.set(top.start, 1)
@@ -266,7 +274,7 @@ def simulate_top(top, input_data, clock_period=1e-8):
 
         for _ in range(int(max_cycles)):
             await ctx.tick()
-            cycle_count[0] += 1
+            compute_cycles[0] += 1
             if ctx.get(top.done):
                 break
 
@@ -275,6 +283,7 @@ def simulate_top(top, input_data, clock_period=1e-8):
         for j in range(out_depth):
             ctx.set(rp["raddr"], j)
             await ctx.tick()
+            readback_cycles[0] += 1
             results[j] = ctx.get(rp["rdata"])
 
     sim.add_testbench(testbench)
@@ -283,5 +292,11 @@ def simulate_top(top, input_data, clock_period=1e-8):
     sim.run()
     wall = time.perf_counter() - t0
 
+    cycle_counts = {
+        "load": load_cycles[0],
+        "compute": compute_cycles[0],
+        "readback": readback_cycles[0],
+        "total": load_cycles[0] + compute_cycles[0] + readback_cycles[0],
+    }
     output = np.array([results.get(i, 0) for i in range(out_depth)], dtype=np.int32)
-    return output, cycle_count[0], wall
+    return output, cycle_counts, wall

@@ -4,8 +4,9 @@ import html
 import json
 import shutil
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import ClassVar
 
 import numpy as np
 from tinygrad.engine.realize import run_schedule
@@ -18,14 +19,49 @@ from compiler.visualize import analyze_schedule
 
 
 @dataclass
+class PCIeModel:
+    """Model for PCIe + AXI-DMA data transfer overhead.
+
+    Represents an FPGA connected over PCIe with an AXI-DMA bridge.
+    Transfer time per direction = latency_s + nbytes / bw_bytes_s.
+    Default: Gen3 x4 (~3.2 GB/s practical) with 5 µs DMA latency.
+    """
+    gen: int = 3
+    lanes: int = 4
+    latency_s: float = 5e-6  # per-direction DMA setup + AXI bridge overhead
+
+    # Practical bandwidth = ~80% of theoretical (encoding + protocol overhead)
+    _BW_TABLE: ClassVar[dict] = {
+        (1,  1): 0.20e9, (1,  4): 0.80e9, (1,  8): 1.60e9, (1, 16): 3.20e9,
+        (2,  1): 0.40e9, (2,  4): 1.60e9, (2,  8): 3.20e9, (2, 16): 6.40e9,
+        (3,  1): 0.80e9, (3,  4): 3.20e9, (3,  8): 6.40e9, (3, 16): 12.8e9,
+        (4,  1): 1.60e9, (4,  4): 6.40e9, (4,  8): 12.8e9, (4, 16): 25.6e9,
+        (5,  1): 3.20e9, (5,  4): 12.8e9, (5,  8): 25.6e9, (5, 16): 51.2e9,
+    }
+
+    @property
+    def bw_bytes_s(self) -> float:
+        return self._BW_TABLE.get((self.gen, self.lanes), 3.20e9)
+
+    def xfer_s(self, nbytes: int) -> float:
+        """One-direction transfer time: latency + bytes / bandwidth."""
+        return self.latency_s + nbytes / self.bw_bytes_s
+
+
+@dataclass
 class BenchmarkArtifact:
     output_dir: str
     report_path: str
     tinygrad_device: str
-    tinygrad_wall_s: float
-    tg2hdl_wall_s: float
-    tg2hdl_cycles: int
+    tinygrad_wall_s: float        # run_schedule() + .numpy() — compute + output copy
+    tg2hdl_wall_s: float          # Amaranth simulator wall time (not hardware time)
+    tg2hdl_cycles: int            # compute-only cycles (start → done)
+    tg2hdl_total_cycles: int      # load + compute + readback cycles
     correctness: bool
+    fpga_wall_s: float | None = None        # tg2hdl_total_cycles / fmax_hz; None if synthesis unavailable
+    pcie_in_s: float | None = None          # PCIe host→FPGA transfer time
+    pcie_out_s: float | None = None         # PCIe FPGA→host transfer time
+    fpga_with_pcie_s: float | None = None   # fpga_wall_s + pcie_in_s + pcie_out_s
 
 
 FPGA_FAMILY = "Lattice ECP5"
@@ -132,659 +168,425 @@ def _format_mhz(value: float | None) -> str:
     return f"{value:.2f} MHz"
 
 
+def _pick_unit(*seconds_values: float | None) -> tuple[float, str]:
+    """Return (multiplier, label) for the best shared time unit across all values."""
+    vals = [v for v in seconds_values if v is not None and v > 0]
+    ref = max(vals) if vals else 0.0
+    if ref < 1e-6:
+        return 1e9, "ns"
+    if ref < 1e-3:
+        return 1e6, "µs"
+    if ref < 1.0:
+        return 1e3, "ms"
+    return 1.0, "s"
+
+
+def _fmt_time(value: float | None, mult: float, unit: str) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value * mult:.3f} {unit}"
+
+
+def _format_fpga_wall(cycles: int, fmax_mhz: float | None) -> str:
+    if fmax_mhz is None or fmax_mhz <= 0:
+        return "n/a"
+    wall_s = cycles / (fmax_mhz * 1e6)
+    mult, unit = _pick_unit(wall_s)
+    return _fmt_time(wall_s, mult, unit)
+
+
+def _bar_chart(title: str, rows: list, domain: float, mult: float, unit: str,
+               W: int = 620, LEFT: int = 110, RIGHT: int = 140,
+               ROW_H: int = 22, GAP: int = 8, TOP: int = 18, BOT: int = 28) -> str:
+    """Render one horizontal stacked-bar chart as an inline SVG."""
+    bar_w = W - LEFT - RIGHT
+    H = TOP + len(rows) * ROW_H + (len(rows) - 1) * GAP + BOT
+
+    def scale(v):
+        return bar_w * v / domain if domain > 0 else 0
+
+    out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
+           f'style="font-family:monospace;font-size:11px;display:block;margin:4px 0 8px 0;">']
+
+    # title
+    out.append(f'<text x="{LEFT}" y="13" font-weight="bold" fill="#111">{title}</text>')
+
+    for ri, (label, segs) in enumerate(rows):
+        y = TOP + ri * (ROW_H + GAP)
+        cx = 0.0
+        total = sum(v for _, v, _ in segs)
+
+        out.append(f'<text x="{LEFT - 4}" y="{y + ROW_H - 6}" '
+                   f'text-anchor="end" fill="#111">{label}</text>')
+
+        for seg_label, val, color in segs:
+            if val <= 0:
+                continue
+            px = scale(val)
+            tooltip = f"{seg_label}: {val * mult:.4g} {unit}"
+            out.append(f'<rect x="{LEFT + cx:.1f}" y="{y}" width="{max(px, 1):.1f}" '
+                       f'height="{ROW_H}" fill="{color}"><title>{tooltip}</title></rect>')
+            if px > 36:
+                out.append(f'<text x="{LEFT + cx + px/2:.1f}" y="{y + ROW_H - 7}" '
+                           f'text-anchor="middle" fill="#fff" font-size="10">{seg_label}</text>')
+            cx += px
+
+        total_str = f"{total * mult:.4g} {unit}"
+        out.append(f'<text x="{LEFT + cx + 4:.1f}" y="{y + ROW_H - 6}" fill="#111">{total_str}</text>')
+
+    # axis
+    ay = H - BOT
+    out.append(f'<line x1="{LEFT}" y1="{ay}" x2="{LEFT + bar_w}" y2="{ay}" stroke="#888" stroke-width="1"/>')
+    for i in range(6):
+        tx = LEFT + bar_w * i // 5
+        tv = domain * i / 5 * mult
+        out.append(f'<line x1="{tx}" y1="{ay}" x2="{tx}" y2="{ay + 4}" stroke="#888" stroke-width="1"/>')
+        out.append(f'<text x="{tx}" y="{ay + 14}" text-anchor="middle" fill="#555">{tv:.3g}</text>')
+    out.append(f'<text x="{LEFT + bar_w // 2}" y="{H - 2}" text-anchor="middle" fill="#555">{unit}</text>')
+
+    out.append("</svg>")
+    return "\n".join(out)
+
+
+def _timing_svg(timing: dict) -> str:
+    """Three charts: comparison (shared scale), CPU breakdown, FPGA+PCIe breakdown."""
+    cpu_segs = [
+        ("compute",  timing["cpu_compute_s"],  "#2a7db8"),
+        ("readback", timing["cpu_readback_s"],  "#6ab0e0"),
+    ]
+    if timing["fpga_available"]:
+        fpga_segs = [
+            ("PCIe in",  timing["pcie_in_s"],      "#5a8fc4"),
+            ("load",     timing["fpga_load_s"],     "#1f7a43"),
+            ("compute",  timing["fpga_compute_s"],  "#d88412"),
+            ("readback", timing["fpga_readback_s"], "#a05cb0"),
+            ("PCIe out", timing["pcie_out_s"],      "#5a8fc4"),
+        ]
+        cpu_total  = timing["cpu_wall_s"]
+        fpga_total = timing["fpga_with_pcie_s"]
+        mult_cmp, unit_cmp   = _pick_unit(cpu_total, fpga_total)
+        mult_cpu, unit_cpu   = _pick_unit(cpu_total)
+        mult_fpga, unit_fpga = _pick_unit(fpga_total)
+
+        cmp_chart  = _bar_chart(
+            "Comparison (shared scale)",
+            [("CPU",       [("total", cpu_total,  "#2a7db8")]),
+             ("FPGA+PCIe", [("total", fpga_total, "#d88412")])],
+            max(cpu_total, fpga_total), mult_cmp, unit_cmp,
+        )
+        cpu_chart  = _bar_chart(
+            "CPU breakdown",
+            [("CPU", cpu_segs)],
+            cpu_total, mult_cpu, unit_cpu,
+        )
+        fpga_chart = _bar_chart(
+            "FPGA+PCIe breakdown",
+            [("FPGA+PCIe", fpga_segs)],
+            fpga_total, mult_fpga, unit_fpga,
+        )
+        return cmp_chart + cpu_chart + fpga_chart
+
+    else:
+        # No fmax: comparison uses CPU time only; FPGA shows raw cycles (PCIe needs fmax)
+        mult_cpu, unit_cpu = _pick_unit(timing["cpu_wall_s"])
+        fpga_cycle_segs = [
+            ("load",     timing["load_cycles"],     "#1f7a43"),
+            ("compute",  timing["compute_cycles"],  "#d88412"),
+            ("readback", timing["readback_cycles"], "#a05cb0"),
+        ]
+        cpu_chart = _bar_chart(
+            "CPU breakdown",
+            [("CPU", cpu_segs)],
+            timing["cpu_wall_s"], mult_cpu, unit_cpu,
+        )
+        fpga_chart = _bar_chart(
+            "FPGA breakdown (cycles, no Fmax — PCIe not modelled)",
+            [("FPGA", fpga_cycle_segs)],
+            timing["total_cycles"], 1.0, "cycles",
+        )
+        return cpu_chart + fpga_chart
+
+
 def _render_html(report: dict) -> str:
     report_json = json.dumps(report)
+    s = report["summary"]
+    t = report["timing"]
+    synth = report["top_synth"]["synth_stats"]
+
+    mult, unit = _pick_unit(t["cpu_wall_s"], t.get("fpga_total_s"))
+    timing_svg = _timing_svg(t)
+
+    def tf(val):
+        return _fmt_time(val, mult, unit) if val is not None else "n/a"
+
+    status_style = "color:green;font-weight:bold" if s["correctness"] else "color:red;font-weight:bold"
+    status_text  = "PASS" if s["correctness"] else "FAIL"
+
+    # Per-kernel rows
+    kernel_rows = ""
+    for i, k in enumerate(report["kernels"]):
+        ks = k["synth_stats"]
+        fmax_str = "n/a" if ks.get("fmax_mhz") is None else f"{ks['fmax_mhz']:.1f}"
+        name_str = k.get("metadata", [""])[0] if k.get("metadata") else ""
+        kernel_rows += (
+            f"<tr><td>{i}</td>"
+            f"<td>{name_str}</td>"
+            f"<td>{fmax_str}</td>"
+            f"<td>{ks.get('comb','n/a')}</td><td>{ks.get('ff','n/a')}</td>"
+            f"<td>{ks.get('dp16kd','n/a')}</td><td>{ks.get('mult18','n/a')}</td></tr>\n"
+        )
+
+    # KernelIR dumps
+    kernelir_sections = ""
+    for i, k in enumerate(report["kernels"]):
+        ir = html.escape(k.get("kernel_ir") or "(not available)")
+        kernelir_sections += f"<h3>Kernel {i}</h3>\n<pre>{ir}</pre>\n"
+
+    # Schematics
+    schematic_sections = ""
+    top_svg = report["top_synth"].get("synth_svg") or ""
+    if top_svg:
+        schematic_sections += "<h3>TopModule</h3>\n" + top_svg + "\n"
+    for i, k in enumerate(report["kernels"]):
+        ksvg = k.get("synth_svg") or ""
+        if ksvg:
+            schematic_sections += f"<h3>Kernel {i}</h3>\n" + ksvg + "\n"
+    if not schematic_sections:
+        schematic_sections = "<p>No schematics available (Yosys/Graphviz not installed).</p>"
+
+    # UOp viz divs
+    uop_graph_divs = ""
+    uop_graph_js = ""
+    for i, k in enumerate(report["kernels"]):
+        if k.get("tinygrad_graph"):
+            uop_graph_divs += f'<h3>Kernel {i}</h3>\n<div class="graph" id="uop-graph-{i}"></div>\n'
+            uop_graph_js += f'renderUOpGraph(document.getElementById("uop-graph-{i}"), REPORT.kernels[{i}].tinygrad_graph);\n'
+    if not uop_graph_divs:
+        uop_graph_divs = "<p>No UOp graphs available.</p>"
+
+    ref_out  = html.escape(str(s["reference_output"]))
+    sim_out  = html.escape(str(s["sim_output"]))
+
+    fpga_time_note = "" if t["fpga_available"] else " (synthesis unavailable — cycles shown instead of time)"
+    pm = t["pcie_model"]
+    pcie_note = (
+        f'PCIe Gen{pm["gen"]} x{pm["lanes"]} — '
+        f'{pm["bw_gbs"]:.2f} GB/s practical, '
+        f'{pm["latency_us"]:.1f} µs per-direction DMA latency'
+    )
+
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>tg2hdl Benchmark</title>
+  <title>tg2hdl Report</title>
   <script src="assets/d3js.org/d3.v7.min.js"></script>
   <script src="assets/dagrejs.github.io/project/dagre/latest/dagre.min.js"></script>
   <style>
-    :root {{
-      --bg: #f4f6f8;
-      --bg2: #edf1f4;
-      --panel: #ffffff;
-      --panel2: #fbfcfd;
-      --line: #d7dde3;
-      --line2: #aab6c2;
-      --ink: #182126;
-      --muted: #5b6975;
-      --accent: #d88412;
-      --accent2: #2a7db8;
-      --ok: #1f7a43;
-      --bad: #b13a2e;
-      --edge: #7d8790;
-      --node: #ffffff;
-    }}
-    * {{ box-sizing: border-box; }}
-    body {{
-      margin: 0;
-      color: var(--ink);
-      background:
-        linear-gradient(180deg, rgba(216,132,18,0.06), transparent 240px),
-        linear-gradient(90deg, rgba(24,33,38,0.03) 1px, transparent 1px),
-        linear-gradient(0deg, rgba(24,33,38,0.02) 1px, transparent 1px),
-        var(--bg);
-      background-size: auto, 24px 24px, 24px 24px, auto;
-      font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
-      min-height: 100vh;
-    }}
-    h1, h2, h3 {{
-      margin: 0;
-      letter-spacing: 0.01em;
-      font-weight: 650;
-    }}
-    .shell {{
-      width: min(1480px, calc(100vw - 32px));
-      margin: 16px auto 32px;
-      display: grid;
-      gap: 12px;
-    }}
-    .hero, .panel {{
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      box-shadow: inset 0 1px 0 rgba(255,255,255,0.7);
-    }}
-    .hero {{
-      padding: 18px;
-      display: grid;
-      gap: 12px;
-      background:
-        linear-gradient(180deg, rgba(216,132,18,0.05), transparent 60%),
-        var(--panel);
-    }}
-    .metrics {{
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
-      gap: 10px;
-    }}
-    .metric {{
-      padding: 12px;
-      border-radius: 6px;
-      background: linear-gradient(180deg, rgba(255,255,255,0.96), rgba(244,246,248,0.9));
-      border: 1px solid var(--line);
-      min-height: 84px;
-    }}
-    .metric .label {{
-      font-size: 12px;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-      color: var(--muted);
-      margin-bottom: 6px;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-    }}
-    .metric .value {{
-      font-size: 24px;
-      font-weight: 700;
-      line-height: 1.1;
-    }}
-    .ok {{ color: var(--ok); }}
-    .bad {{ color: var(--bad); }}
-    .summary-grid {{
-      display: grid;
-      grid-template-columns: 1.2fr 1fr;
-      gap: 12px;
-    }}
-    .summary-table {{
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 13px;
-    }}
-    .summary-table td {{
-      padding: 10px 0;
-      border-bottom: 1px solid var(--line);
-      vertical-align: top;
-    }}
-    .summary-table td:first-child {{
-      width: 220px;
-      color: var(--muted);
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      font-size: 11px;
-    }}
-    .tabs {{
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      border-top: 1px solid var(--line);
-      padding-top: 12px;
-    }}
-    .tab {{
-      border: 1px solid var(--line2);
-      padding: 9px 13px;
-      border-radius: 4px;
-      background: var(--panel2);
-      color: var(--ink);
-      cursor: pointer;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      font-size: 12px;
-    }}
-    .tab.active {{
-      background: var(--accent);
-      color: #ffffff;
-      border-color: var(--accent);
-    }}
-    .panel {{
-      padding: 18px;
-      display: none;
-      gap: 18px;
-    }}
-    .panel.active {{ display: grid; }}
-    .grid-2 {{
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-      gap: 16px;
-    }}
-    .card {{
-      padding: 14px;
-      border-radius: 6px;
-      border: 1px solid var(--line);
-      background: var(--panel2);
-      overflow: hidden;
-    }}
-    .graph {{
-      height: 520px;
-      border-radius: 6px;
-      background:
-        radial-gradient(circle at top left, rgba(42,125,184,0.05), transparent 35%),
-        #ffffff;
-      border: 1px solid var(--line);
-      overflow: hidden;
-      position: relative;
-    }}
-    .graph svg {{
-      width: 100%;
-      height: 100%;
-    }}
-    .graph-toolbar {{
-      position: absolute;
-      top: 8px;
-      right: 8px;
-      display: flex;
-      gap: 6px;
-      z-index: 5;
-    }}
-    .graph-btn {{
-      border: 1px solid var(--line2);
-      background: rgba(255,255,255,0.94);
-      color: var(--ink);
-      border-radius: 4px;
-      padding: 4px 7px;
-      font-size: 11px;
-      cursor: pointer;
-    }}
-    .graph-detail {{
-      position: absolute;
-      left: 10px;
-      bottom: 10px;
-      max-width: 340px;
-      border: 1px solid var(--line);
-      background: rgba(255,255,255,0.97);
-      border-radius: 6px;
-      padding: 8px 10px;
-      font-size: 12px;
-      color: var(--ink);
-      box-shadow: 0 8px 24px rgba(0,0,0,0.08);
-      pointer-events: none;
-      opacity: 0;
-      transition: opacity 120ms ease;
-      white-space: pre-wrap;
-    }}
-    .graph-detail.visible {{
-      opacity: 1;
-    }}
-    pre {{
-      margin: 0;
-      white-space: pre-wrap;
-      word-break: break-word;
-      font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
-      font-size: 13px;
-      line-height: 1.45;
-    }}
-    .kernel-list {{
-      display: grid;
-      gap: 16px;
-    }}
-    .synth svg {{
-      width: 100%;
-      height: auto;
-    }}
-    .muted {{
-      color: var(--muted);
-    }}
-    .section-head {{
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      margin-bottom: 10px;
-    }}
-    .badge {{
-      border: 1px solid var(--line2);
-      border-radius: 4px;
-      padding: 3px 8px;
-      font-size: 11px;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-      color: var(--muted);
-    }}
-    .help {{
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      width: 16px;
-      height: 16px;
-      border-radius: 999px;
-      border: 1px solid var(--line2);
-      color: var(--accent);
-      font-size: 11px;
-      font-weight: 700;
-      cursor: help;
-      position: relative;
-      flex: 0 0 auto;
-    }}
-    .help:hover::after {{
-      content: attr(data-help);
-      position: absolute;
-      left: 22px;
-      top: -8px;
-      width: 260px;
-      padding: 10px 12px;
-      border-radius: 6px;
-      border: 1px solid var(--line2);
-      background: #101317;
-      color: #eef3f6;
-      text-transform: none;
-      letter-spacing: 0;
-      font-size: 12px;
-      line-height: 1.4;
-      white-space: normal;
-      z-index: 20;
-      box-shadow: 0 12px 30px rgba(0,0,0,0.35);
-    }}
-    .methodology {{
-      font-size: 13px;
-      line-height: 1.55;
-    }}
-    .methodology p {{
-      margin: 0 0 10px 0;
-    }}
-    .methodology code {{
-      font-family: "IBM Plex Mono", monospace;
-      font-size: 12px;
-    }}
-    @media (max-width: 980px) {{
-      .summary-grid {{
-        grid-template-columns: 1fr;
-      }}
-    }}
+    body {{ font-family: monospace; margin: 32px 48px; background: #fff; color: #111; font-size: 13px; }}
+    h1 {{ font-size: 16px; border-bottom: 2px solid #111; padding-bottom: 4px; margin-bottom: 16px; }}
+    h2 {{ font-size: 14px; margin-top: 28px; margin-bottom: 6px; border-bottom: 1px solid #bbb; padding-bottom: 2px; }}
+    h3 {{ font-size: 13px; margin-top: 14px; margin-bottom: 4px; }}
+    table {{ border-collapse: collapse; margin: 6px 0 12px 0; }}
+    th, td {{ border: 1px solid #bbb; padding: 3px 10px; text-align: left; white-space: nowrap; }}
+    th {{ background: #f0f0f0; }}
+    pre {{ background: #f8f8f8; border: 1px solid #ddd; padding: 8px 12px; font-size: 12px;
+           overflow-x: auto; white-space: pre-wrap; word-break: break-word; margin: 4px 0 12px 0; }}
+    .graph {{ width: 100%; height: 420px; border: 1px solid #bbb; margin: 6px 0 12px 0;
+              position: relative; overflow: hidden; }}
+    .graph svg {{ width: 100%; height: 100%; }}
+    .graph-toolbar {{ position: absolute; top: 6px; right: 6px; display: flex; gap: 4px; z-index: 5; }}
+    .graph-btn {{ border: 1px solid #bbb; background: #fff; padding: 2px 6px; cursor: pointer; font-size: 11px; }}
+    .graph-detail {{ position: absolute; left: 8px; bottom: 8px; max-width: 320px; border: 1px solid #bbb;
+                     background: rgba(255,255,255,0.97); padding: 6px 8px; font-size: 11px;
+                     pointer-events: none; opacity: 0; white-space: pre-wrap; }}
+    .graph-detail.visible {{ opacity: 1; }}
+    .synth svg {{ width: 100%; height: auto; max-height: 600px; }}
+    p {{ margin: 4px 0; }}
   </style>
 </head>
 <body>
-  <div class="shell">
-    <section class="hero">
-      <div class="section-head">
-        <h1>tg2hdl Benchmark</h1>
-        <div class="badge">Hardware Compilation Report</div>
-      </div>
-      <p class="muted">Tinygrad reference execution, tg2hdl lowering, top-level scheduling, and FPGA-oriented synthesis collected into a single engineering report.</p>
-      <div class="summary-grid">
-        <div class="card">
-          <div class="section-head">
-            <h2>Summary</h2>
-            <div class="badge">At a Glance</div>
-          </div>
-          <table class="summary-table">
-            <tr><td>Status</td><td class="{'ok' if report['summary']['correctness'] else 'bad'}"><strong>{'PASS' if report['summary']['correctness'] else 'FAIL'}</strong></td></tr>
-            <tr><td>Tinygrad Device</td><td>{html.escape(report['summary']['tinygrad_device'])}</td></tr>
-            <tr><td>Kernel Count</td><td>{len(report['kernels'])}</td></tr>
-            <tr><td>FPGA Target</td><td>{FPGA_FAMILY} {FPGA_DEVICE.upper()}-{FPGA_PACKAGE}</td></tr>
-            <tr><td>Report Scope</td><td>Reference execution, compiler graphs, KernelIR, full-system synthesis, per-kernel synthesis</td></tr>
-          </table>
-        </div>
-        <div class="card">
-          <div class="section-head">
-            <h2>Primary Metrics</h2>
-            <div class="badge">Measured</div>
-          </div>
-          <div class="metrics">
-            <div class="metric"><div class="label">Correctness <span class="help" data-help="PASS means the final tg2hdl simulated output buffer exactly matched the tinygrad reference output for this run.">?</span></div><div class="value {'ok' if report['summary']['correctness'] else 'bad'}">{'PASS' if report['summary']['correctness'] else 'FAIL'}</div></div>
-            <div class="metric"><div class="label">Tinygrad Wall <span class="help" data-help="Wall-clock time spent executing the captured tinygrad schedule on the selected tinygrad device, measured in Python around schedule execution.">?</span></div><div class="value">{report['summary']['tinygrad_wall_s']:.6f}s</div></div>
-            <div class="metric"><div class="label">tg2hdl Wall <span class="help" data-help="Wall-clock time spent simulating the generated tg2hdl TopModule in Amaranth. This is software simulation time, not predicted FPGA runtime.">?</span></div><div class="value">{report['summary']['tg2hdl_wall_s']:.6f}s</div></div>
-            <div class="metric"><div class="label">tg2hdl Cycles <span class="help" data-help="Clock cycles observed between start and done in the Amaranth TopModule simulation. This is the hardware-style runtime metric for the generated design.">?</span></div><div class="value">{report['summary']['tg2hdl_cycles']}</div></div>
-            <div class="metric"><div class="label">Kernel Count <span class="help" data-help="Number of tinygrad compute kernels present in the scheduled program after lowering and fusion decisions.">?</span></div><div class="value">{len(report['kernels'])}</div></div>
-            <div class="metric"><div class="label">Full-System Fmax <span class="help" data-help="Estimated maximum clock frequency reported by nextpnr for the full assembled tg2hdl TopModule targeting the selected FPGA.">?</span></div><div class="value">{_format_mhz(report['top_synth']['synth_stats']['fmax_mhz'])}</div></div>
-          </div>
-        </div>
-      </div>
-      <div class="tabs">
-        <button class="tab active" data-target="summary">Summary</button>
-        <button class="tab" data-target="overview">Graphs</button>
-        <button class="tab" data-target="tinygrad">Tinygrad Kernels</button>
-        <button class="tab" data-target="kernelir">KernelIR</button>
-        <button class="tab" data-target="synth">Amaranth Synth</button>
-        <button class="tab" data-target="methodology">Methodology</button>
-      </div>
-    </section>
-    <section class="panel active" id="summary">
-      <div class="grid-2">
-        <div class="card">
-          <div class="section-head">
-            <h2>Outputs</h2>
-            <div class="badge">Comparison</div>
-          </div>
-          <p class="muted">Reference output comes from tinygrad schedule execution. tg2hdl output comes from Amaranth simulation of the generated TopModule.</p>
-          <div class="grid-2">
-            <div>
-              <div class="section-head"><h3>Reference</h3><div class="badge">tinygrad</div></div>
-              <pre id="reference-output"></pre>
-            </div>
-            <div>
-              <div class="section-head"><h3>tg2hdl</h3><div class="badge">simulation</div></div>
-              <pre id="sim-output"></pre>
-            </div>
-          </div>
-        </div>
-        <div class="card">
-          <div class="section-head">
-            <h2>System Summary</h2>
-            <div class="badge">Whole Design</div>
-          </div>
-          <div class="metrics">
-            <div class="metric"><div class="label">FPGA Target <span class="help" data-help="Synthesis target used for both the full-system and per-kernel FPGA estimates.">?</span></div><div class="value" style="font-size:16px;">{FPGA_FAMILY} {FPGA_DEVICE.upper()}-{FPGA_PACKAGE}</div></div>
-            <div class="metric"><div class="label">Synth Wall <span class="help" data-help="Wall-clock time spent running Yosys plus nextpnr for the full TopModule, when available.">?</span></div><div class="value">{_format_seconds(report['top_synth']['synth_stats']['synth_wall_s'])}</div></div>
-            <div class="metric"><div class="label">LUTs <span class="help" data-help="TRELLIS_COMB cells used by the full assembled design according to nextpnr utilization output.">?</span></div><div class="value">{report['top_synth']['synth_stats']['comb']}</div></div>
-            <div class="metric"><div class="label">FFs <span class="help" data-help="TRELLIS_FF cells used by the full assembled design according to nextpnr utilization output.">?</span></div><div class="value">{report['top_synth']['synth_stats']['ff']}</div></div>
-            <div class="metric"><div class="label">BRAM <span class="help" data-help="DP16KD block RAM tiles used by the full assembled design according to nextpnr utilization output.">?</span></div><div class="value">{report['top_synth']['synth_stats']['dp16kd']}</div></div>
-            <div class="metric"><div class="label">DSP <span class="help" data-help="MULT18X18D DSP multiplier tiles used by the full assembled design according to nextpnr utilization output.">?</span></div><div class="value">{report['top_synth']['synth_stats']['mult18']}</div></div>
-          </div>
-        </div>
-      </div>
-    </section>
-    <section class="panel" id="overview">
-      <div class="grid-2">
-        <div class="card">
-          <div class="section-head">
-            <h2>Kernel DAG</h2>
-            <div class="badge">tg2hdl</div>
-          </div>
-          <p class="muted">Logical kernel dependency graph reconstructed by tg2hdl from the tinygrad schedule.</p>
-          <div class="graph" id="pipeline-graph"></div>
-        </div>
-        <div class="card">
-          <div class="section-head">
-            <h2>Execution DAG</h2>
-            <div class="badge">tg2hdl</div>
-          </div>
-          <p class="muted">Top-level execution graph after tg2hdl ordering and copy-group construction.</p>
-          <div class="graph" id="execution-graph"></div>
-        </div>
-      </div>
-    </section>
-    <section class="panel" id="tinygrad">
-      <div class="kernel-list" id="tinygrad-kernels"></div>
-    </section>
-    <section class="panel" id="kernelir">
-      <div class="kernel-list" id="kernelir-kernels"></div>
-    </section>
-    <section class="panel" id="synth">
-      <div class="kernel-list" id="synth-kernels"></div>
-    </section>
-    <section class="panel" id="methodology">
-      <div class="card methodology">
-        <div class="section-head">
-          <h2>Methodology</h2>
-          <div class="badge">Explanations</div>
-        </div>
-        <p><strong>Tinygrad reference:</strong> the input tensor expression is scheduled by tinygrad and executed through <code>run_schedule(...)</code>. The final realized output buffer is used as the reference result.</p>
-        <p><strong>Kernel graphs:</strong> the “Tinygrad Kernels” tab comes directly from tinygrad’s UOp graph for each scheduled compute kernel.</p>
-        <p><strong>Kernel DAG and Execution DAG:</strong> these are tg2hdl-generated views. The Kernel DAG shows logical producer/consumer dependencies. The Execution DAG shows the actual topological execution order and explicit copy edges the tg2hdl top-level executor will drive.</p>
-        <p><strong>tg2hdl wall time:</strong> this is Python wall-clock time for Amaranth simulation of the generated <code>TopModule</code>. It is not intended as an estimate of FPGA runtime.</p>
-        <p><strong>tg2hdl cycles:</strong> this is the cycle count observed from <code>start</code> to <code>done</code> in the Amaranth simulation. This is the closest report metric to generated hardware runtime.</p>
-        <p><strong>Synth wall / Fmax / utilization:</strong> these come from Yosys plus nextpnr targeting <code>{FPGA_FAMILY} {FPGA_DEVICE.upper()}-{FPGA_PACKAGE}</code>. If these tools are not present, the report still renders but synthesis-specific values appear as unavailable.</p>
-        <p><strong>Full System vs Per-Kernel synthesis:</strong> the top synth block represents the assembled design with all kernels and control logic. The per-kernel blocks are local cost views and do not include full-system orchestration overhead.</p>
-      </div>
-    </section>
+  <h1>tg2hdl Report</h1>
+
+  <h2>1. Summary</h2>
+  <table>
+    <tr><th>Field</th><th>Value</th></tr>
+    <tr><td>Correctness</td><td style="{status_style}">{status_text}</td></tr>
+    <tr><td>CPU device</td><td>{html.escape(s['tinygrad_device'])}</td></tr>
+    <tr><td>FPGA target</td><td>{FPGA_FAMILY} {FPGA_DEVICE.upper()}-{FPGA_PACKAGE}</td></tr>
+    <tr><td>Kernels</td><td>{len(report['kernels'])}</td></tr>
+    <tr><td>Fmax</td><td>{_format_mhz(synth.get('fmax_mhz'))}</td></tr>
+  </table>
+
+  <h2>2. Timing{fpga_time_note}</h2>
+  <p style="margin-bottom:6px">{pcie_note} &nbsp;|&nbsp; input {t['pcie_in_bytes']} B, output {t['pcie_out_bytes']} B</p>
+  <table>
+    <tr><th>Phase</th><th>CPU</th><th>FPGA cycles</th><th>FPGA (est.)</th></tr>
+    <tr><td>PCIe in (host→FPGA)</td><td>—</td><td>—</td>
+        <td>{tf(t.get('pcie_in_s'))}</td></tr>
+    <tr><td>Input load (BRAM write)</td><td>—</td>
+        <td>{t['load_cycles']}</td><td>{tf(t.get('fpga_load_s'))}</td></tr>
+    <tr><td>Compute</td><td>{tf(t['cpu_compute_s'])}</td>
+        <td>{t['compute_cycles']}</td><td>{tf(t.get('fpga_compute_s'))}</td></tr>
+    <tr><td>Output readback (BRAM read)</td><td>{tf(t['cpu_readback_s'])}</td>
+        <td>{t['readback_cycles']}</td><td>{tf(t.get('fpga_readback_s'))}</td></tr>
+    <tr><td>PCIe out (FPGA→host)</td><td>—</td><td>—</td>
+        <td>{tf(t.get('pcie_out_s'))}</td></tr>
+    <tr><td><b>Total</b></td><td><b>{tf(t['cpu_wall_s'])}</b></td>
+        <td><b>{t['total_cycles']}</b></td><td><b>{tf(t.get('fpga_with_pcie_s'))}</b></td></tr>
+  </table>
+  {timing_svg}
+
+  <h2>3. FPGA Resources (full system)</h2>
+  <table>
+    <tr><th>Fmax</th><th>LUTs</th><th>FFs</th><th>BRAM (DP16KD)</th><th>DSPs (MULT18)</th><th>On-chip bits</th><th>Synth wall</th></tr>
+    <tr>
+      <td>{_format_mhz(synth.get('fmax_mhz'))}</td>
+      <td>{synth.get('comb','n/a')}</td>
+      <td>{synth.get('ff','n/a')}</td>
+      <td>{synth.get('dp16kd','n/a')}</td>
+      <td>{synth.get('mult18','n/a')}</td>
+      <td>{synth.get('mem_bits','n/a')}</td>
+      <td>{_format_seconds(synth.get('synth_wall_s'))}</td>
+    </tr>
+  </table>
+
+  <h2>4. Per-Kernel Resources</h2>
+  <table>
+    <tr><th>#</th><th>Name</th><th>Fmax (MHz)</th><th>LUTs</th><th>FFs</th><th>BRAM</th><th>DSPs</th></tr>
+    {kernel_rows}
+  </table>
+
+  <h2>5. Output Comparison</h2>
+  <table>
+    <tr><th>CPU reference</th><th>FPGA simulation</th></tr>
+    <tr><td><pre style="margin:0;border:none;background:none">{ref_out}</pre></td>
+        <td><pre style="margin:0;border:none;background:none">{sim_out}</pre></td></tr>
+  </table>
+
+  <h2>6. Kernel DAG</h2>
+  <div class="graph" id="pipeline-graph"></div>
+
+  <h2>7. Execution DAG</h2>
+  <div class="graph" id="execution-graph"></div>
+
+  <h2>8. KernelIR</h2>
+  {kernelir_sections}
+
+  <h2>9. Schematics</h2>
+  <div class="synth">
+  {schematic_sections}
   </div>
+
+  <h2>10. tinygrad UOp Graphs</h2>
+  {uop_graph_divs}
+
   <script>
     const REPORT = {report_json};
 
-    function renderGraph(container, graphData) {{
+    // Strip ANSI escape codes from a string
+    function stripAnsi(s) {{
+      return (s || "").replace(/\x1b\[[0-9;]*m/g, "");
+    }}
+
+    // Build and render a dagre graph into container.
+    // graphData: dict-of-dicts format (from graph_json or uop_to_json).
+    //   Each key is a node id string; each value has: label, src (list of [edge_label, src_id]),
+    //   color.  Labels may contain ANSI escapes and newlines.
+    // labelLine: how many lines of the label to show in the node box (default 1).
+    function _buildGraph(container, graphData, labelLine, nodeW, nodeH) {{
+      nodeW = nodeW || 130;
+      nodeH = nodeH || 36;
+      labelLine = labelLine || 1;
       const root = d3.select(container);
       root.selectAll("*").remove();
       const toolbar = root.append("div").attr("class", "graph-toolbar");
-      const detail = root.append("div").attr("class", "graph-detail").text("");
+      const detail = root.append("div").attr("class", "graph-detail");
       const svg = root.append("svg");
       const viewport = svg.append("g");
       const inner = viewport.append("g");
       const graph = new dagre.graphlib.Graph();
-      graph.setGraph({{ rankdir: "LR", nodesep: 24, ranksep: 56, marginx: 24, marginy: 24 }});
+      graph.setGraph({{ rankdir: "TB", nodesep: 30, ranksep: 40 }});
       graph.setDefaultEdgeLabel(() => ({{}}));
 
-      Object.entries(graphData).forEach(([id, node]) => {{
-        graph.setNode(id, {{
-          label: node.label,
-          width: 220,
-          height: 72,
-          color: node.color || "#20272d",
+      Object.entries(graphData).forEach(([id, n]) => {{
+        const rawLabel = stripAnsi(n.label || id);
+        const dispLabel = rawLabel.split("\\n").slice(0, labelLine).join(" | ");
+        graph.setNode(String(id), {{
+          label: dispLabel, fullLabel: rawLabel,
+          width: nodeW, height: nodeH,
+          color: n.color || "#e8edf2"
         }});
       }});
-      Object.entries(graphData).forEach(([id, node]) => {{
-        (node.src || []).forEach(([edgeLabel, srcId]) => {{
-          graph.setEdge(srcId, id, {{ label: edgeLabel }});
+      Object.entries(graphData).forEach(([dstId, n]) => {{
+        (n.src || []).forEach(e => {{
+          const srcId = String(e[1]);
+          const edgeLbl = typeof e[0] === "string" ? e[0] : "";
+          if (graph.hasNode(srcId)) graph.setEdge(srcId, String(dstId), {{ label: edgeLbl }});
         }});
       }});
 
       dagre.layout(graph);
-      const zoom = d3.zoom().scaleExtent([0.35, 3]).on("zoom", (event) => {{
-        viewport.attr("transform", event.transform);
-      }});
-      svg.call(zoom);
-
-      function fitGraph() {{
-        const dims = graph.graph();
-        const width = container.clientWidth || 800;
-        const height = container.clientHeight || 520;
-        const scale = Math.min(width / Math.max(dims.width + 48, 1), height / Math.max(dims.height + 48, 1), 1);
-        const tx = (width - dims.width * scale) / 2 + 24;
-        const ty = (height - dims.height * scale) / 2 + 24;
-        svg.transition().duration(250).call(zoom.transform, d3.zoomIdentity.translate(tx, ty).scale(scale));
-      }}
-
-      toolbar.append("button").attr("class", "graph-btn").text("Fit").on("click", fitGraph);
-      toolbar.append("button").attr("class", "graph-btn").text("+").on("click", () => svg.transition().duration(180).call(zoom.scaleBy, 1.2));
-      toolbar.append("button").attr("class", "graph-btn").text("-").on("click", () => svg.transition().duration(180).call(zoom.scaleBy, 0.85));
-
       const defs = svg.append("defs");
-      defs.append("marker")
-        .attr("id", "arrow")
-        .attr("viewBox", "0 0 10 10")
-        .attr("refX", 9)
-        .attr("refY", 5)
-        .attr("markerWidth", 7)
-        .attr("markerHeight", 7)
-        .attr("orient", "auto-start-reverse")
-        .append("path")
-        .attr("d", "M 0 0 L 10 5 L 0 10 z")
-        .attr("fill", "#86929a");
-
-      graph.edges().forEach(edge => {{
-        const e = graph.edge(edge);
-        const pts = e.points;
-        const path = d3.line().x(d => d.x).y(d => d.y).curve(d3.curveBasis);
-        inner.append("path")
-          .attr("d", path(pts))
-          .attr("fill", "none")
-          .attr("stroke", "#7d8790")
-          .attr("stroke-width", 1.6)
-          .attr("marker-end", "url(#arrow)");
-        const mid = pts[Math.floor(pts.length / 2)];
-        inner.append("text")
-          .attr("x", mid.x)
-          .attr("y", mid.y - 8)
-          .attr("text-anchor", "middle")
-          .attr("fill", "#5b6975")
-          .style("font-size", "12px")
-          .text(e.label || "");
+      const markId = "arr_" + container.id;
+      defs.append("marker").attr("id", markId).attr("markerWidth",8).attr("markerHeight",6)
+        .attr("refX",8).attr("refY",3).attr("orient","auto")
+        .append("polygon").attr("points","0 0, 8 3, 0 6").attr("fill","#666");
+      graph.edges().forEach(e => {{
+        const pts = graph.edge(e).points;
+        const path = d3.line().x(d=>d.x).y(d=>d.y).curve(d3.curveBasis)(pts);
+        inner.append("path").attr("d",path).attr("fill","none")
+          .attr("stroke","#666").attr("stroke-width",1.5).attr("marker-end","url(#"+markId+")");
+        const ed = graph.edge(e);
+        if (ed.label) {{
+          const mp = pts[Math.floor(pts.length/2)];
+          inner.append("text").attr("x",mp.x).attr("y",mp.y-4)
+            .attr("text-anchor","middle").attr("font-size",9).attr("fill","#555").text(ed.label);
+        }}
       }});
-
       graph.nodes().forEach(id => {{
         const n = graph.node(id);
-        const g = inner.append("g").attr("transform", `translate(${{n.x - n.width/2}}, ${{n.y - n.height/2}})`);
-        const rect = g.append("rect")
-          .attr("rx", 16)
-          .attr("ry", 16)
-          .attr("width", n.width)
-          .attr("height", n.height)
-          .attr("fill", n.color)
-          .attr("stroke", "#8b97a1")
-          .attr("stroke-width", 1.2);
-        const lines = n.label.split("\\n");
-        lines.forEach((line, idx) => {{
-          g.append("text")
-            .attr("x", 16)
-            .attr("y", 24 + idx * 18)
-            .attr("fill", "#182126")
-            .style("font-size", idx === 0 ? "14px" : "12px")
-            .style("font-weight", idx === 0 ? 700 : 500)
-            .text(line);
+        const g = inner.append("g").attr("transform",`translate(${{n.x-n.width/2}},${{n.y-n.height/2}})`);
+        g.append("rect").attr("width",n.width).attr("height",n.height).attr("rx",3)
+          .attr("fill",n.color).attr("stroke","#888").attr("stroke-width",1);
+        g.append("text").attr("x",n.width/2).attr("y",n.height/2+4)
+          .attr("text-anchor","middle").attr("font-size",9).attr("font-family","monospace")
+          .text(n.label);
+        g.on("click", () => {{
+          detail.text(n.fullLabel).classed("visible", true);
+          setTimeout(() => detail.classed("visible", false), 4000);
         }});
-        g.style("cursor", "pointer")
-          .on("mouseenter", () => {{
-            rect.attr("stroke", "#2a7db8").attr("stroke-width", 2);
-            detail.classed("visible", true).text(n.label);
-          }})
-          .on("mouseleave", () => {{
-            rect.attr("stroke", "#8b97a1").attr("stroke-width", 1.2);
-            detail.classed("visible", false);
-          }});
       }});
-
+      const zoom = d3.zoom().scaleExtent([0.1,4]).on("zoom", ev => viewport.attr("transform",ev.transform));
+      svg.call(zoom);
       const dims = graph.graph();
-      svg.attr("viewBox", `0 0 ${{dims.width + 48}} ${{dims.height + 48}}`);
-      fitGraph();
+      const cw = container.clientWidth || 800, ch = container.clientHeight || 420;
+      const sc = Math.min(cw/Math.max(dims.width+40,1), ch/Math.max(dims.height+40,1), 1);
+      const tx = d3.zoomIdentity.translate((cw-dims.width*sc)/2+20,(ch-dims.height*sc)/2+20).scale(sc);
+      svg.call(zoom.transform, tx);
+      toolbar.append("button").attr("class","graph-btn").text("+").on("click",()=>svg.transition().call(zoom.scaleBy,1.3));
+      toolbar.append("button").attr("class","graph-btn").text("−").on("click",()=>svg.transition().call(zoom.scaleBy,0.8));
+      toolbar.append("button").attr("class","graph-btn").text("fit").on("click",()=>svg.transition().call(zoom.transform,tx));
     }}
 
-    function populateOverview() {{
-      renderGraph(document.getElementById("pipeline-graph"), REPORT.graphs.pipeline);
-      renderGraph(document.getElementById("execution-graph"), REPORT.graphs.execution);
-      document.getElementById("reference-output").textContent = JSON.stringify(REPORT.summary.reference_output, null, 2);
-      document.getElementById("sim-output").textContent = JSON.stringify(REPORT.summary.sim_output, null, 2);
-    }}
+    function renderGraph(container, graphData)    {{ _buildGraph(container, graphData, 1, 130, 36); }}
+    function renderUOpGraph(container, graphData) {{ _buildGraph(container, graphData, 1, 110, 32); }}
 
-    function populateTinygrad() {{
-      const root = document.getElementById("tinygrad-kernels");
-      REPORT.kernels.forEach((kernel, idx) => {{
-        const card = document.createElement("div");
-        card.className = "card";
-        card.innerHTML = `<div class="section-head"><h2>Kernel ${{idx}}</h2><div class="badge">tinygrad source K${{kernel.source_index}}</div></div><p class="muted">This graph comes directly from tinygrad's UOp graph for the scheduled kernel.</p><p class="muted">${{kernel.metadata.join(", ") || "no metadata"}}</p><div class="graph" id="tinygrad-graph-${{idx}}"></div>`;
-        root.appendChild(card);
-        renderGraph(card.querySelector(".graph"), kernel.tinygrad_graph);
-      }});
-    }}
-
-    function populateKernelIR() {{
-      const root = document.getElementById("kernelir-kernels");
-      REPORT.kernels.forEach((kernel, idx) => {{
-        const card = document.createElement("div");
-        card.className = "card";
-        card.innerHTML = `<div class="section-head"><h2>KernelIR ${{idx}}</h2><div class="badge">tg2hdl</div></div><p class="muted">This textual IR is generated by tg2hdl after translating tinygrad UOps into the compiler's own typed kernel representation.</p><pre></pre>`;
-        card.querySelector("pre").textContent = kernel.kernel_ir;
-        root.appendChild(card);
-      }});
-    }}
-
-    function populateSynth() {{
-      const root = document.getElementById("synth-kernels");
-      const topCard = document.createElement("div");
-      topCard.className = "card synth";
-      const topStats = REPORT.top_synth.synth_stats;
-      topCard.innerHTML = `<div class="section-head"><h2>Full System</h2><div class="badge">assembled design</div></div>
-        <p class="muted">${{REPORT.top_synth.description}}</p>
-        <p class="muted">This is the real whole-design synthesis target: one assembled TopModule, not a per-kernel estimate.</p>
-        <div class="metrics">
-          <div class="metric"><div class="label">FPGA Target <span class="help" data-help="Synthesis target used for the full assembled TopModule.">?</span></div><div class="value" style="font-size:16px;">${{topStats.fpga_family}} ${{topStats.fpga_device.toUpperCase()}}-${{topStats.fpga_package}}</div></div>
-          <div class="metric"><div class="label">Fmax <span class="help" data-help="Estimated maximum clock frequency reported by nextpnr for the full assembled design.">?</span></div><div class="value">${{topStats.fmax_mhz === null ? "n/a" : topStats.fmax_mhz.toFixed(2) + " MHz"}}</div></div>
-          <div class="metric"><div class="label">Synth Wall <span class="help" data-help="Wall-clock time spent running Yosys plus nextpnr for the full assembled TopModule.">?</span></div><div class="value">${{topStats.synth_wall_s === null ? "n/a" : topStats.synth_wall_s.toFixed(3) + "s"}}</div></div>
-          <div class="metric"><div class="label">LUTs <span class="help" data-help="TRELLIS_COMB cells used by the full design according to nextpnr utilization output.">?</span></div><div class="value">${{topStats.comb}}</div></div>
-          <div class="metric"><div class="label">FFs <span class="help" data-help="TRELLIS_FF cells used by the full design according to nextpnr utilization output.">?</span></div><div class="value">${{topStats.ff}}</div></div>
-          <div class="metric"><div class="label">BRAM <span class="help" data-help="DP16KD block RAM tiles used by the full design according to nextpnr utilization output.">?</span></div><div class="value">${{topStats.dp16kd}}</div></div>
-          <div class="metric"><div class="label">DSP <span class="help" data-help="MULT18X18D DSP multiplier tiles used by the full design according to nextpnr utilization output.">?</span></div><div class="value">${{topStats.mult18}}</div></div>
-          <div class="metric"><div class="label">On-chip Bits <span class="help" data-help="Total buffer storage bits across the compiled design, aggregated from compiled kernel buffer definitions.">?</span></div><div class="value">${{topStats.mem_bits}}</div></div>
-        </div>`;
-      if (REPORT.top_synth.synth_svg) {{
-        const wrap = document.createElement("div");
-        wrap.innerHTML = REPORT.top_synth.synth_svg;
-        topCard.appendChild(wrap);
-      }} else {{
-        const p = document.createElement("p");
-        p.className = "muted";
-        p.textContent = "Full-system schematic unavailable. Yosys or Graphviz is probably missing.";
-        topCard.appendChild(p);
-      }}
-      root.appendChild(topCard);
-
-      REPORT.kernels.forEach((kernel, idx) => {{
-        const card = document.createElement("div");
-        card.className = "card synth";
-        const stats = kernel.synth_stats;
-        card.innerHTML = `<div class="section-head"><h2>Synthesis ${{idx}}</h2><div class="badge">per-kernel</div></div>
-          <p class="muted">This is a per-kernel synthesis view. It is useful for localizing cost, but it is not the full assembled design.</p>
-          <div class="metrics">
-            <div class="metric"><div class="label">FPGA Target <span class="help" data-help="Synthesis target used for this kernel-local estimate.">?</span></div><div class="value" style="font-size:16px;">${{stats.fpga_family}} ${{stats.fpga_device.toUpperCase()}}-${{stats.fpga_package}}</div></div>
-            <div class="metric"><div class="label">Fmax <span class="help" data-help="Estimated maximum clock frequency reported by nextpnr for this compiled kernel alone.">?</span></div><div class="value">${{stats.fmax_mhz === null ? "n/a" : stats.fmax_mhz.toFixed(2) + " MHz"}}</div></div>
-            <div class="metric"><div class="label">Synth Wall <span class="help" data-help="Wall-clock time spent running Yosys plus nextpnr for this compiled kernel alone.">?</span></div><div class="value">${{stats.synth_wall_s === null ? "n/a" : stats.synth_wall_s.toFixed(3) + "s"}}</div></div>
-            <div class="metric"><div class="label">LUTs <span class="help" data-help="TRELLIS_COMB cells used by this kernel according to nextpnr utilization output.">?</span></div><div class="value">${{stats.comb}}</div></div>
-            <div class="metric"><div class="label">FFs <span class="help" data-help="TRELLIS_FF cells used by this kernel according to nextpnr utilization output.">?</span></div><div class="value">${{stats.ff}}</div></div>
-            <div class="metric"><div class="label">BRAM <span class="help" data-help="DP16KD block RAM tiles used by this kernel according to nextpnr utilization output.">?</span></div><div class="value">${{stats.dp16kd}}</div></div>
-            <div class="metric"><div class="label">DSP <span class="help" data-help="MULT18X18D DSP tiles used by this kernel according to nextpnr utilization output.">?</span></div><div class="value">${{stats.mult18}}</div></div>
-            <div class="metric"><div class="label">On-chip Bits <span class="help" data-help="Total buffer storage bits for this compiled kernel.">?</span></div><div class="value">${{stats.mem_bits}}</div></div>
-          </div>`;
-        if (kernel.synth_svg) {{
-          const wrap = document.createElement("div");
-          wrap.innerHTML = kernel.synth_svg;
-          card.appendChild(wrap);
-        }} else {{
-          const p = document.createElement("p");
-          p.className = "muted";
-          p.textContent = "Schematic unavailable. Yosys or Graphviz is probably missing.";
-          card.appendChild(p);
-        }}
-        root.appendChild(card);
-      }});
-    }}
-
-    document.querySelectorAll(".tab").forEach(btn => {{
-      btn.addEventListener("click", () => {{
-        document.querySelectorAll(".tab").forEach(el => el.classList.remove("active"));
-        document.querySelectorAll(".panel").forEach(el => el.classList.remove("active"));
-        btn.classList.add("active");
-        document.getElementById(btn.dataset.target).classList.add("active");
-      }});
-    }});
-
-    populateOverview();
-    populateTinygrad();
-    populateKernelIR();
-    populateSynth();
+    renderGraph(document.getElementById("pipeline-graph"),   REPORT.graphs.pipeline);
+    renderGraph(document.getElementById("execution-graph"),  REPORT.graphs.execution);
+    {uop_graph_js}
   </script>
 </body>
 </html>
 """
 
-
-def benchmark(tensor, *extra_outputs, schedule_outputs=None, out_dir: str = "tg2hdl_report") -> BenchmarkArtifact:
+def benchmark(tensor, *extra_outputs, schedule_outputs=None, out_dir: str = "tg2hdl_report",
+              pcie: PCIeModel | None = None) -> BenchmarkArtifact:
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
     _copy_viz_assets(out_path)
+
+    pcie = pcie or PCIeModel()
 
     if schedule_outputs is None:
         schedule = tensor.schedule(*extra_outputs)
@@ -796,12 +598,20 @@ def benchmark(tensor, *extra_outputs, schedule_outputs=None, out_dir: str = "tg2
     top, _connections, kernel_specs = compile_top_module(schedule)
     input_data = _infer_input_data(schedule, pipeline_view, top)
 
+    # Tinygrad reference — warm up first, then time compute and readback separately
+    run_schedule(list(schedule), do_update_stats=False)
+
     t0 = time.perf_counter()
     run_schedule(list(schedule), do_update_stats=False)
-    ref_out = np.array(tensor.numpy(), copy=True).reshape(-1)
-    tinygrad_wall = time.perf_counter() - t0
+    cpu_compute_wall = time.perf_counter() - t0
 
-    sim_out_raw, sim_cycles, sim_wall = simulate_top(top, input_data)
+    t1 = time.perf_counter()
+    ref_out = np.array(tensor.numpy(), copy=True).reshape(-1)
+    cpu_readback_wall = time.perf_counter() - t1
+
+    tinygrad_wall = cpu_compute_wall + cpu_readback_wall
+
+    sim_out_raw, cycle_counts, sim_wall = simulate_top(top, input_data)
     sim_out = _decode_sim_output(sim_out_raw, tensor.dtype).reshape(-1)
 
     if np.issubdtype(ref_out.dtype, np.floating):
@@ -809,12 +619,21 @@ def benchmark(tensor, *extra_outputs, schedule_outputs=None, out_dir: str = "tg2
     else:
         correctness = bool(np.array_equal(ref_out.reshape(-1), sim_out.reshape(-1)))
 
+    # PCIe transfer times
+    input_bytes  = sum(arr.nbytes for arr in input_data.values())
+    output_bytes = sim_out_raw.nbytes
+    pcie_in_s    = pcie.xfer_s(input_bytes)
+    pcie_out_s   = pcie.xfer_s(output_bytes)
+
     report = {
         "summary": {
             "tinygrad_device": str(tensor.device),
             "tinygrad_wall_s": tinygrad_wall,
             "tg2hdl_wall_s": sim_wall,
-            "tg2hdl_cycles": sim_cycles,
+            "tg2hdl_cycles": cycle_counts["compute"],
+            "tg2hdl_load_cycles": cycle_counts["load"],
+            "tg2hdl_readback_cycles": cycle_counts["readback"],
+            "tg2hdl_total_cycles": cycle_counts["total"],
             "correctness": correctness,
             "reference_output": ref_out.reshape(-1).tolist(),
             "sim_output": sim_out.reshape(-1).tolist(),
@@ -822,6 +641,41 @@ def benchmark(tensor, *extra_outputs, schedule_outputs=None, out_dir: str = "tg2
         "graphs": _graph_payload(pipeline_view),
         "top_synth": _top_payload(top, out_path / "synth"),
         "kernels": _kernel_payload(schedule, pipeline_view, kernel_specs, out_path / "synth"),
+    }
+
+    fmax_mhz = report["top_synth"]["synth_stats"]["fmax_mhz"]
+    total_cycles = cycle_counts["total"]
+    fpga_wall_s = (total_cycles / (fmax_mhz * 1e6)) if (fmax_mhz and fmax_mhz > 0) else None
+    fpga_with_pcie_s = (fpga_wall_s + pcie_in_s + pcie_out_s) if fpga_wall_s is not None else None
+
+    def _cycles_to_s(c):
+        return (c / (fmax_mhz * 1e6)) if (fmax_mhz and fmax_mhz > 0) else None
+
+    report["timing"] = {
+        "cpu_compute_s":    cpu_compute_wall,
+        "cpu_readback_s":   cpu_readback_wall,
+        "cpu_wall_s":       tinygrad_wall,
+        "fpga_available":   fpga_wall_s is not None,
+        "fpga_load_s":      _cycles_to_s(cycle_counts["load"]),
+        "fpga_compute_s":   _cycles_to_s(cycle_counts["compute"]),
+        "fpga_readback_s":  _cycles_to_s(cycle_counts["readback"]),
+        "fpga_total_s":     fpga_wall_s,
+        "load_cycles":      cycle_counts["load"],
+        "compute_cycles":   cycle_counts["compute"],
+        "readback_cycles":  cycle_counts["readback"],
+        "total_cycles":     total_cycles,
+        # PCIe model
+        "pcie_in_s":        pcie_in_s,
+        "pcie_out_s":       pcie_out_s,
+        "fpga_with_pcie_s": fpga_with_pcie_s,
+        "pcie_in_bytes":    input_bytes,
+        "pcie_out_bytes":   output_bytes,
+        "pcie_model": {
+            "gen":        pcie.gen,
+            "lanes":      pcie.lanes,
+            "latency_us": pcie.latency_s * 1e6,
+            "bw_gbs":     pcie.bw_bytes_s / 1e9,
+        },
     }
 
     html_path = out_path / "index.html"
@@ -832,6 +686,11 @@ def benchmark(tensor, *extra_outputs, schedule_outputs=None, out_dir: str = "tg2
         tinygrad_device=str(tensor.device),
         tinygrad_wall_s=tinygrad_wall,
         tg2hdl_wall_s=sim_wall,
-        tg2hdl_cycles=sim_cycles,
+        tg2hdl_cycles=cycle_counts["compute"],
+        tg2hdl_total_cycles=total_cycles,
         correctness=correctness,
+        fpga_wall_s=fpga_wall_s,
+        pcie_in_s=pcie_in_s,
+        pcie_out_s=pcie_out_s,
+        fpga_with_pcie_s=fpga_with_pcie_s,
     )

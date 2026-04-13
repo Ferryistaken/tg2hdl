@@ -140,7 +140,8 @@ def _probe_manual_top(
     is_float: bool = False,
 ) -> ScoreboardResult:
     top = TopModule(kernels, connections, _make_buf_depths(kernels))
-    out, cycles, wall = simulate_top(top, input_data)
+    out, cycle_counts, wall = simulate_top(top, input_data)
+    cycles = cycle_counts["compute"]
     if is_float:
         got = out.astype(np.uint32).view(np.float32)
         expected_cmp = expected.astype(np.float32)

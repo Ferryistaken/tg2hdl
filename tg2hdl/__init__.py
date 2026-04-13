@@ -1,3 +1,3 @@
-from .report import BenchmarkArtifact, benchmark
+from .report import BenchmarkArtifact, PCIeModel, benchmark
 
-__all__ = ["BenchmarkArtifact", "benchmark"]
+__all__ = ["BenchmarkArtifact", "PCIeModel", "benchmark"]

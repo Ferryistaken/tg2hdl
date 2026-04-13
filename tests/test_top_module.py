@@ -174,7 +174,7 @@ class TestTopModuleSimulation:
                 if buf_idx in arr_map:
                     input_data[(k_idx, buf_idx)] = arr_map[buf_idx]
 
-        out_top, cycles, _ = simulate_top(top, input_data)
+        out_top, _, _ = simulate_top(top, input_data)
 
         np.testing.assert_array_equal(
             out_top, out1_ref,
@@ -197,7 +197,7 @@ class TestTopModuleSimulation:
                 if buf_idx in arr_map:
                     input_data[(k_idx, buf_idx)] = arr_map[buf_idx]
 
-        out_top, cycles, _ = simulate_top(top, input_data)
+        out_top, _, _ = simulate_top(top, input_data)
         expected = _ref_mlp_small(data)
 
         np.testing.assert_array_equal(out_top, expected)
@@ -217,8 +217,8 @@ class TestTopModuleSimulation:
                 if buf_idx in arr_map:
                     input_data[(k_idx, buf_idx)] = arr_map[buf_idx]
 
-        _, cycles, wall = simulate_top(top, input_data)
-        assert cycles > 0, "No cycles recorded — done never observed"
+        _, cycle_counts, wall = simulate_top(top, input_data)
+        assert cycle_counts["compute"] > 0, "No cycles recorded — done never observed"
         assert wall > 0.0
 
     def test_manual_non_adjacent_dependency(self):
