@@ -14,6 +14,7 @@ from tinygrad.uop.ops import Ops
 from tinygrad.viz.serve import uop_to_json
 
 from compiler import compile_top_module, show_hardware, synthesis_stats
+from compiler.backend import HDLRenderer, _get_uops, uops_to_kernel_ir, _count_cycles_from_root
 from compiler.top_module import simulate_top
 from compiler.visualize import analyze_schedule
 
@@ -28,9 +29,13 @@ class PCIeModel:
     """
     gen: int = 3
     lanes: int = 4
+    # FIXME: DMA latency is a fixed estimate (5 µs); real latency depends on
+    # the specific AXI-DMA IP core, bridge configuration, and host-side driver.
     latency_s: float = 5e-6  # per-direction DMA setup + AXI bridge overhead
 
-    # Practical bandwidth = ~80% of theoretical (encoding + protocol overhead)
+    # FIXME: Practical bandwidth assumes ~80% of theoretical link rate.
+    # Real throughput varies with TLP payload size, MPS/MRRS settings,
+    # and host chipset overhead.  Measure with a DMA loopback test.
     _BW_TABLE: ClassVar[dict] = {
         (1,  1): 0.20e9, (1,  4): 0.80e9, (1,  8): 1.60e9, (1, 16): 3.20e9,
         (2,  1): 0.40e9, (2,  4): 1.60e9, (2,  8): 3.20e9, (2, 16): 6.40e9,
@@ -307,7 +312,314 @@ def _timing_svg(timing: dict) -> str:
         return cpu_chart + fpga_chart
 
 
-def _render_html(report: dict) -> str:
+# ---------------------------------------------------------------------------
+# Flame graph payload + SVG renderer
+# ---------------------------------------------------------------------------
+
+def _flamegraph_payload(schedule, pipeline_view, top, kernel_specs,
+                        cycle_counts: dict, tinygrad_wall: float,
+                        cpu_compute_wall: float, cpu_readback_wall: float) -> dict:
+    """Build flame graph data for both FPGA and CPU execution paths.
+
+    Returns a dict with 'fpga' and 'cpu' keys, each containing a flat list
+    of labeled spans with cycle/time values for SVG rendering.
+    """
+    compute_items = [si for si in schedule if si.ast.op == Ops.SINK]
+    renderer = HDLRenderer()
+
+    # --- FPGA flame graph: per-kernel analytical cycle breakdown ---
+    fpga_spans = []
+    analytical_total = 0
+
+    # Load phase (BRAM writes from simulation)
+    fpga_spans.append({
+        "label": "BRAM load",
+        "cycles": cycle_counts["load"],
+        "type": "load",
+        "estimated": False,
+    })
+
+    # Per-kernel compute spans
+    for exec_k, orig_k in enumerate(pipeline_view.execution_kernel_map):
+        si = compute_items[orig_k]
+        uops = _get_uops(si.ast, renderer)
+        kernel_ir, _ = uops_to_kernel_ir(uops)
+        # FIXME: Cycle count comes from an analytical model (_count_cycles_from_root)
+        # that assumes perfect pipelining with no memory stalls or pipeline bubbles.
+        # The real hardware FSM may differ due to startup/shutdown overhead,
+        # wave grouping, and prologue/epilogue states.
+        k_cycles = _count_cycles_from_root(kernel_ir.loop_tree)
+        analytical_total += k_cycles
+        meta = [str(m.name if hasattr(m, "name") else m) for m in si.metadata]
+        name = f"K{exec_k}" + (f" ({', '.join(meta)})" if meta else "")
+        fpga_spans.append({
+            "label": name,
+            "cycles": k_cycles,
+            "type": "compute",
+            "estimated": True,
+        })
+
+        # Inter-kernel copy groups that follow this kernel
+        for gi, group in enumerate(top._copy_groups.get(exec_k, [])):
+            src_buf = group[0][1]
+            depth = top.buf_depths.get((exec_k, src_buf), 0)
+            # FIXME: Copy cycle count equals buffer depth (one element per clock).
+            # Real DMA copies may have additional setup latency or burst overhead
+            # not captured here.
+            dsts = [f"K{dk}.b{db}" for _, _, dk, db in group]
+            fpga_spans.append({
+                "label": f"copy K{exec_k}.b{src_buf}\u2192{','.join(dsts)}",
+                "cycles": depth,
+                "type": "copy",
+                "estimated": True,
+            })
+            analytical_total += depth
+
+    # FSM overhead residual
+    fsm_overhead = max(0, cycle_counts["compute"] - analytical_total)
+    if fsm_overhead > 0:
+        # FIXME: FSM overhead is the residual between observed simulation cycles
+        # and the sum of analytical per-kernel + copy cycles.  This lumps together
+        # start/done handshake, state-transition latency, and any pipeline stalls.
+        fpga_spans.append({
+            "label": "FSM overhead",
+            "cycles": fsm_overhead,
+            "type": "overhead",
+            "estimated": True,
+        })
+
+    # Readback phase (BRAM reads from simulation)
+    fpga_spans.append({
+        "label": "BRAM readback",
+        "cycles": cycle_counts["readback"],
+        "type": "readback",
+        "estimated": False,
+    })
+
+    # --- CPU flame graph: per-schedule-item timing ---
+    cpu_spans = []
+
+    # Compute phase — distribute proportionally by buffer size
+    # FIXME: Per-item timing for the CPU path is not available because
+    # tinygrad's run_schedule() executes the entire schedule atomically.
+    # We distribute the measured compute wall time proportionally based on
+    # estimated compute cost (total buffer bytes) as a rough approximation.
+    weights = []
+    labels = []
+    for idx, si in enumerate(schedule):
+        bufs = getattr(si, "bufs", [])
+        weight = sum(getattr(b, "nbytes", 0) for b in bufs if b is not None) or 1
+        weights.append(weight)
+        if si.ast.op == Ops.SINK:
+            meta = [str(m.name if hasattr(m, "name") else m) for m in getattr(si, "metadata", ())]
+            labels.append(f"K{idx}" + (f" ({', '.join(meta)})" if meta else ""))
+        elif si.ast.op == Ops.COPY:
+            labels.append(f"Copy {idx}")
+        else:
+            labels.append(f"Op {idx}")
+
+    total_weight = sum(weights) or 1
+    for i, (label, w) in enumerate(zip(labels, weights)):
+        frac = w / total_weight
+        cpu_spans.append({
+            "label": label,
+            "time_s": cpu_compute_wall * frac,
+            "type": "compute",
+            "estimated": True,
+        })
+
+    # Readback phase — measured directly
+    cpu_spans.append({
+        "label": "numpy readback",
+        "time_s": cpu_readback_wall,
+        "type": "readback",
+        "estimated": False,
+    })
+
+    return {"fpga": fpga_spans, "cpu": cpu_spans}
+
+
+def _flamegraph_svg(fg: dict, fmax_mhz: float | None) -> str:
+    """Render flame graph spans as stacked horizontal SVG bars.
+
+    FPGA spans are shown in cycles (and estimated wall time if fmax is known).
+    CPU spans are shown in time units.
+    """
+    W = 700
+    LEFT = 4
+    RIGHT = 4
+    BAR_H = 20
+    GAP = 2
+    TOP_PAD = 18
+    LABEL_PAD = 4
+
+    COLORS = {
+        "load":     "#1f7a43",
+        "compute":  "#d88412",
+        "copy":     "#5a8fc4",
+        "readback": "#a05cb0",
+        "overhead": "#888888",
+    }
+
+    parts = []
+
+    def _render_span_chart(title: str, spans: list, value_key: str,
+                           domain: float, fmt_val, y_offset: int) -> int:
+        """Render one set of spans; returns total height consumed."""
+        bar_w = W - LEFT - RIGHT
+        n = len(spans)
+        chart_h = TOP_PAD + n * (BAR_H + GAP) + 4
+
+        parts.append(f'<text x="{LEFT}" y="{y_offset + 13}" '
+                     f'font-weight="bold" fill="#111" font-size="12">{title}</text>')
+
+        for i, span in enumerate(spans):
+            y = y_offset + TOP_PAD + i * (BAR_H + GAP)
+            val = span[value_key]
+            pct = (val / domain * 100) if domain > 0 else 0
+            px = max(bar_w * val / domain, 1) if domain > 0 else 1
+
+            color = COLORS.get(span["type"], "#999")
+            est_marker = "\u2020" if span.get("estimated") else ""
+
+            # Bar
+            parts.append(
+                f'<rect x="{LEFT}" y="{y}" width="{px:.1f}" height="{BAR_H}" '
+                f'fill="{color}" rx="2">'
+                f'<title>{html.escape(span["label"])}: {fmt_val(val)} ({pct:.1f}%)'
+                f'{"  [estimated]" if span.get("estimated") else ""}</title>'
+                f'</rect>'
+            )
+
+            # Label inside bar (if wide enough) or to the right
+            label_text = f'{est_marker}{span["label"]}  {fmt_val(val)} ({pct:.1f}%)'
+            text_x = LEFT + LABEL_PAD
+            text_color = "#fff"
+            if px < 180:
+                text_x = LEFT + px + LABEL_PAD
+                text_color = "#111"
+            parts.append(
+                f'<text x="{text_x:.1f}" y="{y + BAR_H - 5}" fill="{text_color}" '
+                f'font-size="10" clip-path="url(#clip-fg)">{html.escape(label_text)}</text>'
+            )
+
+        return chart_h
+
+    # --- FPGA chart ---
+    fpga_spans = fg.get("fpga", [])
+    fpga_total_cycles = sum(s["cycles"] for s in fpga_spans)
+
+    def fmt_cycles(c):
+        if fmax_mhz and fmax_mhz > 0:
+            wall = c / (fmax_mhz * 1e6)
+            m, u = _pick_unit(wall)
+            return f"{c:,} cyc ({wall * m:.3f} {u})"
+        return f"{c:,} cyc"
+
+    fmax_note = f" @ {fmax_mhz:.1f} MHz" if fmax_mhz else " (no Fmax)"
+    y = 0
+    fpga_h = _render_span_chart(
+        f"FPGA execution{fmax_note}  [\u2020 = estimated]",
+        fpga_spans, "cycles", fpga_total_cycles, fmt_cycles, y,
+    )
+    y += fpga_h + 12
+
+    # --- CPU chart ---
+    cpu_spans = fg.get("cpu", [])
+    cpu_total_s = sum(s["time_s"] for s in cpu_spans)
+    mult_cpu, unit_cpu = _pick_unit(cpu_total_s)
+
+    def fmt_time(t):
+        return f"{t * mult_cpu:.4g} {unit_cpu}"
+
+    cpu_h = _render_span_chart(
+        f"CPU execution  [\u2020 = estimated]",
+        cpu_spans, "time_s", cpu_total_s, fmt_time, y,
+    )
+    y += cpu_h
+
+    total_h = y + 4
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{total_h}" '
+        f'style="font-family:monospace;font-size:11px;display:block;margin:4px 0 8px 0;">\n'
+        f'<defs><clipPath id="clip-fg"><rect x="0" y="0" width="{W}" height="{total_h}"/>'
+        f'</clipPath></defs>\n'
+    )
+    svg += "\n".join(parts)
+    svg += "\n</svg>"
+    return svg
+
+
+# -- Estimates & Assumptions --
+
+_ESTIMATES_AND_ASSUMPTIONS = [
+    {
+        "id": "analytical_cycle_model",
+        "scope": "tg2hdl",
+        "title": "Analytical cycle model",
+        "description": (
+            "Per-kernel cycle counts use _count_cycles_from_root() which assumes "
+            "perfect pipelining with no memory stalls or pipeline bubbles. The real "
+            "hardware FSM may differ due to wave grouping, prologue/epilogue states, "
+            "and memory arbitration overhead."
+        ),
+    },
+    {
+        "id": "fsm_overhead_residual",
+        "scope": "tg2hdl",
+        "title": "FSM overhead (residual)",
+        "description": (
+            "Computed as the difference between observed simulation cycle count and "
+            "the sum of analytical per-kernel + copy cycles. Lumps together start/done "
+            "handshake, state-transition latency, and pipeline stalls into one bucket."
+        ),
+    },
+    {
+        "id": "copy_cycles_from_depth",
+        "scope": "tg2hdl",
+        "title": "Copy cycles = buffer depth",
+        "description": (
+            "Inter-kernel DMA copy cycles are set equal to the source buffer depth "
+            "(one element per clock). Real copies may have burst setup latency or "
+            "arbitration overhead not captured here."
+        ),
+    },
+    {
+        "id": "pcie_transfer_model",
+        "scope": "tg2hdl",
+        "title": "PCIe transfer time",
+        "description": (
+            "PCIe transfer times use a fixed bandwidth table (80% of theoretical "
+            "link rate) and a constant 5 \u00b5s per-direction DMA latency. Real throughput "
+            "depends on TLP payload size, MPS/MRRS settings, and host chipset."
+        ),
+    },
+    {
+        "id": "fpga_wall_from_fmax",
+        "scope": "tg2hdl",
+        "title": "FPGA wall time = cycles / Fmax",
+        "description": (
+            "FPGA wall time is derived by dividing total cycles by the synthesised "
+            "Fmax. Actual deployed clock may differ due to voltage/temperature "
+            "derating or user-selected clock constraints."
+        ),
+    },
+    {
+        "id": "cpu_per_item_proportional",
+        "scope": "native",
+        "title": "CPU per-item timing (proportional)",
+        "description": (
+            "tinygrad\u2019s run_schedule() executes the full schedule atomically, "
+            "so per-schedule-item CPU time is unavailable. The flame graph distributes "
+            "measured compute wall time proportionally by buffer byte size \u2014 a rough "
+            "approximation that does not reflect actual per-kernel compute cost."
+        ),
+    },
+]
+
+
+def _render_html(report: dict, flamegraph_svg: str = "",
+                 estimates: list | None = None) -> str:
     report_json = json.dumps(report)
     s = report["summary"]
     t = report["timing"]
@@ -374,6 +686,16 @@ def _render_html(report: dict) -> str:
         f'{pm["bw_gbs"]:.2f} GB/s practical, '
         f'{pm["latency_us"]:.1f} µs per-direction DMA latency'
     )
+
+    # Estimates & Assumptions table rows
+    est_list = estimates if estimates is not None else _ESTIMATES_AND_ASSUMPTIONS
+    estimates_rows = ""
+    for e in est_list:
+        estimates_rows += (
+            f'<tr><td>{html.escape(e["scope"])}</td>'
+            f'<td>{html.escape(e["title"])}</td>'
+            f'<td style="white-space:normal">{html.escape(e["description"])}</td></tr>\n'
+        )
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -478,7 +800,27 @@ def _render_html(report: dict) -> str:
   {schematic_sections}
   </div>
 
-  <h2>10. tinygrad UOp Graphs</h2>
+  <h2>10. Flame Graph</h2>
+  <p style="margin-bottom:2px">Per-phase execution breakdown.  Color key:
+  <span style="color:#1f7a43">■ load</span> &nbsp;
+  <span style="color:#d88412">■ compute</span> &nbsp;
+  <span style="color:#5a8fc4">■ copy/PCIe</span> &nbsp;
+  <span style="color:#a05cb0">■ readback</span> &nbsp;
+  <span style="color:#888">■ overhead</span> &nbsp;
+  († = estimated value — see §11)
+  </p>
+  {flamegraph_svg}
+
+  <h2>11. Estimates &amp; Assumptions</h2>
+  <p>Values marked with † in the flame graph, and timing estimates throughout
+  this report, rely on models documented below.  Each corresponds to a
+  <code>FIXME</code> comment in the source code.</p>
+  <table>
+    <tr><th>Scope</th><th>Assumption</th><th>Description</th></tr>
+    {estimates_rows}
+  </table>
+
+  <h2>12. tinygrad UOp Graphs</h2>
   {uop_graph_divs}
 
   <script>
@@ -678,8 +1020,16 @@ def benchmark(tensor, *extra_outputs, schedule_outputs=None, out_dir: str = "tg2
         },
     }
 
+    # Flame graph
+    fg = _flamegraph_payload(
+        schedule, pipeline_view, top, kernel_specs,
+        cycle_counts, tinygrad_wall, cpu_compute_wall, cpu_readback_wall,
+    )
+    fg_svg = _flamegraph_svg(fg, fmax_mhz)
+
     html_path = out_path / "index.html"
-    html_path.write_text(_render_html(report))
+    html_path.write_text(_render_html(report, flamegraph_svg=fg_svg,
+                                      estimates=_ESTIMATES_AND_ASSUMPTIONS))
     return BenchmarkArtifact(
         output_dir=str(out_path),
         report_path=str(html_path),
