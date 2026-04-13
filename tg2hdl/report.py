@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import json
+import re
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -14,7 +15,6 @@ from tinygrad.uop.ops import Ops
 from tinygrad.viz.serve import uop_to_json
 
 from compiler import compile_top_module, show_hardware, synthesis_stats
-from compiler.backend import HDLRenderer, _get_uops, uops_to_kernel_ir, _count_cycles_from_root
 from compiler.top_module import simulate_top
 from compiler.visualize import analyze_schedule
 
@@ -121,6 +121,54 @@ def _graph_payload(view) -> dict[str, dict]:
         "pipeline": view.graph_json(),
         "execution": view.execution_graph_json(),
     }
+
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text)
+
+
+def _format_metadata(meta) -> str:
+    names = [str(m.name if hasattr(m, "name") else m) for m in meta]
+    return f" ({', '.join(names)})" if names else ""
+
+
+def _measure_cpu_schedule(schedule) -> tuple[list[dict], float]:
+    spans = []
+    total = 0.0
+    compute_idx = 0
+    copy_idx = 0
+
+    for si in schedule:
+        ei = si.lower()
+        t0 = time.perf_counter()
+        et = ei.run(wait=True, do_update_stats=False)
+        dt = et if et is not None else (time.perf_counter() - t0)
+        total += dt
+
+        if si.ast.op == Ops.SINK:
+            label = f"K{compute_idx}{_format_metadata(getattr(si, 'metadata', ()))}"
+            span_type = "compute"
+            compute_idx += 1
+        elif si.ast.op == Ops.COPY:
+            label = f"copy {copy_idx}"
+            span_type = "copy"
+            copy_idx += 1
+        else:
+            label = _strip_ansi(getattr(getattr(ei, "prg", None), "display_name", si.ast.op.name)).strip() or si.ast.op.name
+            span_type = "overhead"
+
+        spans.append({
+            "label": label,
+            "time_s": dt,
+            "type": span_type,
+            "estimated": False,
+            "detail": _strip_ansi(getattr(getattr(ei, "prg", None), "display_name", "")).strip(),
+        })
+
+    return spans, total
 
 
 def _kernel_payload(schedule, pipeline_view, kernel_specs, synth_dir: Path) -> list[dict]:
@@ -316,276 +364,312 @@ def _timing_svg(timing: dict) -> str:
 # Flame graph payload + SVG renderer
 # ---------------------------------------------------------------------------
 
-def _flamegraph_payload(schedule, pipeline_view, top, kernel_specs,
-                        cycle_counts: dict, tinygrad_wall: float,
-                        cpu_compute_wall: float, cpu_readback_wall: float) -> dict:
-    """Build flame graph data for both FPGA and CPU execution paths.
+def _fg_node(label: str, value: float, node_type: str, *, estimated: bool = False,
+             detail: str = "", children: list[dict] | None = None) -> dict:
+    return {
+        "label": label,
+        "value": value,
+        "type": node_type,
+        "estimated": estimated,
+        "detail": detail,
+        "children": list(children or []),
+    }
 
-    Returns a dict with 'fpga' and 'cpu' keys, each containing a flat list
-    of labeled spans with cycle/time values for SVG rendering.
-    """
+
+def _resource_summary(stats: dict | None) -> str:
+    if not stats:
+        return ""
+    parts = []
+    fmax = stats.get("fmax_mhz")
+    if fmax is not None:
+        parts.append(f"Fmax {fmax:.1f} MHz")
+    for key, label in (("comb", "LUT"), ("ff", "FF"), ("dp16kd", "BRAM"), ("mult18", "DSP")):
+        if stats.get(key) is not None:
+            parts.append(f"{label} {stats[key]}")
+    return ", ".join(parts)
+
+
+def _flamegraph_payload(schedule, pipeline_view, top, cycle_counts: dict, cpu_spans: list[dict],
+                        cpu_readback_wall: float, timing: dict, kernels: list[dict],
+                        fmax_mhz: float | None) -> dict:
+    """Build hierarchical flame graph data for FPGA and CPU."""
     compute_items = [si for si in schedule if si.ast.op == Ops.SINK]
-    renderer = HDLRenderer()
+    # FIXME: When Fmax is present, the FPGA flame graph uses derived wall time
+    # (cycles / synthesized Fmax), not a directly measured board-level runtime.
+    state_cycles = cycle_counts.get("states", {})
+    fmax_hz = (fmax_mhz * 1e6) if (fmax_mhz and fmax_mhz > 0) else None
 
-    # --- FPGA flame graph: per-kernel analytical cycle breakdown ---
-    fpga_spans = []
-    analytical_total = 0
+    def cyc_to_val(cycles: int) -> float:
+        return (cycles / fmax_hz) if fmax_hz else float(cycles)
 
-    # Load phase (BRAM writes from simulation)
-    fpga_spans.append({
-        "label": "BRAM load",
-        "cycles": cycle_counts["load"],
-        "type": "load",
-        "estimated": False,
-    })
+    def cyc_detail(cycles: int) -> str:
+        if fmax_hz:
+            m, u = _pick_unit(cycles / fmax_hz)
+            return f"{cycles} cyc, {(cycles / fmax_hz) * m:.4g} {u}"
+        return f"{cycles} cyc"
 
-    # Per-kernel compute spans
+    fpga_compute_children = []
+    measured_compute_cycles = 0
     for exec_k, orig_k in enumerate(pipeline_view.execution_kernel_map):
         si = compute_items[orig_k]
-        uops = _get_uops(si.ast, renderer)
-        kernel_ir, _ = uops_to_kernel_ir(uops)
-        # FIXME: Cycle count comes from an analytical model (_count_cycles_from_root)
-        # that assumes perfect pipelining with no memory stalls or pipeline bubbles.
-        # The real hardware FSM may differ due to startup/shutdown overhead,
-        # wave grouping, and prologue/epilogue states.
-        k_cycles = _count_cycles_from_root(kernel_ir.loop_tree)
-        analytical_total += k_cycles
-        meta = [str(m.name if hasattr(m, "name") else m) for m in si.metadata]
-        name = f"K{exec_k}" + (f" ({', '.join(meta)})" if meta else "")
-        fpga_spans.append({
-            "label": name,
-            "cycles": k_cycles,
-            "type": "compute",
-            "estimated": True,
-        })
+        run_cycles = state_cycles.get(f"K{exec_k}_RUN", 0)
+        wait_cycles = state_cycles.get(f"K{exec_k}_WAIT", 0)
+        kernel_cycles = run_cycles + wait_cycles
+        measured_compute_cycles += kernel_cycles
+        kstats = kernels[exec_k]["synth_stats"] if exec_k < len(kernels) else {}
+        kchildren = []
+        if run_cycles > 0:
+            kchildren.append(_fg_node("RUN", cyc_to_val(run_cycles), "compute", detail=cyc_detail(run_cycles)))
+        if wait_cycles > 0:
+            kchildren.append(_fg_node("WAIT", cyc_to_val(wait_cycles), "overhead", detail=cyc_detail(wait_cycles)))
+        fpga_compute_children.append(_fg_node(
+            f"K{exec_k}{_format_metadata(si.metadata)}",
+            cyc_to_val(kernel_cycles),
+            "compute",
+            detail=_resource_summary(kstats),
+            children=kchildren,
+        ))
 
-        # Inter-kernel copy groups that follow this kernel
         for gi, group in enumerate(top._copy_groups.get(exec_k, [])):
             src_buf = group[0][1]
-            depth = top.buf_depths.get((exec_k, src_buf), 1)
-            # FIXME: Copy cycle count equals buffer depth (one element per clock).
-            # Real DMA copies may have additional setup latency or burst overhead
-            # not captured here.
             dsts = [f"K{dk}.b{db}" for _, _, dk, db in group]
-            fpga_spans.append({
-                "label": f"copy K{exec_k}.b{src_buf}\u2192{','.join(dsts)}",
-                "cycles": depth,
-                "type": "copy",
-                "estimated": True,
-            })
-            analytical_total += depth
+            copy_cycles = state_cycles.get(f"K{exec_k}_COPY_{gi}", 0)
+            measured_compute_cycles += copy_cycles
+            fpga_compute_children.append(_fg_node(
+                f"copy K{exec_k}.b{src_buf}\u2192{','.join(dsts)}",
+                cyc_to_val(copy_cycles),
+                "copy",
+                detail=cyc_detail(copy_cycles),
+            ))
 
-    # FSM overhead residual
-    fsm_overhead = max(0, cycle_counts["compute"] - analytical_total)
-    if fsm_overhead > 0:
-        # FIXME: FSM overhead is the residual between observed simulation cycles
-        # and the sum of analytical per-kernel + copy cycles.  This lumps together
-        # start/done handshake, state-transition latency, and any pipeline stalls.
-        fpga_spans.append({
-            "label": "FSM overhead",
-            "cycles": fsm_overhead,
-            "type": "overhead",
-            "estimated": True,
-        })
+    fpga_overhead_cycles = max(0, cycle_counts["compute"] - measured_compute_cycles)
+    if fpga_overhead_cycles > 0:
+        fpga_compute_children.append(_fg_node(
+            "FSM/control overhead",
+            cyc_to_val(fpga_overhead_cycles),
+            "overhead",
+            detail=cyc_detail(fpga_overhead_cycles),
+        ))
 
-    # Readback phase (BRAM reads from simulation)
-    fpga_spans.append({
-        "label": "BRAM readback",
-        "cycles": cycle_counts["readback"],
-        "type": "readback",
-        "estimated": False,
-    })
+    fpga_in_children = []
+    if timing.get("pcie_in_s") is not None and fmax_hz:
+        # FIXME: PCIe transfer leaves are still model-based, not measured from a
+        # real PCIe-enabled FPGA DMA path or hardware timestamp source.
+        fpga_in_children.append(_fg_node(
+            "PCIe host→FPGA",
+            timing["pcie_in_s"],
+            "copy",
+            estimated=True,
+            detail=f"{timing['pcie_in_bytes']} B",
+        ))
+    fpga_in_children.append(_fg_node(
+        "BRAM load",
+        cyc_to_val(cycle_counts["load"]),
+        "load",
+        detail=cyc_detail(cycle_counts["load"]),
+    ))
 
-    # --- CPU flame graph: per-schedule-item timing ---
-    cpu_spans = []
+    fpga_out_children = [
+        _fg_node("BRAM readback", cyc_to_val(cycle_counts["readback"]), "readback",
+                 detail=cyc_detail(cycle_counts["readback"]))
+    ]
+    if timing.get("pcie_out_s") is not None and fmax_hz:
+        # FIXME: PCIe transfer leaves are still model-based, not measured from a
+        # real PCIe-enabled FPGA DMA path or hardware timestamp source.
+        fpga_out_children.append(_fg_node(
+            "PCIe FPGA→host",
+            timing["pcie_out_s"],
+            "copy",
+            estimated=True,
+            detail=f"{timing['pcie_out_bytes']} B",
+        ))
 
-    # Compute phase — distribute proportionally by buffer size
-    # FIXME: Per-item timing for the CPU path is not available because
-    # tinygrad's run_schedule() executes the entire schedule atomically.
-    # We distribute the measured compute wall time proportionally based on
-    # estimated compute cost (total buffer bytes) as a rough approximation.
-    weights = []
-    labels = []
-    compute_idx = 0
-    for idx, si in enumerate(schedule):
-        bufs = getattr(si, "bufs", [])
-        weight = sum(getattr(b, "nbytes", 0) for b in bufs if b is not None) or 1
-        weights.append(weight)
-        if si.ast.op == Ops.SINK:
-            meta = [str(m.name if hasattr(m, "name") else m) for m in getattr(si, "metadata", ())]
-            labels.append(f"K{compute_idx}" + (f" ({', '.join(meta)})" if meta else ""))
-            compute_idx += 1
-        elif si.ast.op == Ops.COPY:
-            labels.append(f"Copy {idx}")
-        else:
-            labels.append(f"Op {idx}")
+    fpga_phase_nodes = [
+        _fg_node("Input transfer", sum(c["value"] for c in fpga_in_children), "load", children=fpga_in_children),
+        _fg_node("Compute", sum(c["value"] for c in fpga_compute_children), "compute", children=fpga_compute_children),
+        _fg_node("Output transfer", sum(c["value"] for c in fpga_out_children), "readback", children=fpga_out_children),
+    ]
+    fpga_total = _fg_node(
+        "FPGA total",
+        sum(c["value"] for c in fpga_phase_nodes),
+        "overhead",
+        children=[c for c in fpga_phase_nodes if c["value"] > 0],
+    )
 
-    total_weight = sum(weights) or 1
-    for i, (label, w) in enumerate(zip(labels, weights)):
-        frac = w / total_weight
-        cpu_spans.append({
-            "label": label,
-            "time_s": cpu_compute_wall * frac,
-            "type": "compute",
-            "estimated": True,
-        })
+    cpu_input_children = [span for span in cpu_spans if span["type"] == "copy"]
+    cpu_compute_children = [span for span in cpu_spans if span["type"] == "compute"]
+    cpu_overhead_children = [span for span in cpu_spans if span["type"] not in {"copy", "compute"}]
 
-    # Readback phase — measured directly
-    cpu_spans.append({
-        "label": "numpy readback",
-        "time_s": cpu_readback_wall,
-        "type": "readback",
-        "estimated": False,
-    })
+    cpu_phase_nodes = []
+    if cpu_input_children:
+        cpu_phase_nodes.append(_fg_node(
+            "Input transfer",
+            sum(s["time_s"] for s in cpu_input_children),
+            "copy",
+            children=[_fg_node(s["label"], s["time_s"], s["type"], detail=s.get("detail", "")) for s in cpu_input_children],
+        ))
+    if cpu_compute_children:
+        cpu_phase_nodes.append(_fg_node(
+            "Compute",
+            sum(s["time_s"] for s in cpu_compute_children),
+            "compute",
+            children=[_fg_node(s["label"], s["time_s"], s["type"], detail=s.get("detail", "")) for s in cpu_compute_children],
+        ))
+    if cpu_overhead_children:
+        cpu_phase_nodes.append(_fg_node(
+            "Runtime overhead",
+            sum(s["time_s"] for s in cpu_overhead_children),
+            "overhead",
+            children=[_fg_node(s["label"], s["time_s"], s["type"], detail=s.get("detail", "")) for s in cpu_overhead_children],
+        ))
 
-    return {"fpga": fpga_spans, "cpu": cpu_spans}
+    cpu_out_children = [_fg_node("numpy readback", cpu_readback_wall, "readback")]
+    cpu_phase_nodes.append(_fg_node("Output transfer", cpu_readback_wall, "readback", children=cpu_out_children))
+    cpu_total = _fg_node("CPU total", sum(c["value"] for c in cpu_phase_nodes), "overhead", children=cpu_phase_nodes)
+
+    unit = "time_s" if fmax_hz else "cycles"
+    return {"fpga": fpga_total, "cpu": cpu_total, "unit": unit}
 
 
 def _flamegraph_svg(fg: dict, fmax_mhz: float | None) -> str:
-    """Render flame graph spans as stacked horizontal SVG bars.
+    """Render hierarchical flame graphs with independent zoomable panels."""
+    W = 1040
+    LEFT = 8
+    RIGHT = 8
+    TITLE_H = 18
+    BAR_H = 28
+    LEVEL_GAP = 3
+    TEXT_PAD = 4
+    bar_w = W - LEFT - RIGHT
 
-    FPGA spans are shown in cycles (and estimated wall time if fmax is known).
-    CPU spans are shown in time units.
-    """
-    W = 700
-    LEFT = 4
-    RIGHT = 4
-    BAR_H = 20
-    GAP = 2
-    TOP_PAD = 18
-    LABEL_PAD = 4
-
-    COLORS = {
-        "load":     "#1f7a43",
-        "compute":  "#d88412",
-        "copy":     "#5a8fc4",
-        "readback": "#a05cb0",
-        "overhead": "#888888",
+    BASE_COLORS = {
+        "load": (0x53, 0x9b, 0x4b),
+        "compute": (0xe2, 0x86, 0x2b),
+        "copy": (0x63, 0x97, 0xc5),
+        "readback": (0xb2, 0x61, 0xb9),
+        "overhead": (0x8b, 0x8b, 0x8b),
     }
 
-    parts = []
+    def _mix_color(rgb: tuple[int, int, int], factor: float) -> str:
+        factor = max(-0.35, min(0.35, factor))
+        if factor >= 0:
+            vals = [int(c + (255 - c) * factor) for c in rgb]
+        else:
+            vals = [int(c * (1 + factor)) for c in rgb]
+        return f"#{vals[0]:02x}{vals[1]:02x}{vals[2]:02x}"
 
-    def _render_span_chart(title: str, spans: list, value_key: str,
-                           domain: float, fmt_val, y_offset: int) -> int:
-        """Render one set of spans; returns total height consumed."""
-        bar_w = W - LEFT - RIGHT
-        n = len(spans)
-        chart_h = TOP_PAD + n * (BAR_H + GAP) + 4
+    def _span_fill(node: dict) -> str:
+        base = BASE_COLORS.get(node["type"], (0x99, 0x99, 0x99))
+        jitter = (((sum(ord(c) for c in node["label"]) % 13) - 6) / 30.0)
+        return _mix_color(base, jitter)
 
-        parts.append(f'<text x="{LEFT}" y="{y_offset + 13}" '
-                     f'font-weight="bold" fill="#111" font-size="12">{title}</text>')
+    def _trim_label(text: str, width_px: float) -> str:
+        approx_chars = max(int((width_px - 2 * TEXT_PAD) / 6.7), 0)
+        if approx_chars <= 0:
+            return ""
+        if len(text) <= approx_chars:
+            return text
+        if approx_chars <= 3:
+            return ""
+        return text[:approx_chars - 1] + "…"
 
-        for i, span in enumerate(spans):
-            y = y_offset + TOP_PAD + i * (BAR_H + GAP)
-            val = span[value_key]
-            pct = (val / domain * 100) if domain > 0 else 0
-            px = max(bar_w * val / domain, 1) if domain > 0 else 1
+    def _max_depth(node: dict) -> int:
+        kids = node.get("children") or []
+        return 1 if not kids else 1 + max(_max_depth(child) for child in kids)
 
-            color = COLORS.get(span["type"], "#999")
-            est_marker = "\u2020" if span.get("estimated") else ""
-
-            # Bar
+    def _render_node(node: dict, x: float, width: float, depth_from_root: int, max_depth: int,
+                     fmt_val, domain: float, y_base: int, parts: list[str], clip_id: str) -> None:
+        y = y_base + (max_depth - depth_from_root - 1) * (BAR_H + LEVEL_GAP)
+        pct = (node["value"] / domain * 100) if domain > 0 else 0
+        est_note = " [estimated]" if node.get("estimated") else ""
+        tooltip = f'{node["label"]}: {fmt_val(node["value"])} ({pct:.1f}%){est_note}'
+        if node.get("detail"):
+            tooltip += f" | {node['detail']}"
+        parts.append(
+            f'<rect x="{x:.2f}" y="{y:.2f}" width="{max(width, 1):.2f}" height="{BAR_H}" '
+            f'fill="{_span_fill(node)}" stroke="#fff7eb" stroke-width="1">'
+            f'<title>{html.escape(tooltip)}</title></rect>'
+        )
+        text = _trim_label(node["label"], width)
+        if text:
             parts.append(
-                f'<rect x="{LEFT}" y="{y}" width="{px:.1f}" height="{BAR_H}" '
-                f'fill="{color}" rx="2">'
-                f'<title>{html.escape(span["label"])}: {fmt_val(val)} ({pct:.1f}%)'
-                f'{"  [estimated]" if span.get("estimated") else ""}</title>'
-                f'</rect>'
+                f'<text x="{x + TEXT_PAD:.2f}" y="{y + 18:.2f}" fill="#24170b" font-size="10" '
+                f'clip-path="url(#{clip_id})">{html.escape(text)}</text>'
             )
 
-            # Label inside bar (if wide enough) or to the right
-            label_text = f'{est_marker}{span["label"]}  {fmt_val(val)} ({pct:.1f}%)'
-            text_x = LEFT + LABEL_PAD
-            text_color = "#fff"
-            if px < 180:
-                text_x = LEFT + px + LABEL_PAD
-                text_color = "#111"
-            parts.append(
-                f'<text x="{text_x:.1f}" y="{y + BAR_H - 5}" fill="{text_color}" '
-                f'font-size="10" clip-path="url(#clip-fg)">{html.escape(label_text)}</text>'
-            )
+        children = [child for child in (node.get("children") or []) if child["value"] > 0]
+        if not children:
+            return
 
-        return chart_h
+        cursor = x
+        total_child_value = sum(child["value"] for child in children)
+        for idx, child in enumerate(children):
+            child_width = width * child["value"] / total_child_value if total_child_value > 0 else 0
+            if idx == len(children) - 1:
+                child_width = (x + width) - cursor
+            _render_node(child, cursor, child_width, depth_from_root + 1, max_depth, fmt_val, domain, y_base, parts, clip_id)
+            cursor += child_width
 
-    # --- FPGA chart ---
-    fpga_spans = fg.get("fpga", [])
-    fpga_total_cycles = sum(s["cycles"] for s in fpga_spans)
+    def _render_chart_svg(title: str, root: dict, fmt_val, chart_id: str) -> str:
+        max_depth = _max_depth(root)
+        chart_h = TITLE_H + max_depth * BAR_H + (max_depth - 1) * LEVEL_GAP + 4
+        clip_id = f"clip-fg-{chart_id}"
+        parts: list[str] = [
+            f'<text x="{LEFT}" y="13" font-weight="bold" fill="#111" font-size="12">{html.escape(title)}</text>'
+        ]
+        _render_node(root, LEFT, bar_w, 0, max_depth, fmt_val, root["value"], TITLE_H, parts, clip_id)
+        svg = (
+            f'<svg class="flamegraph-svg" xmlns="http://www.w3.org/2000/svg" width="{W}" height="{chart_h}" '
+            f'data-base-width="{W}" style="font-family:monospace;font-size:11px;display:block;margin:0;">\n'
+            f'<defs><clipPath id="{clip_id}"><rect x="0" y="0" width="{W * 8}" height="{chart_h}"/></clipPath></defs>\n'
+        )
+        svg += f'<g class="flamegraph-root" transform="scale(1,1)">\n'
+        svg += "\n".join(parts)
+        svg += "\n</g>"
+        svg += "\n</svg>"
+        return svg
 
-    def fmt_cycles(c):
-        if fmax_mhz and fmax_mhz > 0:
-            wall = c / (fmax_mhz * 1e6)
-            m, u = _pick_unit(wall)
-            return f"{c:,} cyc ({wall * m:.3f} {u})"
-        return f"{c:,} cyc"
+    def fmt_fpga(v: float) -> str:
+        if fg.get("unit") == "time_s":
+            mult, unit = _pick_unit(v)
+            return f"{v * mult:.4g} {unit}"
+        return f"{int(round(v))} cyc"
 
-    fmax_note = f" @ {fmax_mhz:.1f} MHz" if fmax_mhz else " (no Fmax)"
-    y = 0
-    fpga_h = _render_span_chart(
-        f"FPGA execution{fmax_note}  [\u2020 = estimated]",
-        fpga_spans, "cycles", fpga_total_cycles, fmt_cycles, y,
+    cpu_total = fg["cpu"]["value"]
+    mult_cpu, unit_cpu = _pick_unit(cpu_total)
+
+    def fmt_cpu(v: float) -> str:
+        return f"{v * mult_cpu:.4g} {unit_cpu}"
+
+    fmax_note = f" @ {fmax_mhz:.1f} MHz" if (fmax_mhz and fg.get("unit") == "time_s") else ""
+    fpga_svg = _render_chart_svg(f"FPGA execution{fmax_note}", fg["fpga"], fmt_fpga, "fpga")
+    cpu_svg = _render_chart_svg("CPU execution", fg["cpu"], fmt_cpu, "cpu")
+
+    return (
+        '<div class="flamegraph-panel" data-default-zoom="2.5">'
+        '<div class="flamegraph-controls">'
+        '<button type="button" class="flamegraph-btn" data-zoom-step="-0.25">-</button>'
+        '<input class="flamegraph-zoom" type="range" min="1" max="8" step="0.25" value="2.5" />'
+        '<button type="button" class="flamegraph-btn" data-zoom-step="0.25">+</button>'
+        '<span class="flamegraph-zoom-label">2.50x</span>'
+        '</div>'
+        f'<div class="flamegraph-scroll">{fpga_svg}</div>'
+        '</div>'
+        '<div class="flamegraph-panel" data-default-zoom="1.25">'
+        '<div class="flamegraph-controls">'
+        '<button type="button" class="flamegraph-btn" data-zoom-step="-0.25">-</button>'
+        '<input class="flamegraph-zoom" type="range" min="1" max="8" step="0.25" value="1.25" />'
+        '<button type="button" class="flamegraph-btn" data-zoom-step="0.25">+</button>'
+        '<span class="flamegraph-zoom-label">1.25x</span>'
+        '</div>'
+        f'<div class="flamegraph-scroll">{cpu_svg}</div>'
+        '</div>'
     )
-    y += fpga_h + 12
-
-    # --- CPU chart ---
-    cpu_spans = fg.get("cpu", [])
-    cpu_total_s = sum(s["time_s"] for s in cpu_spans)
-    mult_cpu, unit_cpu = _pick_unit(cpu_total_s)
-
-    def fmt_time(t):
-        return f"{t * mult_cpu:.4g} {unit_cpu}"
-
-    cpu_h = _render_span_chart(
-        f"CPU execution  [\u2020 = estimated]",
-        cpu_spans, "time_s", cpu_total_s, fmt_time, y,
-    )
-    y += cpu_h
-
-    total_h = y + 4
-    svg = (
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{total_h}" '
-        f'style="font-family:monospace;font-size:11px;display:block;margin:4px 0 8px 0;">\n'
-        f'<defs><clipPath id="clip-fg"><rect x="0" y="0" width="{W}" height="{total_h}"/>'
-        f'</clipPath></defs>\n'
-    )
-    svg += "\n".join(parts)
-    svg += "\n</svg>"
-    return svg
 
 
 # -- Estimates & Assumptions --
 
 _ESTIMATES_AND_ASSUMPTIONS = [
-    {
-        "id": "analytical_cycle_model",
-        "scope": "tg2hdl",
-        "title": "Analytical cycle model",
-        "description": (
-            "Per-kernel cycle counts use _count_cycles_from_root() which assumes "
-            "perfect pipelining with no memory stalls or pipeline bubbles. The real "
-            "hardware FSM may differ due to wave grouping, prologue/epilogue states, "
-            "and memory arbitration overhead."
-        ),
-    },
-    {
-        "id": "fsm_overhead_residual",
-        "scope": "tg2hdl",
-        "title": "FSM overhead (residual)",
-        "description": (
-            "Computed as the difference between observed simulation cycle count and "
-            "the sum of analytical per-kernel + copy cycles. Lumps together start/done "
-            "handshake, state-transition latency, and pipeline stalls into one bucket."
-        ),
-    },
-    {
-        "id": "copy_cycles_from_depth",
-        "scope": "tg2hdl",
-        "title": "Copy cycles = buffer depth",
-        "description": (
-            "Inter-kernel DMA copy cycles are set equal to the source buffer depth "
-            "(one element per clock). Real copies may have burst setup latency or "
-            "arbitration overhead not captured here."
-        ),
-    },
     {
         "id": "pcie_transfer_model",
         "scope": "tg2hdl",
@@ -604,17 +688,6 @@ _ESTIMATES_AND_ASSUMPTIONS = [
             "FPGA wall time is derived by dividing total cycles by the synthesised "
             "Fmax. Actual deployed clock may differ due to voltage/temperature "
             "derating or user-selected clock constraints."
-        ),
-    },
-    {
-        "id": "cpu_per_item_proportional",
-        "scope": "native",
-        "title": "CPU per-item timing (proportional)",
-        "description": (
-            "tinygrad\u2019s run_schedule() executes the full schedule atomically, "
-            "so per-schedule-item CPU time is unavailable. The flame graph distributes "
-            "measured compute wall time proportionally by buffer byte size \u2014 a rough "
-            "approximation that does not reflect actual per-kernel compute cost."
         ),
     },
 ]
@@ -650,33 +723,44 @@ def _render_html(report: dict, flamegraph_svg: str = "",
             f"<td>{ks.get('dp16kd','n/a')}</td><td>{ks.get('mult18','n/a')}</td></tr>\n"
         )
 
-    # KernelIR dumps
-    kernelir_sections = ""
-    for i, k in enumerate(report["kernels"]):
-        ir = html.escape(k.get("kernel_ir") or "(not available)")
-        kernelir_sections += f"<h3>Kernel {i}</h3>\n<pre>{ir}</pre>\n"
-
-    # Schematics
-    schematic_sections = ""
     top_svg = report["top_synth"].get("synth_svg") or ""
-    if top_svg:
-        schematic_sections += "<h3>TopModule</h3>\n" + top_svg + "\n"
-    for i, k in enumerate(report["kernels"]):
-        ksvg = k.get("synth_svg") or ""
-        if ksvg:
-            schematic_sections += f"<h3>Kernel {i}</h3>\n" + ksvg + "\n"
-    if not schematic_sections:
-        schematic_sections = "<p>No schematics available (Yosys/Graphviz not installed).</p>"
+    top_schematic = top_svg if top_svg else "<p>No top-module schematic available (Yosys/Graphviz not installed).</p>"
 
-    # UOp viz divs
-    uop_graph_divs = ""
-    uop_graph_js = ""
+    kernel_sections = ""
     for i, k in enumerate(report["kernels"]):
-        if k.get("tinygrad_graph"):
-            uop_graph_divs += f'<h3>Kernel {i}</h3>\n<div class="graph" id="uop-graph-{i}"></div>\n'
-            uop_graph_js += f'renderUOpGraph(document.getElementById("uop-graph-{i}"), REPORT.kernels[{i}].tinygrad_graph);\n'
-    if not uop_graph_divs:
-        uop_graph_divs = "<p>No UOp graphs available.</p>"
+        ks = k["synth_stats"]
+        meta = ", ".join(k.get("metadata") or []) or "unnamed"
+        ir = html.escape(k.get("kernel_ir") or "(not available)")
+        ksvg = k.get("synth_svg") or "<p>No schematic available.</p>"
+        uop_div = (
+            f'<div class="graph kernel-uop-graph" id="uop-graph-{i}" data-kernel-index="{i}"></div>'
+            if k.get("tinygrad_graph") else
+            "<p>No UOp graph available.</p>"
+        )
+        kernel_sections += f"""
+  <details class="kernel-detail">
+    <summary>Kernel {i}: {html.escape(meta)}</summary>
+    <h3>Kernel {i} Resources</h3>
+    <table>
+      <tr><th>Fmax (MHz)</th><th>LUTs</th><th>FFs</th><th>BRAM</th><th>DSPs</th></tr>
+      <tr>
+        <td>{'n/a' if ks.get('fmax_mhz') is None else f"{ks['fmax_mhz']:.1f}"}</td>
+        <td>{ks.get('comb','n/a')}</td>
+        <td>{ks.get('ff','n/a')}</td>
+        <td>{ks.get('dp16kd','n/a')}</td>
+        <td>{ks.get('mult18','n/a')}</td>
+      </tr>
+    </table>
+    <h3>UOp Graph</h3>
+    {uop_div}
+    <h3>KernelIR</h3>
+    <pre>{ir}</pre>
+    <h3>Schematic</h3>
+    <div class="synth">{ksvg}</div>
+  </details>
+"""
+    if not kernel_sections:
+        kernel_sections = "<p>No kernel details available.</p>"
 
     ref_out  = html.escape(str(s["reference_output"]))
     sim_out  = html.escape(str(s["sim_output"]))
@@ -711,6 +795,7 @@ def _render_html(report: dict, flamegraph_svg: str = "",
     h1 {{ font-size: 16px; border-bottom: 2px solid #111; padding-bottom: 4px; margin-bottom: 16px; }}
     h2 {{ font-size: 14px; margin-top: 28px; margin-bottom: 6px; border-bottom: 1px solid #bbb; padding-bottom: 2px; }}
     h3 {{ font-size: 13px; margin-top: 14px; margin-bottom: 4px; }}
+    h4 {{ font-size: 12px; margin-top: 10px; margin-bottom: 4px; }}
     table {{ border-collapse: collapse; margin: 6px 0 12px 0; }}
     th, td {{ border: 1px solid #bbb; padding: 3px 10px; text-align: left; white-space: nowrap; }}
     th {{ background: #f0f0f0; }}
@@ -726,6 +811,17 @@ def _render_html(report: dict, flamegraph_svg: str = "",
                      pointer-events: none; opacity: 0; white-space: pre-wrap; }}
     .graph-detail.visible {{ opacity: 1; }}
     .synth svg {{ width: 100%; height: auto; max-height: 600px; }}
+    .flamegraph-panel {{ margin: 8px 0 14px 0; }}
+    .flamegraph-controls {{ display: flex; align-items: center; gap: 8px; margin: 0 0 6px 0; }}
+    .flamegraph-btn {{ border: 1px solid #bbb; background: #fff; padding: 2px 8px; cursor: pointer; font-size: 11px; }}
+    .flamegraph-zoom {{ width: 180px; }}
+    .flamegraph-zoom-label {{ min-width: 42px; }}
+    .flamegraph-scroll {{ overflow-x: auto; overflow-y: hidden; border: 1px solid #bbb; background: #faf8f1; }}
+    .flamegraph-scroll svg {{ display: block; }}
+    details.kernel-detail {{ margin: 10px 0 14px 0; border: 1px solid #ccc; background: #fbfbfb; }}
+    details.kernel-detail > summary {{ cursor: pointer; padding: 8px 10px; font-weight: bold; background: #f3f3f3; }}
+    details.kernel-detail[open] > summary {{ border-bottom: 1px solid #ccc; }}
+    details.kernel-detail > :not(summary) {{ margin-left: 10px; margin-right: 10px; }}
     p {{ margin: 4px 0; }}
   </style>
 </head>
@@ -733,6 +829,7 @@ def _render_html(report: dict, flamegraph_svg: str = "",
   <h1>tg2hdl Report</h1>
 
   <h2>1. Summary</h2>
+  <h3>Run Summary</h3>
   <table>
     <tr><th>Field</th><th>Value</th></tr>
     <tr><td>Correctness</td><td style="{status_style}">{status_text}</td></tr>
@@ -742,7 +839,15 @@ def _render_html(report: dict, flamegraph_svg: str = "",
     <tr><td>Fmax</td><td>{_format_mhz(synth.get('fmax_mhz'))}</td></tr>
   </table>
 
-  <h2>2. Timing{fpga_time_note}</h2>
+  <h3>Output Comparison</h3>
+  <table>
+    <tr><th>CPU reference</th><th>FPGA simulation</th></tr>
+    <tr><td><pre style="margin:0;border:none;background:none">{ref_out}</pre></td>
+        <td><pre style="margin:0;border:none;background:none">{sim_out}</pre></td></tr>
+  </table>
+
+  <h2>2. Performance</h2>
+  <h3>Timing{fpga_time_note}</h3>
   <p style="margin-bottom:6px">{pcie_note} &nbsp;|&nbsp; input {t['pcie_in_bytes']} B, output {t['pcie_out_bytes']} B</p>
   <table>
     <tr><th>Phase</th><th>CPU</th><th>FPGA cycles</th><th>FPGA (est.)</th></tr>
@@ -761,7 +866,35 @@ def _render_html(report: dict, flamegraph_svg: str = "",
   </table>
   {timing_svg}
 
-  <h2>3. FPGA Resources (full system)</h2>
+  <h3>Flame Graph</h3>
+  <p style="margin-bottom:2px">Inclusive flame graph with total cost at the bottom and hierarchical breakdown above. Color key:
+  <span style="color:#1f7a43">■ load</span> &nbsp;
+  <span style="color:#d88412">■ compute</span> &nbsp;
+  <span style="color:#5a8fc4">■ copy/PCIe</span> &nbsp;
+  <span style="color:#a05cb0">■ readback</span> &nbsp;
+  <span style="color:#888">■ overhead</span>
+  </p>
+  <div class="flamegraph-panel" id="flamegraph-fpga-panel" data-kind="fpga" data-default-zoom="2.5">
+    <div class="flamegraph-controls">
+      <button type="button" class="flamegraph-btn" data-zoom-step="-0.25">-</button>
+      <input class="flamegraph-zoom" type="range" min="1" max="8" step="0.25" value="2.5" />
+      <button type="button" class="flamegraph-btn" data-zoom-step="0.25">+</button>
+      <span class="flamegraph-zoom-label">2.50x</span>
+    </div>
+    <div class="flamegraph-scroll"></div>
+  </div>
+  <div class="flamegraph-panel" id="flamegraph-cpu-panel" data-kind="cpu" data-default-zoom="1.25">
+    <div class="flamegraph-controls">
+      <button type="button" class="flamegraph-btn" data-zoom-step="-0.25">-</button>
+      <input class="flamegraph-zoom" type="range" min="1" max="8" step="0.25" value="1.25" />
+      <button type="button" class="flamegraph-btn" data-zoom-step="0.25">+</button>
+      <span class="flamegraph-zoom-label">1.25x</span>
+    </div>
+    <div class="flamegraph-scroll"></div>
+  </div>
+
+  <h2>3. Resources</h2>
+  <h3>Full System Resources</h3>
   <table>
     <tr><th>Fmax</th><th>LUTs</th><th>FFs</th><th>BRAM (DP16KD)</th><th>DSPs (MULT18)</th><th>On-chip bits</th><th>Synth wall</th></tr>
     <tr>
@@ -775,55 +908,35 @@ def _render_html(report: dict, flamegraph_svg: str = "",
     </tr>
   </table>
 
-  <h2>4. Per-Kernel Resources</h2>
+  <h3>Per-Kernel Resources</h3>
   <table>
     <tr><th>#</th><th>Name</th><th>Fmax (MHz)</th><th>LUTs</th><th>FFs</th><th>BRAM</th><th>DSPs</th></tr>
     {kernel_rows}
   </table>
 
-  <h2>5. Output Comparison</h2>
-  <table>
-    <tr><th>CPU reference</th><th>FPGA simulation</th></tr>
-    <tr><td><pre style="margin:0;border:none;background:none">{ref_out}</pre></td>
-        <td><pre style="margin:0;border:none;background:none">{sim_out}</pre></td></tr>
-  </table>
-
-  <h2>6. Kernel DAG</h2>
-  <div class="graph" id="pipeline-graph"></div>
-
-  <h2>7. Execution DAG</h2>
-  <div class="graph" id="execution-graph"></div>
-
-  <h2>8. KernelIR</h2>
-  {kernelir_sections}
-
-  <h2>9. Schematics</h2>
+  <h3>Top Module Schematic</h3>
   <div class="synth">
-  {schematic_sections}
+  {top_schematic}
   </div>
 
-  <h2>10. Flame Graph</h2>
-  <p style="margin-bottom:2px">Per-phase execution breakdown.  Color key:
-  <span style="color:#1f7a43">■ load</span> &nbsp;
-  <span style="color:#d88412">■ compute</span> &nbsp;
-  <span style="color:#5a8fc4">■ copy/PCIe</span> &nbsp;
-  <span style="color:#a05cb0">■ readback</span> &nbsp;
-  <span style="color:#888">■ overhead</span> &nbsp;
-  († = estimated value — see §11)
-  </p>
-  {flamegraph_svg}
+  <h2>4. Kernels</h2>
+  <h3>Execution Views</h3>
+  <h4>Kernel DAG</h4>
+  <div class="graph" id="pipeline-graph"></div>
+  <h4>Execution DAG</h4>
+  <div class="graph" id="execution-graph"></div>
+  <h3>Kernel Details</h3>
+  <p>Kernel details are collapsed by default.</p>
+  {kernel_sections}
 
-  <h2>11. Estimates &amp; Assumptions</h2>
-  <p>Values marked with † in the flame graph, and timing estimates throughout
-  this report, rely on models documented below.  Each corresponds to a
-  <code>FIXME</code> comment in the source code.</p>
+  <h2>5. Estimates</h2>
+  <p>Measured flame graph spans are shown directly above. Timing estimates that
+  still exist elsewhere in the report are documented below. Each corresponds to
+  a <code>FIXME</code> comment in the source code.</p>
   <table>
     <tr><th>Scope</th><th>Assumption</th><th>Description</th></tr>
     {estimates_rows}
   </table>
-
-  <h2>12. tinygrad UOp Graphs</h2>
-  {uop_graph_divs}
 
   <script>
     const REPORT = {report_json};
@@ -916,9 +1029,180 @@ def _render_html(report: dict, flamegraph_svg: str = "",
     function renderGraph(container, graphData)    {{ _buildGraph(container, graphData, 1, 130, 36); }}
     function renderUOpGraph(container, graphData) {{ _buildGraph(container, graphData, 1, 110, 32); }}
 
+    const FLAMEGRAPH_COLORS = {{
+      load: [0x53, 0x9b, 0x4b],
+      compute: [0xe2, 0x86, 0x2b],
+      copy: [0x63, 0x97, 0xc5],
+      readback: [0xb2, 0x61, 0xb9],
+      overhead: [0x8b, 0x8b, 0x8b],
+    }};
+
+    function flamegraphMixColor(rgb, factor) {{
+      const clamped = Math.max(-0.35, Math.min(0.35, factor));
+      const vals = rgb.map(c => clamped >= 0 ? Math.round(c + (255 - c) * clamped) : Math.round(c * (1 + clamped)));
+      return `#${{vals.map(v => v.toString(16).padStart(2, "0")).join("")}}`;
+    }}
+
+    function flamegraphFill(node) {{
+      const base = FLAMEGRAPH_COLORS[node.type] || [0x99, 0x99, 0x99];
+      const hash = Array.from(node.label || "").reduce((acc, ch) => acc + ch.charCodeAt(0), 0);
+      const jitter = ((hash % 13) - 6) / 30;
+      return flamegraphMixColor(base, jitter);
+    }}
+
+    function flamegraphDepth(node) {{
+      const kids = node.children || [];
+      return kids.length ? 1 + Math.max(...kids.map(flamegraphDepth)) : 1;
+    }}
+
+    function flamegraphTrim(text, widthPx) {{
+      const chars = Math.max(Math.floor((widthPx - 8) / 6.7), 0);
+      if (chars <= 0) return "";
+      if (text.length <= chars) return text;
+      if (chars <= 3) return "";
+      return text.slice(0, chars - 1) + "…";
+    }}
+
+    function flamegraphPickUnit(sec) {{
+      if (sec < 1e-6) return [1e9, "ns"];
+      if (sec < 1e-3) return [1e6, "µs"];
+      if (sec < 1) return [1e3, "ms"];
+      return [1, "s"];
+    }}
+
+    function flamegraphFormatValue(value, unit) {{
+      if (unit === "cycles") return `${{Math.round(value)}} cyc`;
+      const [mult, label] = flamegraphPickUnit(value);
+      return `${{(value * mult).toPrecision(4)}} ${{label}}`;
+    }}
+
+    function renderFlamegraphPanel(panel, rootNode, title, unit) {{
+      const BAR_H = 28, LEVEL_GAP = 3, TITLE_H = 18, LEFT = 8, RIGHT = 8, TEXT_PAD = 4;
+      const slider = panel.querySelector(".flamegraph-zoom");
+      const label = panel.querySelector(".flamegraph-zoom-label");
+      const scroll = panel.querySelector(".flamegraph-scroll");
+      const panelWidth = Math.max(scroll.clientWidth || 0, 1040);
+      const zoom = Math.max(1, Number(slider.value) || 1);
+      const svgWidth = panelWidth * zoom;
+      const maxDepth = flamegraphDepth(rootNode);
+      const svgHeight = TITLE_H + maxDepth * BAR_H + (maxDepth - 1) * LEVEL_GAP + 4;
+      const usableWidth = svgWidth - LEFT - RIGHT;
+
+      const svg = d3.create("svg")
+        .attr("xmlns", "http://www.w3.org/2000/svg")
+        .attr("width", svgWidth)
+        .attr("height", svgHeight)
+        .style("font-family", "monospace")
+        .style("font-size", "11px")
+        .style("display", "block")
+        .style("margin", 0);
+
+      svg.append("text")
+        .attr("x", LEFT)
+        .attr("y", 13)
+        .attr("font-weight", "bold")
+        .attr("fill", "#111")
+        .attr("font-size", 12)
+        .text(title);
+
+      function drawNode(node, x, width, depthFromRoot) {{
+        const y = TITLE_H + (maxDepth - depthFromRoot - 1) * (BAR_H + LEVEL_GAP);
+        const pct = rootNode.value > 0 ? (node.value / rootNode.value * 100) : 0;
+        let tip = `${{node.label}}: ${{flamegraphFormatValue(node.value, unit)}} (${{pct.toFixed(1)}}%)`;
+        if (node.estimated) tip += " [estimated]";
+        if (node.detail) tip += ` | ${{node.detail}}`;
+
+        svg.append("rect")
+          .attr("x", x)
+          .attr("y", y)
+          .attr("width", Math.max(width, 1))
+          .attr("height", BAR_H)
+          .attr("fill", flamegraphFill(node))
+          .attr("stroke", "#fff7eb")
+          .attr("stroke-width", 1)
+          .append("title")
+          .text(tip);
+
+        const text = flamegraphTrim(node.label, width);
+        if (text) {{
+          svg.append("text")
+            .attr("x", x + TEXT_PAD)
+            .attr("y", y + 18)
+            .attr("fill", "#24170b")
+            .attr("font-size", 10)
+            .text(text);
+        }}
+
+        const children = (node.children || []).filter(child => child.value > 0);
+        if (!children.length) return;
+        const total = children.reduce((acc, child) => acc + child.value, 0);
+        let cursor = x;
+        children.forEach((child, idx) => {{
+          let childWidth = total > 0 ? width * child.value / total : 0;
+          if (idx === children.length - 1) childWidth = x + width - cursor;
+          drawNode(child, cursor, childWidth, depthFromRoot + 1);
+          cursor += childWidth;
+        }});
+      }}
+
+      drawNode(rootNode, LEFT, usableWidth, 0);
+      scroll.replaceChildren(svg.node());
+      label.textContent = `${{zoom.toFixed(2)}}x`;
+    }}
+
+    function initFlamegraphPanel(panel, rootNode, title, unit) {{
+      const slider = panel.querySelector(".flamegraph-zoom");
+      const scroll = panel.querySelector(".flamegraph-scroll");
+      const render = () => renderFlamegraphPanel(panel, rootNode, title, unit);
+
+      panel.querySelectorAll("[data-zoom-step]").forEach(btn => {{
+        btn.addEventListener("click", () => {{
+          const step = Number(btn.getAttribute("data-zoom-step")) || 0;
+          const next = Math.min(Number(slider.max), Math.max(Number(slider.min), Number(slider.value) + step));
+          slider.value = next.toFixed(2);
+          render();
+          scroll.focus();
+        }});
+      }});
+
+      slider.addEventListener("input", render);
+      render();
+      window.addEventListener("resize", render);
+    }}
+
+    initFlamegraphPanel(
+      document.getElementById("flamegraph-fpga-panel"),
+      REPORT.flamegraph.fpga,
+      REPORT.flamegraph.unit === "time_s" && REPORT.top_synth.synth_stats.fmax_mhz
+        ? `FPGA execution @ ${{REPORT.top_synth.synth_stats.fmax_mhz.toFixed(1)}} MHz`
+        : "FPGA execution",
+      REPORT.flamegraph.unit
+    );
+    initFlamegraphPanel(
+      document.getElementById("flamegraph-cpu-panel"),
+      REPORT.flamegraph.cpu,
+      "CPU execution",
+      "time_s"
+    );
+
+    function renderKernelGraphIfNeeded(idx) {{
+      const el = document.getElementById(`uop-graph-${{idx}}`);
+      if (!el || el.dataset.rendered === "1") return;
+      renderUOpGraph(el, REPORT.kernels[idx].tinygrad_graph);
+      el.dataset.rendered = "1";
+    }}
+
+    document.querySelectorAll("details.kernel-detail").forEach(detail => {{
+      detail.addEventListener("toggle", () => {{
+        if (!detail.open) return;
+        detail.querySelectorAll(".kernel-uop-graph[data-kernel-index]").forEach(el => {{
+          renderKernelGraphIfNeeded(Number(el.dataset.kernelIndex));
+        }});
+      }});
+    }});
+
     renderGraph(document.getElementById("pipeline-graph"),   REPORT.graphs.pipeline);
     renderGraph(document.getElementById("execution-graph"),  REPORT.graphs.execution);
-    {uop_graph_js}
   </script>
 </body>
 </html>
@@ -945,9 +1229,7 @@ def benchmark(tensor, *extra_outputs, schedule_outputs=None, out_dir: str = "tg2
     # Tinygrad reference — warm up first, then time compute and readback separately
     run_schedule(list(schedule), do_update_stats=False)
 
-    t0 = time.perf_counter()
-    run_schedule(list(schedule), do_update_stats=False)
-    cpu_compute_wall = time.perf_counter() - t0
+    cpu_spans, cpu_compute_wall = _measure_cpu_schedule(schedule)
 
     t1 = time.perf_counter()
     ref_out = np.array(tensor.numpy(), copy=True).reshape(-1)
@@ -966,6 +1248,8 @@ def benchmark(tensor, *extra_outputs, schedule_outputs=None, out_dir: str = "tg2
     # PCIe transfer times
     input_bytes  = sum(arr.nbytes for arr in input_data.values())
     output_bytes = sim_out_raw.nbytes
+    # FIXME: These PCIe timings come from PCIeModel, not from a live FPGA DMA
+    # measurement or host-side hardware timestamping path.
     pcie_in_s    = pcie.xfer_s(input_bytes)
     pcie_out_s   = pcie.xfer_s(output_bytes)
 
@@ -989,10 +1273,14 @@ def benchmark(tensor, *extra_outputs, schedule_outputs=None, out_dir: str = "tg2
 
     fmax_mhz = report["top_synth"]["synth_stats"]["fmax_mhz"]
     total_cycles = cycle_counts["total"]
+    # FIXME: FPGA wall time is derived from simulated cycles and synthesized Fmax,
+    # not from direct timing on a programmed board.
     fpga_wall_s = (total_cycles / (fmax_mhz * 1e6)) if (fmax_mhz and fmax_mhz > 0) else None
     fpga_with_pcie_s = (fpga_wall_s + pcie_in_s + pcie_out_s) if fpga_wall_s is not None else None
 
     def _cycles_to_s(c):
+        # FIXME: Per-phase FPGA times are derived from simulated cycles and
+        # synthesized Fmax, not directly measured in hardware.
         return (c / (fmax_mhz * 1e6)) if (fmax_mhz and fmax_mhz > 0) else None
 
     report["timing"] = {
@@ -1024,13 +1312,14 @@ def benchmark(tensor, *extra_outputs, schedule_outputs=None, out_dir: str = "tg2
 
     # Flame graph
     fg = _flamegraph_payload(
-        schedule, pipeline_view, top, kernel_specs,
-        cycle_counts, tinygrad_wall, cpu_compute_wall, cpu_readback_wall,
+        schedule, pipeline_view, top,
+        cycle_counts, cpu_spans, cpu_readback_wall,
+        report["timing"], report["kernels"], fmax_mhz,
     )
-    fg_svg = _flamegraph_svg(fg, fmax_mhz)
+    report["flamegraph"] = fg
 
     html_path = out_path / "index.html"
-    html_path.write_text(_render_html(report, flamegraph_svg=fg_svg,
+    html_path.write_text(_render_html(report, flamegraph_svg="",
                                       estimates=_ESTIMATES_AND_ASSUMPTIONS))
     return BenchmarkArtifact(
         output_dir=str(out_path),
