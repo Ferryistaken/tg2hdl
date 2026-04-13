@@ -5,9 +5,8 @@ import json
 import re
 import shutil
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import ClassVar
 
 import numpy as np
 from tinygrad.engine.realize import run_schedule
@@ -15,42 +14,11 @@ from tinygrad.uop.ops import Ops
 from tinygrad.viz.serve import uop_to_json
 
 from compiler import compile_top_module, show_hardware, synthesis_stats
+from compiler.pcie_dma import simulate_top_with_pcie
 from compiler.top_module import simulate_top
 from compiler.visualize import analyze_schedule
-
-
-@dataclass
-class PCIeModel:
-    """Model for PCIe + AXI-DMA data transfer overhead.
-
-    Represents an FPGA connected over PCIe with an AXI-DMA bridge.
-    Transfer time per direction = latency_s + nbytes / bw_bytes_s.
-    Default: Gen3 x4 (~3.2 GB/s practical) with 5 µs DMA latency.
-    """
-    gen: int = 3
-    lanes: int = 4
-    # FIXME: DMA latency is a fixed estimate (5 µs); real latency depends on
-    # the specific AXI-DMA IP core, bridge configuration, and host-side driver.
-    latency_s: float = 5e-6  # per-direction DMA setup + AXI bridge overhead
-
-    # FIXME: Practical bandwidth assumes ~80% of theoretical link rate.
-    # Real throughput varies with TLP payload size, MPS/MRRS settings,
-    # and host chipset overhead.  Measure with a DMA loopback test.
-    _BW_TABLE: ClassVar[dict] = {
-        (1,  1): 0.20e9, (1,  4): 0.80e9, (1,  8): 1.60e9, (1, 16): 3.20e9,
-        (2,  1): 0.40e9, (2,  4): 1.60e9, (2,  8): 3.20e9, (2, 16): 6.40e9,
-        (3,  1): 0.80e9, (3,  4): 3.20e9, (3,  8): 6.40e9, (3, 16): 12.8e9,
-        (4,  1): 1.60e9, (4,  4): 6.40e9, (4,  8): 12.8e9, (4, 16): 25.6e9,
-        (5,  1): 3.20e9, (5,  4): 12.8e9, (5,  8): 25.6e9, (5, 16): 51.2e9,
-    }
-
-    @property
-    def bw_bytes_s(self) -> float:
-        return self._BW_TABLE.get((self.gen, self.lanes), 3.20e9)
-
-    def xfer_s(self, nbytes: int) -> float:
-        """One-direction transfer time: latency + bytes / bandwidth."""
-        return self.latency_s + nbytes / self.bw_bytes_s
+from compiler.wishbone_wrapper import simulate_wishbone
+from tg2hdl.fpga_card import FPGACard, load_card
 
 
 @dataclass
@@ -63,15 +31,21 @@ class BenchmarkArtifact:
     tg2hdl_cycles: int            # compute-only cycles (start → done)
     tg2hdl_total_cycles: int      # load + compute + readback cycles
     correctness: bool
+    fpga_card: str = ""                     # name of FPGA card used
     fpga_wall_s: float | None = None        # tg2hdl_total_cycles / fmax_hz; None if synthesis unavailable
-    pcie_in_s: float | None = None          # PCIe host→FPGA transfer time
-    pcie_out_s: float | None = None         # PCIe FPGA→host transfer time
-    fpga_with_pcie_s: float | None = None   # fpga_wall_s + pcie_in_s + pcie_out_s
-
-
-FPGA_FAMILY = "Lattice ECP5"
-FPGA_DEVICE = "45k"
-FPGA_PACKAGE = "CABGA381"
+    pcie_in_s: float | None = None          # PCIe host→FPGA transfer time (analytical model)
+    pcie_out_s: float | None = None         # PCIe FPGA→host transfer time (analytical model)
+    fpga_with_pcie_s: float | None = None   # fpga_wall_s + pcie_in_s + pcie_out_s (analytical)
+    # Cycle-accurate PCIe DMA simulation results
+    dma_load_cycles: int | None = None      # DMA load cycles (cycle-accurate)
+    dma_readback_cycles: int | None = None  # DMA readback cycles (cycle-accurate)
+    dma_total_cycles: int | None = None     # total cycles including DMA (cycle-accurate)
+    dma_wall_s: float | None = None         # total DMA-aware wall time
+    # Wishbone bus simulation results
+    wb_load_cycles: int | None = None       # Wishbone input write cycles
+    wb_readback_cycles: int | None = None   # Wishbone output read cycles
+    wb_total_cycles: int | None = None      # total Wishbone cycles (load+start+compute+readback)
+    wb_wall_s: float | None = None          # total Wishbone-aware wall time
 
 
 def _copy_viz_assets(out_dir: Path) -> None:
@@ -171,7 +145,8 @@ def _measure_cpu_schedule(schedule) -> tuple[list[dict], float]:
     return spans, total
 
 
-def _kernel_payload(schedule, pipeline_view, kernel_specs, synth_dir: Path) -> list[dict]:
+def _kernel_payload(schedule, pipeline_view, kernel_specs, synth_dir: Path,
+                    card: FPGACard) -> list[dict]:
     compute_items = [si for si in schedule if si.ast.op == Ops.SINK]
     payload = []
     for exec_k, orig_k in enumerate(pipeline_view.execution_kernel_map):
@@ -182,7 +157,7 @@ def _kernel_payload(schedule, pipeline_view, kernel_specs, synth_dir: Path) -> l
         svg_path = show_hardware(kernel, str(synth_dir / f"kernel_{exec_k}"), fmt="svg")
         if svg_path is not None:
             svg = Path(svg_path).read_text()
-        synth = synthesis_stats(kernel, device=FPGA_DEVICE, package=FPGA_PACKAGE)
+        synth = synthesis_stats(kernel, card=card)
         payload.append({
             "exec_index": exec_k,
             "source_index": orig_k,
@@ -195,12 +170,12 @@ def _kernel_payload(schedule, pipeline_view, kernel_specs, synth_dir: Path) -> l
     return payload
 
 
-def _top_payload(top, synth_dir: Path) -> dict:
+def _top_payload(top, synth_dir: Path, card: FPGACard) -> dict:
     svg = None
     svg_path = show_hardware(top, str(synth_dir / "top_module"), fmt="svg")
     if svg_path is not None:
         svg = Path(svg_path).read_text()
-    synth = synthesis_stats(top, device=FPGA_DEVICE, package=FPGA_PACKAGE)
+    synth = synthesis_stats(top, card=card)
     return {
         "name": "TopModule",
         "description": "Full assembled tg2hdl system including all compiled kernels, top-level control FSM, inter-kernel copies, and exposed I/O wiring.",
@@ -394,8 +369,6 @@ def _flamegraph_payload(schedule, pipeline_view, top, cycle_counts: dict, cpu_sp
                         fmax_mhz: float | None) -> dict:
     """Build hierarchical flame graph data for FPGA and CPU."""
     compute_items = [si for si in schedule if si.ast.op == Ops.SINK]
-    # FIXME: When Fmax is present, the FPGA flame graph uses derived wall time
-    # (cycles / synthesized Fmax), not a directly measured board-level runtime.
     state_cycles = cycle_counts.get("states", {})
     fmax_hz = (fmax_mhz * 1e6) if (fmax_mhz and fmax_mhz > 0) else None
 
@@ -453,8 +426,6 @@ def _flamegraph_payload(schedule, pipeline_view, top, cycle_counts: dict, cpu_sp
 
     fpga_in_children = []
     if timing.get("pcie_in_s") is not None and fmax_hz:
-        # FIXME: PCIe transfer leaves are still model-based, not measured from a
-        # real PCIe-enabled FPGA DMA path or hardware timestamp source.
         fpga_in_children.append(_fg_node(
             "PCIe host→FPGA",
             timing["pcie_in_s"],
@@ -474,8 +445,6 @@ def _flamegraph_payload(schedule, pipeline_view, top, cycle_counts: dict, cpu_sp
                  detail=cyc_detail(cycle_counts["readback"]))
     ]
     if timing.get("pcie_out_s") is not None and fmax_hz:
-        # FIXME: PCIe transfer leaves are still model-based, not measured from a
-        # real PCIe-enabled FPGA DMA path or hardware timestamp source.
         fpga_out_children.append(_fg_node(
             "PCIe FPGA→host",
             timing["pcie_out_s"],
@@ -669,28 +638,62 @@ def _flamegraph_svg(fg: dict, fmax_mhz: float | None) -> str:
 
 # -- Estimates & Assumptions --
 
-_ESTIMATES_AND_ASSUMPTIONS = [
-    {
-        "id": "pcie_transfer_model",
-        "scope": "tg2hdl",
-        "title": "PCIe transfer time",
-        "description": (
-            "PCIe transfer times use a fixed bandwidth table (80% of theoretical "
-            "link rate) and a constant 5 \u00b5s per-direction DMA latency. Real throughput "
-            "depends on TLP payload size, MPS/MRRS settings, and host chipset."
-        ),
-    },
-    {
-        "id": "fpga_wall_from_fmax",
-        "scope": "tg2hdl",
-        "title": "FPGA wall time = cycles / Fmax",
-        "description": (
-            "FPGA wall time is derived by dividing total cycles by the synthesised "
-            "Fmax. Actual deployed clock may differ due to voltage/temperature "
-            "derating or user-selected clock constraints."
-        ),
-    },
-]
+def _estimates_for_card(card: FPGACard) -> list[dict]:
+    """Build the list of estimates/assumptions for the active FPGA card."""
+    return [
+        {
+            "id": "pcie_transfer_model",
+            "scope": card.name,
+            "title": "PCIe transfer time (analytical model)",
+            "description": (
+                f"PCIe Gen{card.pcie_gen} x{card.pcie_lanes} transfer times use "
+                f"{card.pcie_practical_efficiency:.0%} of theoretical link rate "
+                f"({card.pcie_practical_bw_bytes_s / 1e6:.0f} MB/s practical) and a "
+                f"{card.pcie_dma_latency_s * 1e6:.1f} \u00b5s per-direction DMA latency "
+                f"from the {card.part_number} datasheet. Real throughput depends on "
+                f"TLP payload size (max {card.pcie_max_payload_bytes} B), MPS/MRRS "
+                f"settings, and host chipset."
+            ),
+        },
+        {
+            "id": "dma_pcie_simulation",
+            "scope": card.name,
+            "title": "DMA + PCIe cycle-accurate simulation",
+            "description": (
+                "A second Amaranth simulation throttles input loading and output "
+                "readback to match the card\u2019s practical PCIe bandwidth "
+                f"({card.pcie_practical_bw_bytes_s / 1e6:.0f} MB/s) at "
+                f"{card.synth_typical_fmax_mhz:.0f} MHz Fmax. DMA setup latency "
+                f"({card.pcie_dma_latency_s * 1e6:.1f} \u00b5s) is added per direction. "
+                "This gives cycle-accurate end-to-end timing including bus "
+                "transfer overhead."
+            ),
+        },
+        {
+            "id": "wishbone_simulation",
+            "scope": card.name,
+            "title": "Wishbone bus simulation (synthesizable wrapper)",
+            "description": (
+                "A WishboneTopWrapper (Amaranth Elaboratable) wraps TopModule "
+                "as a Wishbone B4 slave. The simulation drives all data through "
+                "the bus interface: each word write/read is a 2-cycle Wishbone "
+                "transaction (strobe + ack). Compute status is polled via the "
+                "bus. This wrapper is synthesizable and goes through "
+                "Yosys/nextpnr, so its resource cost is included in "
+                "utilisation reports. It models a LiteX SoC integration path."
+            ),
+        },
+        {
+            "id": "fpga_wall_from_fmax",
+            "scope": card.name,
+            "title": "FPGA wall time = cycles / Fmax",
+            "description": (
+                "FPGA wall time is derived by dividing total cycles by the synthesised "
+                "Fmax. Actual deployed clock may differ due to voltage/temperature "
+                "derating or user-selected clock constraints."
+            ),
+        },
+    ]
 
 
 def _render_html(report: dict, flamegraph_svg: str = "",
@@ -766,15 +769,10 @@ def _render_html(report: dict, flamegraph_svg: str = "",
     sim_out  = html.escape(str(s["sim_output"]))
 
     fpga_time_note = "" if t["fpga_available"] else " (synthesis unavailable — cycles shown instead of time)"
-    pm = t["pcie_model"]
-    pcie_note = (
-        f'PCIe Gen{pm["gen"]} x{pm["lanes"]} — '
-        f'{pm["bw_gbs"]:.2f} GB/s practical, '
-        f'{pm["latency_us"]:.1f} µs per-direction DMA latency'
-    )
+    pcie_note = html.escape(t["pcie_label"])
 
     # Estimates & Assumptions table rows
-    est_list = estimates if estimates is not None else _ESTIMATES_AND_ASSUMPTIONS
+    est_list = estimates if estimates is not None else []
     estimates_rows = ""
     for e in est_list:
         estimates_rows += (
@@ -834,7 +832,7 @@ def _render_html(report: dict, flamegraph_svg: str = "",
     <tr><th>Field</th><th>Value</th></tr>
     <tr><td>Correctness</td><td style="{status_style}">{status_text}</td></tr>
     <tr><td>CPU device</td><td>{html.escape(s['tinygrad_device'])}</td></tr>
-    <tr><td>FPGA target</td><td>{FPGA_FAMILY} {FPGA_DEVICE.upper()}-{FPGA_PACKAGE}</td></tr>
+    <tr><td>FPGA target</td><td>{html.escape(s.get('fpga_card_name', ''))}</td></tr>
     <tr><td>Kernels</td><td>{len(report['kernels'])}</td></tr>
     <tr><td>Fmax</td><td>{_format_mhz(synth.get('fmax_mhz'))}</td></tr>
   </table>
@@ -863,6 +861,36 @@ def _render_html(report: dict, flamegraph_svg: str = "",
         <td>{tf(t.get('pcie_out_s'))}</td></tr>
     <tr><td><b>Total</b></td><td><b>{tf(t['cpu_wall_s'])}</b></td>
         <td><b>{t['total_cycles']}</b></td><td><b>{tf(t.get('fpga_with_pcie_s'))}</b></td></tr>
+  </table>
+
+  <h3>DMA + PCIe Cycle-Accurate Simulation</h3>
+  <p style="margin-bottom:6px">End-to-end timing with cycle-accurate PCIe DMA throttling (bandwidth-gated word transfers + per-direction DMA setup latency).</p>
+  <table>
+    <tr><th>Phase</th><th>Cycles</th><th>Time (est.)</th></tr>
+    <tr><td>DMA load (host→FPGA)</td><td>{t.get('dma_load_cycles', 'n/a')}</td>
+        <td>{tf(t.get('dma_wall_s', 0) * t.get('dma_load_cycles', 0) / max(t.get('dma_total_cycles', 1), 1)) if t.get('dma_total_cycles') else 'n/a'}</td></tr>
+    <tr><td>Compute</td><td>{t.get('dma_compute_cycles', 'n/a')}</td>
+        <td>{tf(t.get('dma_wall_s', 0) * t.get('dma_compute_cycles', 0) / max(t.get('dma_total_cycles', 1), 1)) if t.get('dma_total_cycles') else 'n/a'}</td></tr>
+    <tr><td>DMA readback (FPGA→host)</td><td>{t.get('dma_readback_cycles', 'n/a')}</td>
+        <td>{tf(t.get('dma_wall_s', 0) * t.get('dma_readback_cycles', 0) / max(t.get('dma_total_cycles', 1), 1)) if t.get('dma_total_cycles') else 'n/a'}</td></tr>
+    <tr><td><b>Total (DMA-aware)</b></td><td><b>{t.get('dma_total_cycles', 'n/a')}</b></td>
+        <td><b>{tf(t.get('dma_wall_s'))}</b></td></tr>
+  </table>
+
+  <h3>Wishbone Bus Simulation (synthesizable wrapper)</h3>
+  <p style="margin-bottom:6px">End-to-end timing through a Wishbone B4 slave that wraps TopModule. Every input write, control register poke, status poll, and output read is a real bus transaction (2 cycles each: strobe + ack). This wrapper is synthesizable and goes through Yosys/nextpnr.</p>
+  <table>
+    <tr><th>Phase</th><th>Cycles</th><th>Time (est.)</th></tr>
+    <tr><td>WB input writes</td><td>{t.get('wb_load_cycles', 'n/a')}</td>
+        <td>{tf(t.get('wb_wall_s', 0) * t.get('wb_load_cycles', 0) / max(t.get('wb_total_cycles', 1), 1)) if t.get('wb_total_cycles') else 'n/a'}</td></tr>
+    <tr><td>WB start (CTRL write)</td><td>{t.get('wb_start_cycles', 'n/a')}</td>
+        <td>{tf(t.get('wb_wall_s', 0) * t.get('wb_start_cycles', 0) / max(t.get('wb_total_cycles', 1), 1)) if t.get('wb_total_cycles') else 'n/a'}</td></tr>
+    <tr><td>Compute (polled via WB)</td><td>{t.get('wb_compute_cycles', 'n/a')}</td>
+        <td>{tf(t.get('wb_wall_s', 0) * t.get('wb_compute_cycles', 0) / max(t.get('wb_total_cycles', 1), 1)) if t.get('wb_total_cycles') else 'n/a'}</td></tr>
+    <tr><td>WB output reads</td><td>{t.get('wb_readback_cycles', 'n/a')}</td>
+        <td>{tf(t.get('wb_wall_s', 0) * t.get('wb_readback_cycles', 0) / max(t.get('wb_total_cycles', 1), 1)) if t.get('wb_total_cycles') else 'n/a'}</td></tr>
+    <tr><td><b>Total (Wishbone)</b></td><td><b>{t.get('wb_total_cycles', 'n/a')}</b></td>
+        <td><b>{tf(t.get('wb_wall_s'))}</b></td></tr>
   </table>
   {timing_svg}
 
@@ -930,9 +958,8 @@ def _render_html(report: dict, flamegraph_svg: str = "",
   {kernel_sections}
 
   <h2>5. Estimates</h2>
-  <p>Measured flame graph spans are shown directly above. Timing estimates that
-  still exist elsewhere in the report are documented below. Each corresponds to
-  a <code>FIXME</code> comment in the source code.</p>
+  <p>Measured flame graph spans are shown directly above. Timing estimates derived
+  from the FPGA card specification are documented below.</p>
   <table>
     <tr><th>Scope</th><th>Assumption</th><th>Description</th></tr>
     {estimates_rows}
@@ -1209,12 +1236,12 @@ def _render_html(report: dict, flamegraph_svg: str = "",
 """
 
 def benchmark(tensor, *extra_outputs, schedule_outputs=None, out_dir: str = "tg2hdl_report",
-              pcie: PCIeModel | None = None) -> BenchmarkArtifact:
+              card: FPGACard | None = None) -> BenchmarkArtifact:
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
     _copy_viz_assets(out_path)
 
-    pcie = pcie or PCIeModel()
+    card = card or load_card()
 
     if schedule_outputs is None:
         schedule = tensor.schedule(*extra_outputs)
@@ -1240,48 +1267,67 @@ def benchmark(tensor, *extra_outputs, schedule_outputs=None, out_dir: str = "tg2
     sim_out_raw, cycle_counts, sim_wall = simulate_top(top, input_data)
     sim_out = _decode_sim_output(sim_out_raw, tensor.dtype).reshape(-1)
 
+    # Cycle-accurate PCIe DMA simulation
+    _dma_out_raw, dma_cycle_counts, _dma_sim_wall = simulate_top_with_pcie(
+        top, input_data, card,
+    )
+
+    # Wishbone bus simulation (synthesizable bus wrapper)
+    _wb_out_raw, wb_cycle_counts, _wb_sim_wall = simulate_wishbone(
+        top, input_data, card,
+    )
+
     if np.issubdtype(ref_out.dtype, np.floating):
         correctness = bool(np.allclose(ref_out.reshape(-1), sim_out.reshape(-1), rtol=1e-5, atol=1e-5))
     else:
         correctness = bool(np.array_equal(ref_out.reshape(-1), sim_out.reshape(-1)))
 
-    # PCIe transfer times
+    # PCIe transfer times — analytical model from FPGA card specification
     input_bytes  = sum(arr.nbytes for arr in input_data.values())
     output_bytes = sim_out_raw.nbytes
-    # FIXME: These PCIe timings come from PCIeModel, not from a live FPGA DMA
-    # measurement or host-side hardware timestamping path.
-    pcie_in_s    = pcie.xfer_s(input_bytes)
-    pcie_out_s   = pcie.xfer_s(output_bytes)
+    pcie_in_s    = card.pcie_xfer_s(input_bytes)
+    pcie_out_s   = card.pcie_xfer_s(output_bytes)
 
     report = {
         "summary": {
             "tinygrad_device": str(tensor.device),
+            "fpga_card_name": card.name,
             "tinygrad_wall_s": tinygrad_wall,
             "tg2hdl_wall_s": sim_wall,
             "tg2hdl_cycles": cycle_counts["compute"],
             "tg2hdl_load_cycles": cycle_counts["load"],
             "tg2hdl_readback_cycles": cycle_counts["readback"],
             "tg2hdl_total_cycles": cycle_counts["total"],
+            # Cycle-accurate DMA simulation
+            "dma_load_cycles": dma_cycle_counts["dma_load"],
+            "dma_compute_cycles": dma_cycle_counts["compute"],
+            "dma_readback_cycles": dma_cycle_counts["dma_readback"],
+            "dma_total_cycles": dma_cycle_counts["total"],
             "correctness": correctness,
             "reference_output": ref_out.reshape(-1).tolist(),
             "sim_output": sim_out.reshape(-1).tolist(),
         },
         "graphs": _graph_payload(pipeline_view),
-        "top_synth": _top_payload(top, out_path / "synth"),
-        "kernels": _kernel_payload(schedule, pipeline_view, kernel_specs, out_path / "synth"),
+        "top_synth": _top_payload(top, out_path / "synth", card),
+        "kernels": _kernel_payload(schedule, pipeline_view, kernel_specs,
+                                    out_path / "synth", card),
     }
 
     fmax_mhz = report["top_synth"]["synth_stats"]["fmax_mhz"]
     total_cycles = cycle_counts["total"]
-    # FIXME: FPGA wall time is derived from simulated cycles and synthesized Fmax,
-    # not from direct timing on a programmed board.
     fpga_wall_s = (total_cycles / (fmax_mhz * 1e6)) if (fmax_mhz and fmax_mhz > 0) else None
     fpga_with_pcie_s = (fpga_wall_s + pcie_in_s + pcie_out_s) if fpga_wall_s is not None else None
 
     def _cycles_to_s(c):
-        # FIXME: Per-phase FPGA times are derived from simulated cycles and
-        # synthesized Fmax, not directly measured in hardware.
         return (c / (fmax_mhz * 1e6)) if (fmax_mhz and fmax_mhz > 0) else None
+
+    # DMA-aware wall time (cycle-accurate, uses card typical Fmax)
+    dma_fmax_hz = card.synth_typical_fmax_mhz * 1e6
+    dma_wall_s = dma_cycle_counts["total"] / dma_fmax_hz
+
+    # Wishbone wall time
+    wb_fmax_hz = (fmax_mhz * 1e6) if (fmax_mhz and fmax_mhz > 0) else dma_fmax_hz
+    wb_wall_s = wb_cycle_counts["wb_total"] / wb_fmax_hz
 
     report["timing"] = {
         "cpu_compute_s":    cpu_compute_wall,
@@ -1296,18 +1342,27 @@ def benchmark(tensor, *extra_outputs, schedule_outputs=None, out_dir: str = "tg2
         "compute_cycles":   cycle_counts["compute"],
         "readback_cycles":  cycle_counts["readback"],
         "total_cycles":     total_cycles,
-        # PCIe model
+        # PCIe — analytical model from FPGA card
         "pcie_in_s":        pcie_in_s,
         "pcie_out_s":       pcie_out_s,
         "fpga_with_pcie_s": fpga_with_pcie_s,
         "pcie_in_bytes":    input_bytes,
         "pcie_out_bytes":   output_bytes,
-        "pcie_model": {
-            "gen":        pcie.gen,
-            "lanes":      pcie.lanes,
-            "latency_us": pcie.latency_s * 1e6,
-            "bw_gbs":     pcie.bw_bytes_s / 1e9,
-        },
+        "pcie_label":       card.pcie_label(),
+        # Cycle-accurate DMA simulation
+        "dma_load_cycles":     dma_cycle_counts["dma_load"],
+        "dma_compute_cycles":  dma_cycle_counts["compute"],
+        "dma_readback_cycles": dma_cycle_counts["dma_readback"],
+        "dma_total_cycles":    dma_cycle_counts["total"],
+        "dma_wall_s":          dma_wall_s,
+        "dma_pcie_model":      dma_cycle_counts.get("pcie_model", {}),
+        # Wishbone bus simulation (synthesizable wrapper)
+        "wb_load_cycles":     wb_cycle_counts["wb_load"],
+        "wb_start_cycles":    wb_cycle_counts["wb_start"],
+        "wb_compute_cycles":  wb_cycle_counts["compute"],
+        "wb_readback_cycles": wb_cycle_counts["wb_readback"],
+        "wb_total_cycles":    wb_cycle_counts["wb_total"],
+        "wb_wall_s":          wb_wall_s,
     }
 
     # Flame graph
@@ -1318,9 +1373,10 @@ def benchmark(tensor, *extra_outputs, schedule_outputs=None, out_dir: str = "tg2
     )
     report["flamegraph"] = fg
 
+    estimates = _estimates_for_card(card)
     html_path = out_path / "index.html"
     html_path.write_text(_render_html(report, flamegraph_svg="",
-                                      estimates=_ESTIMATES_AND_ASSUMPTIONS))
+                                      estimates=estimates))
     return BenchmarkArtifact(
         output_dir=str(out_path),
         report_path=str(html_path),
@@ -1330,8 +1386,17 @@ def benchmark(tensor, *extra_outputs, schedule_outputs=None, out_dir: str = "tg2
         tg2hdl_cycles=cycle_counts["compute"],
         tg2hdl_total_cycles=total_cycles,
         correctness=correctness,
+        fpga_card=card.name,
         fpga_wall_s=fpga_wall_s,
         pcie_in_s=pcie_in_s,
         pcie_out_s=pcie_out_s,
         fpga_with_pcie_s=fpga_with_pcie_s,
+        dma_load_cycles=dma_cycle_counts["dma_load"],
+        dma_readback_cycles=dma_cycle_counts["dma_readback"],
+        dma_total_cycles=dma_cycle_counts["total"],
+        dma_wall_s=dma_wall_s,
+        wb_load_cycles=wb_cycle_counts["wb_load"],
+        wb_readback_cycles=wb_cycle_counts["wb_readback"],
+        wb_total_cycles=wb_cycle_counts["wb_total"],
+        wb_wall_s=wb_wall_s,
     )

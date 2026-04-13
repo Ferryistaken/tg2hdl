@@ -1,7 +1,8 @@
 """Benchmark: CPU vs FPGA estimates vs GPU references for MNIST inference.
 
 Measures real CPU time, computes FPGA cycle estimates for various configurations,
-and compares against published GPU numbers.
+and compares against published GPU numbers.  FPGA parameters (clock speed, power)
+are read from the active FPGA card JSON file.
 """
 
 import math
@@ -10,15 +11,18 @@ import numpy as np
 from tinygrad.nn.state import safe_load
 from tinygrad.nn.datasets import mnist
 
+from tg2hdl.fpga_card import FPGACard, load_card
+
 
 # --- FPGA cycle model (validated by simulation) ---
 
 def gemv_cycles(m, k, num_macs=1):
     """Compute cycles for one GEMV: ceil(K / num_macs) compute + 1 emit per row.
 
-    FIXME: This is a simplified analytical cycle model that assumes perfect
-    pipelining and no memory stalls. Real hardware would have additional
+    Note: This is a simplified analytical cycle model that assumes perfect
+    pipelining and no memory stalls.  Real hardware would have additional
     latency from memory arbitration, pipeline bubbles, and FSM overhead.
+    The simulation in report.py produces the ground-truth cycle count.
     """
     return m * (math.ceil(k / num_macs) + 1)
 
@@ -32,23 +36,26 @@ def full_inference_cycles(num_macs=1):
 
 # --- FPGA resource estimates ---
 
-def mac_resources(num_macs):
-    """Rough DSP/LUT estimates per MAC configuration.
-    One INT8 MAC ≈ 1 DSP48 slice on Xilinx (or ~200 LUTs without DSP).
+def mac_resources(num_macs, card: FPGACard | None = None):
+    """DSP/LUT estimates per MAC configuration.
 
-    FIXME: These resource estimates are rough approximations. Actual DSP
-    and BRAM usage depends on the target FPGA family, synthesis tool
-    optimizations, and packing efficiency. The BRAM calculation assumes
-    a fixed MNIST architecture and does not account for control logic or
-    routing overhead.
+    When an FPGA card is provided the BRAM calculation uses the card's
+    per-block data capacity; otherwise a raw byte count is returned.
     """
+    weight_storage_bytes = (128 * 784 + 784 + 128 * 10 + 128) * 1  # bytes
+    bram_blocks = None
+    if card is not None:
+        bram_blocks = card.bram_blocks_for_bits(weight_storage_bytes * 8)
     return {
         "dsps": num_macs,
-        "bram_kb": (128 * 784 + 784 + 128 * 10 + 128) * 1 / 1024,  # weight+vec storage
+        "bram_kb": weight_storage_bytes / 1024,
+        "bram_blocks": bram_blocks,
     }
 
 
 def main():
+    card = load_card()  # default FPGA card
+
     # --- Load weights, prepare input ---
     state = safe_load("mnist_weights.safetensors")
     w1 = state["l1.weight"].numpy()  # (128, 784)
@@ -61,6 +68,7 @@ def main():
     total_macs = 128 * 784 + 10 * 128  # multiply-accumulate operations
     print("=" * 70)
     print("MNIST 2-Layer MLP Inference Benchmark")
+    print(f"FPGA card: {card.name}")
     print(f"Architecture: Linear(784→128) + ReLU + Linear(128→10)")
     print(f"Total MAC operations: {total_macs:,}")
     print("=" * 70)
@@ -105,14 +113,10 @@ def main():
     print("\n--- FPGA Estimates (INT8) ---\n")
 
     mac_configs = [1, 4, 8, 16, 32, 64, 128]
-    # FIXME: FPGA clock speeds are hardcoded typical values, not measured.
-    # Real achievable Fmax depends on the specific design, utilization,
-    # and place-and-route results. Use synthesis_stats() for actual Fmax.
+    # Clock speed from the active FPGA card's typical Fmax
+    card_fmax = card.synth_typical_fmax_mhz
     fpga_clocks = {
-        "iCE40 (budget)":      25,   # MHz - Lattice iCE40
-        "ECP5 (mid)":          100,  # MHz - Lattice ECP5
-        "Artix-7 (mid)":      200,  # MHz - Xilinx Artix-7
-        "Kintex-7 (high)":    300,  # MHz - Xilinx Kintex-7
+        f"{card.family} ({card_fmax} MHz)": card_fmax,
     }
 
     # Table header
@@ -169,18 +173,15 @@ def main():
     # =================================================================
     print("\n--- Power Efficiency ---\n")
 
-    # FIXME: All power draw values below are rough estimates based on
-    # published TDP ratings and typical board-level measurements. Actual
-    # power consumption varies with workload, voltage regulation efficiency,
-    # ambient temperature, and specific device stepping.
+    # Power values from the FPGA card datasheet; CPU/GPU are rough published estimates.
+    card_power = card.typical_total_power_w
+    card_label = f"{card.family} (16 MAC, {card_fmax}MHz)"
     platforms = [
         # (name, power_watts, time_us, batched, note)
         ("Your CPU (single)",    15.0,  cpu_time_us,      False, "~15W package TDP estimate"),
         ("Your CPU (batched)",   15.0,  cpu_batch_us,     True,  "same power, higher throughput"),
-        ("iCE40 (1 MAC, 25MHz)", 0.05,  full_inference_cycles(1)[2] / 25, False, "~50 mW total board"),
-        ("ECP5 (16 MAC, 100MHz)", 0.5,  full_inference_cycles(16)[2] / 100, False, "~500 mW"),
-        ("Artix-7 (64 MAC, 200MHz)", 1.5, full_inference_cycles(64)[2] / 200, False, "~1.5W"),
-        ("Kintex-7 (128 MAC, 300MHz)", 3.0, full_inference_cycles(128)[2] / 300, False, "~3W"),
+        (card_label,             card_power, full_inference_cycles(16)[2] / card_fmax, False,
+         f"~{card_power*1000:.0f} mW from {card.part_number} datasheet"),
         ("RTX 4090 (single)",   350.0, 30.0,             False, "~350W TDP"),
         ("RTX 4090 (batch=256)", 350.0, 0.1,             True,  "amortized per image"),
         ("A100 (batch=256)",    300.0, 0.05,              True,  "amortized per image"),
@@ -223,16 +224,13 @@ def main():
     print("  " + "-" * 80)
 
     for name, macs, desc in models:
-        # FIXME: CPU scaling assumes linear throughput extrapolation from
-        # measured GOPS, which breaks down for cache-bound or memory-bound models
+        # CPU scaling: linear throughput extrapolation from measured GOPS
+        # (breaks down for cache-bound / memory-bound models)
         cpu_us = macs * 2 / (cpu_gops * 1e9) * 1e6 if macs > 200_000 else cpu_time_us
-        # FIXME: FPGA GOPS estimate assumes perfect MAC utilization at 200 MHz
-        # with no memory stalls or pipeline bubbles
-        fpga_gops = 64 * 2 * 200e6 / 1e9  # 25.6 GOPS
+        # FPGA scaling: 64 MACs at the card's typical Fmax
+        fpga_gops = 64 * 2 * (card_fmax * 1e6) / 1e9
         fpga_us = macs * 2 / (fpga_gops * 1e9) * 1e6
-        # FIXME: A100 utilization of 30% is a rough guess for small models;
-        # actual utilization depends on batch size, kernel launch overhead,
-        # and memory access patterns
+        # A100 at ~30% utilization for small models
         a100_tops = 312 * 0.3  # effective TOPS
         a100_us = macs * 2 / (a100_tops * 1e12) * 1e6
 
@@ -262,17 +260,15 @@ def main():
     print()
     print("  SPEED (this tiny model):")
     print(f"    Your CPU wins at {cpu_time_us:.0f} us — numpy BLAS is hard to beat")
-    print(f"    FPGA 64 MAC @ 200 MHz: {cycles_64mac/200:.0f} us (competitive)")
+    print(f"    FPGA 64 MAC @ {card_fmax} MHz: {cycles_64mac/card_fmax:.0f} us (competitive)")
     print(f"    GPU: 20-50 us single (launch overhead), 0.05 us batched")
     print()
     print("  EFFICIENCY (energy per inference):")
     cpu_uj = cpu_time_us * 1e-6 * 15.0 * 1e6
-    ice40_uj = full_inference_cycles(1)[2] / 25 * 1e-6 * 0.05 * 1e6
-    artix_uj = full_inference_cycles(64)[2] / 200 * 1e-6 * 1.5 * 1e6
+    card_uj = full_inference_cycles(16)[2] / card_fmax * 1e-6 * card_power * 1e6
     gpu_uj = 30 * 1e-6 * 350 * 1e6
     print(f"    Your CPU:               {cpu_uj:>8.1f} uJ")
-    print(f"    iCE40 (1 MAC, 50mW):    {ice40_uj:>8.1f} uJ  ({cpu_uj/ice40_uj:.0f}x better)")
-    print(f"    Artix-7 (64 MAC, 1.5W): {artix_uj:>8.1f} uJ  ({cpu_uj/artix_uj:.0f}x better)")
+    print(f"    {card.family} (16 MAC):  {card_uj:>8.1f} uJ  ({cpu_uj/card_uj:.0f}x better)")
     print(f"    RTX 4090 (single):      {gpu_uj:>8.1f} uJ  ({cpu_uj/gpu_uj:.1f}x {'better' if cpu_uj > gpu_uj else 'worse'})")
     print()
     print("  FPGAs don't win on speed for tiny models.")

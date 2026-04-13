@@ -1,7 +1,12 @@
 """Utilities for inspecting tinygrad UOps and generated hardware."""
 
-from typing import List, Optional
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, List, Optional
 from textwrap import shorten
+
+if TYPE_CHECKING:
+    from tg2hdl.fpga_card import FPGACard
 
 
 def _elaboratable_ports(elab):
@@ -177,17 +182,34 @@ def show_hardware(kernel, out_dir: str, *,
 # synthesis_stats — Yosys + nextpnr resource/timing analysis
 # ---------------------------------------------------------------------------
 
-def synthesis_stats(kernel, device: str = "45k", package: str = "CABGA381"):
+def synthesis_stats(kernel, device: str = "45k", package: str = "CABGA381",
+                    card: FPGACard | None = None):
     """Run Yosys + nextpnr-ecp5 and return resource/timing data.
+
+    Parameters
+    ----------
+    kernel : CompiledKernel or TopModule
+        The Amaranth elaboratable to synthesise.
+    device : str
+        nextpnr device flag (e.g. ``"45k"``).  Ignored when *card* is provided.
+    package : str
+        nextpnr package flag (e.g. ``"CABGA381"``).  Ignored when *card* is
+        provided.
+    card : FPGACard or None
+        When supplied, *device*, *package*, Yosys target, and resource-type
+        names are all read from the card.  Callers that already have a card
+        should pass it here for full consistency.
 
     Returns a dict with:
       mem_bits    -- total on-chip storage in bits (from buf_infos)
       fp32_units  -- FP32 submodule count (from RTLIL)
       fmax_mhz    -- achieved Fmax in MHz (float), or None if unavailable
-      comb        -- TRELLIS_COMB cells used (LUT equivalent)
-      ff          -- TRELLIS_FF flip-flops used
-      dp16kd      -- DP16KD block RAM tiles used
-      mult18      -- MULT18X18D DSP multiplier tiles used
+      target_mhz  -- target clock frequency used for timing closure check
+      timing_met  -- True if fmax_mhz >= target_mhz, None if unknown
+      comb        -- LUT-equivalent cells used
+      ff          -- flip-flops used
+      dp16kd      -- block RAM tiles used
+      mult18      -- DSP multiplier tiles used
       from_synth  -- True when Yosys+nextpnr ran successfully
 
     Falls back gracefully when Yosys or nextpnr-ecp5 is not on PATH.
@@ -199,6 +221,25 @@ def synthesis_stats(kernel, device: str = "45k", package: str = "CABGA381"):
     import json
     import time
     from amaranth.back import rtlil
+
+    # Resolve parameters from card when available
+    if card is not None:
+        device = card.synth_device_flag
+        package = card.synth_package_flag
+        yosys_target = card.synth_yosys_target
+        nextpnr_bin = card.synth_nextpnr_binary
+        res_types = card.synth_resource_types
+        fpga_family = card.family
+    else:
+        yosys_target = "synth_ecp5"
+        nextpnr_bin = "nextpnr-ecp5"
+        res_types = {
+            "lut": "TRELLIS_COMB",
+            "ff": "TRELLIS_FF",
+            "bram": "DP16KD",
+            "dsp": "MULT18X18D",
+        }
+        fpga_family = "Lattice ECP5"
 
     if hasattr(kernel, "buf_infos"):
         mem_bits = sum(b["depth"] * b["elem_width"] for b in kernel.buf_infos)
@@ -212,13 +253,19 @@ def synthesis_stats(kernel, device: str = "45k", package: str = "CABGA381"):
         mem_bits = 0
     fp32_units = _rtlil_fp32_units(kernel)
 
+    # Target frequency for timing closure check.  When the card provides a
+    # typical Fmax we use that; otherwise fall back to 100 MHz.
+    target_mhz = (card.synth_typical_fmax_mhz if card is not None else 100.0)
+
     base = dict(
-        fpga_family="Lattice ECP5",
+        fpga_family=fpga_family,
         fpga_device=device,
         fpga_package=package,
         mem_bits=mem_bits,
         fp32_units=fp32_units,
         fmax_mhz=None,
+        target_mhz=target_mhz,
+        timing_met=None,
         comb=0,
         ff=0,
         dp16kd=0,
@@ -227,7 +274,7 @@ def synthesis_stats(kernel, device: str = "45k", package: str = "CABGA381"):
         synth_wall_s=None,
     )
 
-    if not shutil.which("yosys") or not shutil.which("nextpnr-ecp5"):
+    if not shutil.which("yosys") or not shutil.which(nextpnr_bin):
         return base
 
     il = rtlil.convert(kernel, ports=_elaboratable_ports(kernel))
@@ -242,14 +289,15 @@ def synthesis_stats(kernel, device: str = "45k", package: str = "CABGA381"):
             f.write(il)
 
         r = subprocess.run(
-            ["yosys", "-q", "-p", f"read_rtlil {il_path}; synth_ecp5 -json {json_path}"],
+            ["yosys", "-q", "-p",
+             f"read_rtlil {il_path}; {yosys_target} -json {json_path}"],
             capture_output=True, text=True, timeout=120,
         )
         if r.returncode != 0:
             return base
 
         r2 = subprocess.run(
-            ["nextpnr-ecp5", f"--{device}", "--package", package,
+            [nextpnr_bin, f"--{device}", "--package", package,
              "--json", json_path, "--report", report_path,
              "--timing-allow-fail", "--quiet"],
             capture_output=True, text=True, timeout=300,
@@ -269,18 +317,22 @@ def synthesis_stats(kernel, device: str = "45k", package: str = "CABGA381"):
         if achieved and (fmax_mhz is None or achieved < fmax_mhz):
             fmax_mhz = float(achieved)
 
+    timing_met = (fmax_mhz >= target_mhz) if fmax_mhz is not None else None
+
     util = rep.get("utilization", {})
     return dict(
-        fpga_family="Lattice ECP5",
+        fpga_family=fpga_family,
         fpga_device=device,
         fpga_package=package,
         mem_bits=mem_bits,
         fp32_units=fp32_units,
         fmax_mhz=fmax_mhz,
-        comb=util.get("TRELLIS_COMB",  {}).get("used", 0),
-        ff=util.get("TRELLIS_FF",     {}).get("used", 0),
-        dp16kd=util.get("DP16KD",     {}).get("used", 0),
-        mult18=util.get("MULT18X18D", {}).get("used", 0),
+        target_mhz=target_mhz,
+        timing_met=timing_met,
+        comb=util.get(res_types.get("lut", "TRELLIS_COMB"),  {}).get("used", 0),
+        ff=util.get(res_types.get("ff", "TRELLIS_FF"),     {}).get("used", 0),
+        dp16kd=util.get(res_types.get("bram", "DP16KD"),     {}).get("used", 0),
+        mult18=util.get(res_types.get("dsp", "MULT18X18D"), {}).get("used", 0),
         from_synth=True,
         synth_wall_s=time.perf_counter() - t0,
     )

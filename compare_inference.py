@@ -30,6 +30,7 @@ from compiler import HDLRenderer, compile_kernel, simulate_kernel
 from utils import quantize_int8
 from compiler.backend import _get_uops
 from compiler.utils import synthesis_stats
+from tg2hdl.fpga_card import FPGACard, load_card
 
 
 @contextmanager
@@ -40,11 +41,6 @@ def _noopt_scope(value=1):
         yield
     finally:
         tg_noopt.value = old
-
-
-# FIXME: RAMB36 constant is Xilinx-specific and may not apply to other FPGA
-# families (e.g., Lattice ECP5 uses DP16KD with 16 Kbit blocks).
-_RAMB36_BITS = 36 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -265,12 +261,14 @@ def _load_data(img_idx: int, batch_size: int):
 def main():
     args = _parse_args()
     Tensor.training = False
+    card = load_card()  # default FPGA card
 
     (w1, b1, w2, b2), (x_single, label, x_batch, labels_batch) = _load_data(args.img_idx, args.batch_size)
     x_float = x_single.reshape(784)
 
     print("=" * 60)
     print("MNIST Inference Comparison  (A=CPU · B=FP32-HDL · C=INT8-HDL)")
+    print(f"FPGA card: {card.name}")
     print("=" * 60)
     print(f"Test image index: {args.img_idx}, true label: {label}")
     print(f"Config: batch={args.batch_size}, cpu_runs={args.cpu_runs}, gpu_runs={args.gpu_runs}")
@@ -371,11 +369,13 @@ def main():
             kernels_fp32 = _compile_kernels(_build_fp32_schedule())
         print(f"  compiled {len(kernels_fp32)} kernels")
         if args.skip_synth:
-            stats_fp32 = [synthesis_stats(k) | {"from_synth": False} for k in kernels_fp32]
+            stats_fp32 = [synthesis_stats(k, card=card)
+                          | {"from_synth": False} for k in kernels_fp32]
             print("  synthesis stats skipped by option")
         else:
-            print("  synthesising for ECP5 45F...", end=" ", flush=True)
-            stats_fp32 = [synthesis_stats(k) for k in kernels_fp32]
+            print(f"  synthesising for {card.fpga_target_label()}...", end=" ", flush=True)
+            stats_fp32 = [synthesis_stats(k, card=card)
+                          for k in kernels_fp32]
             print("done" if stats_fp32[0]["from_synth"] else "tools not found, using RTLIL estimates")
 
         w1_fp32 = w1.T.astype(np.float32)
@@ -397,11 +397,13 @@ def main():
             kernels_i8 = _compile_kernels(_build_int8_schedule())
         print(f"  compiled {len(kernels_i8)} kernels")
         if args.skip_synth:
-            stats_i8 = [synthesis_stats(k) | {"from_synth": False} for k in kernels_i8]
+            stats_i8 = [synthesis_stats(k, card=card)
+                        | {"from_synth": False} for k in kernels_i8]
             print("  synthesis stats skipped by option")
         else:
-            print("  synthesising for ECP5 45F...", end=" ", flush=True)
-            stats_i8 = [synthesis_stats(k) for k in kernels_i8]
+            print(f"  synthesising for {card.fpga_target_label()}...", end=" ", flush=True)
+            stats_i8 = [synthesis_stats(k, card=card)
+                        for k in kernels_i8]
             print("done" if stats_i8[0]["from_synth"] else "tools not found, using RTLIL estimates")
 
         w1_q, w1_scale = quantize_int8(w1)
@@ -464,15 +466,18 @@ def main():
 
     if stats_fp32 or stats_i8:
         from_synth = (stats_fp32[0]["from_synth"] if stats_fp32 else stats_i8[0]["from_synth"])
-        src_label = "ECP5 45F — Yosys + nextpnr-ecp5" if from_synth else "RTLIL pre-synthesis estimates"
+        src_label = (f"{card.fpga_target_label()} — {card.synth_toolchain}"
+                     if from_synth else "RTLIL pre-synthesis estimates")
         fp32_total_mem = sum(s["mem_bits"] for s in stats_fp32)
         i8_total_mem = sum(s["mem_bits"] for s in stats_i8)
-        fp32_ramb36 = math.ceil(fp32_total_mem / _RAMB36_BITS) if fp32_total_mem else 0
-        i8_ramb36 = math.ceil(i8_total_mem / _RAMB36_BITS) if i8_total_mem else 0
+        bram_type = card.bram_type
+        bits_per_block = card.bram_data_bits_per_block
+        fp32_blocks = math.ceil(fp32_total_mem / bits_per_block) if fp32_total_mem else 0
+        i8_blocks = math.ceil(i8_total_mem / bits_per_block) if i8_total_mem else 0
         print()
         print(f"Hardware resources ({src_label}):")
-        print(f"  float32 total on-chip: {fp32_total_mem/8/1024:>6.1f} KB  → ~{fp32_ramb36} Xilinx RAMB36")
-        print(f"  int8    total on-chip: {i8_total_mem/8/1024:>6.1f} KB  → ~{i8_ramb36} Xilinx RAMB36")
+        print(f"  float32 total on-chip: {fp32_total_mem/8/1024:>6.1f} KB  → ~{fp32_blocks} {bram_type}")
+        print(f"  int8    total on-chip: {i8_total_mem/8/1024:>6.1f} KB  → ~{i8_blocks} {bram_type}")
 
 
 if __name__ == "__main__":
