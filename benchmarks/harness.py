@@ -182,10 +182,22 @@ def run_bench(name: str, build_fn, input_arrays: list, exact: bool = True,
     # ------------------------------------------------------------------
     connections, external_slots = _detect_connections(compute_items)
 
+    # Map external buffer slots to input arrays.  Multiple kernels may
+    # reference the *same* external buffer (e.g. softmax reads x in all 3
+    # kernels).  Group external slots by buffer identity so every slot that
+    # points to the same underlying buffer receives the same input array.
+    buf_id_to_input: dict[int, np.ndarray] = {}
+    input_idx = 0
     input_map: dict[tuple, np.ndarray] = {}
-    for i, slot in enumerate(external_slots):
-        if i < len(input_arrays):
-            input_map[slot] = input_arrays[i]
+    for k_idx, buf_pos in external_slots:
+        buf_obj = compute_items[k_idx].bufs[buf_pos]
+        bid = id(buf_obj)
+        if bid not in buf_id_to_input:
+            if input_idx < len(input_arrays):
+                buf_id_to_input[bid] = input_arrays[input_idx]
+                input_idx += 1
+        if bid in buf_id_to_input:
+            input_map[(k_idx, buf_pos)] = buf_id_to_input[bid]
 
     kernel_outputs: dict[int, np.ndarray] = {}
     total_cycles = 0

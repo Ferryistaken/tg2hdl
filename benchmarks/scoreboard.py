@@ -312,6 +312,47 @@ def _score_bf16_relu(case: ScoreboardCase) -> ScoreboardResult:
     return _probe_bench(case, lambda t: t[0].cast(dtypes.bfloat16).relu(), [a], exact=False)
 
 
+def _score_conv2d_3x3_int8(case: ScoreboardCase) -> ScoreboardResult:
+    rng = np.random.RandomState(42)
+    x = rng.randint(-3, 3, (1, 1, 8, 8)).astype(np.int8)
+    w = rng.randint(-2, 2, (1, 1, 3, 3)).astype(np.int8)
+    return _probe_bench(case, lambda t: (t[0].conv2d(t[1])).cast(dtypes.int32), [x, w])
+
+
+def _score_conv2d_3x3_fp32(case: ScoreboardCase) -> ScoreboardResult:
+    rng = np.random.RandomState(42)
+    x = rng.randn(1, 1, 6, 6).astype(np.float32) * 0.5
+    w = rng.randn(1, 1, 3, 3).astype(np.float32) * 0.5
+    return _probe_bench(case, lambda t: t[0].conv2d(t[1]), [x, w], exact=False)
+
+
+def _score_conv2d_relu_int8(case: ScoreboardCase) -> ScoreboardResult:
+    rng = np.random.RandomState(42)
+    x = rng.randint(-3, 3, (1, 1, 6, 6)).astype(np.int8)
+    w = rng.randint(-2, 2, (1, 1, 3, 3)).astype(np.int8)
+    return _probe_bench(case, lambda t: (t[0].conv2d(t[1])).cast(dtypes.int32).relu(), [x, w])
+
+
+def _score_maxpool_int32(case: ScoreboardCase) -> ScoreboardResult:
+    rng = np.random.RandomState(42)
+    x = rng.randint(-10, 10, (1, 1, 4, 4)).astype(np.int32)
+    return _probe_bench(case, lambda t: t[0].max_pool2d(kernel_size=(2, 2)), [x])
+
+
+def _score_mini_cnn_int8(case: ScoreboardCase) -> ScoreboardResult:
+    rng = np.random.RandomState(42)
+    x = rng.randint(-3, 3, (1, 1, 4, 4)).astype(np.int8)
+    conv_w = rng.randint(-2, 2, (1, 1, 3, 3)).astype(np.int8)
+    fc_w = rng.randint(-2, 2, (4, 2)).astype(np.int8)
+
+    def build(t):
+        h = (t[0].conv2d(t[1])).cast(dtypes.int32).relu()
+        h = h.cast(dtypes.int8).reshape(1, -1)
+        return (h @ t[2]).cast(dtypes.int32)
+
+    return _probe_bench(case, build, [x, conv_w, fc_w])
+
+
 def build_cases() -> list[ScoreboardCase]:
     return [
         ScoreboardCase("add_int32_scalar", 0, "kernel", "int32_add", "Scalar int32 add should stay green", lambda: _score_add_int32(_CASES["add_int32_scalar"])),
@@ -326,6 +367,11 @@ def build_cases() -> list[ScoreboardCase]:
         ScoreboardCase("top_non_adjacent_dependency", 3, "system", "topmodule_non_adjacent_edge", "TopModule should support producer->consumer edges that skip intermediate kernels", lambda: _score_top_non_adjacent_dependency(_CASES["top_non_adjacent_dependency"])),
         ScoreboardCase("top_fanout_dependency", 3, "system", "topmodule_fanout", "TopModule should support one producer feeding two later kernels", lambda: _score_top_fanout(_CASES["top_fanout_dependency"])),
         ScoreboardCase("top_float_chain", 3, "system", "topmodule_float_io", "TopModule should load float inputs as bit patterns, not truncated ints", lambda: _score_top_float_chain(_CASES["top_float_chain"])),
+        ScoreboardCase("conv2d_3x3_int8", 2, "kernel", "conv2d_int8", "3x3 int8 Conv2d baseline", lambda: _score_conv2d_3x3_int8(_CASES["conv2d_3x3_int8"])),
+        ScoreboardCase("conv2d_3x3_fp32", 2, "kernel", "conv2d_fp32", "3x3 fp32 Conv2d baseline", lambda: _score_conv2d_3x3_fp32(_CASES["conv2d_3x3_fp32"])),
+        ScoreboardCase("conv2d_relu_int8", 2, "kernel", "conv2d_relu", "Conv2d + ReLU fusion", lambda: _score_conv2d_relu_int8(_CASES["conv2d_relu_int8"])),
+        ScoreboardCase("maxpool_2x2_int32", 2, "kernel", "maxpool", "Max pool 2x2 int32", lambda: _score_maxpool_int32(_CASES["maxpool_2x2_int32"])),
+        ScoreboardCase("mini_cnn_int8", 3, "model", "mini_cnn", "Conv2d + ReLU + FC mini CNN", lambda: _score_mini_cnn_int8(_CASES["mini_cnn_int8"])),
         ScoreboardCase("fp16_add", 4, "dtype", "fp16", "Float16 arithmetic path", lambda: _score_fp16_add(_CASES["fp16_add"])),
         ScoreboardCase("bf16_relu", 4, "dtype", "bf16", "BFloat16 relu path", lambda: _score_bf16_relu(_CASES["bf16_relu"])),
     ]
