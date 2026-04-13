@@ -42,7 +42,8 @@ def _noopt_scope(value=1):
         tg_noopt.value = old
 
 
-# Xilinx RAMB36 = 36 Kbits; one block covers up to 36,864 bits of storage.
+# FIXME: RAMB36 constant is Xilinx-specific and may not apply to other FPGA
+# families (e.g., Lattice ECP5 uses DP16KD with 16 Kbit blocks).
 _RAMB36_BITS = 36 * 1024
 
 
@@ -445,18 +446,22 @@ def main():
     all_fmax = [s["fmax_mhz"] for s in all_stats if s["fmax_mhz"] is not None]
     fmax_mhz = min(all_fmax) if all_fmax else None
 
+    # FIXME: All FPGA time estimates below assume a fixed 100 MHz clock.
+    # This is not measured from synthesis — real Fmax depends on the design
+    # complexity and target device. Use synthesis_stats() fmax_mhz for the
+    # actual achieved clock frequency.
     if cyc_fp32_total is not None:
         ms100 = cyc_fp32_total / 100e6 * 1e3
-        print(f"  FP32 FPGA single: {ms100:.3f} ms @100MHz ({cyc_fp32_total:,} cyc)")
+        print(f"  FP32 FPGA single: {ms100:.3f} ms @100MHz ({cyc_fp32_total:,} cyc)")  # FIXME: assumes 100 MHz clock
     if cyc_i8_total is not None:
         ms100 = cyc_i8_total / 100e6 * 1e3
-        print(f"  INT8 FPGA single: {ms100:.3f} ms @100MHz ({cyc_i8_total:,} cyc)")
+        print(f"  INT8 FPGA single: {ms100:.3f} ms @100MHz ({cyc_i8_total:,} cyc)")  # FIXME: assumes 100 MHz clock
     if cyc_fp32_stream_total is not None:
         ms100 = cyc_fp32_stream_total / 100e6 * 1e3
-        print(f"  FP32 FPGA stream: {ms100:.3f} ms @100MHz ({cyc_fp32_stream_total:,} cyc)")
+        print(f"  FP32 FPGA stream: {ms100:.3f} ms @100MHz ({cyc_fp32_stream_total:,} cyc)")  # FIXME: assumes 100 MHz clock
     if cyc_i8_stream_total is not None:
         ms100 = cyc_i8_stream_total / 100e6 * 1e3
-        print(f"  INT8 FPGA stream: {ms100:.3f} ms @100MHz ({cyc_i8_stream_total:,} cyc)")
+        print(f"  INT8 FPGA stream: {ms100:.3f} ms @100MHz ({cyc_i8_stream_total:,} cyc)")  # FIXME: assumes 100 MHz clock
 
     if fmax_mhz is not None:
         print(f"  Synthesized worst-case Fmax: {fmax_mhz:.1f} MHz")

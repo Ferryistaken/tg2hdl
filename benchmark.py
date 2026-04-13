@@ -14,7 +14,12 @@ from tinygrad.nn.datasets import mnist
 # --- FPGA cycle model (validated by simulation) ---
 
 def gemv_cycles(m, k, num_macs=1):
-    """Compute cycles for one GEMV: ceil(K / num_macs) compute + 1 emit per row."""
+    """Compute cycles for one GEMV: ceil(K / num_macs) compute + 1 emit per row.
+
+    FIXME: This is a simplified analytical cycle model that assumes perfect
+    pipelining and no memory stalls. Real hardware would have additional
+    latency from memory arbitration, pipeline bubbles, and FSM overhead.
+    """
     return m * (math.ceil(k / num_macs) + 1)
 
 
@@ -30,7 +35,14 @@ def full_inference_cycles(num_macs=1):
 def mac_resources(num_macs):
     """Rough DSP/LUT estimates per MAC configuration.
     One INT8 MAC ≈ 1 DSP48 slice on Xilinx (or ~200 LUTs without DSP).
+
+    FIXME: These resource estimates are rough approximations. Actual DSP
+    and BRAM usage depends on the target FPGA family, synthesis tool
+    optimizations, and packing efficiency. The BRAM calculation assumes
+    a fixed MNIST architecture and does not account for control logic or
+    routing overhead.
     """
+    # FIXME: BRAM estimate is hardcoded for MNIST 784->128->10 architecture
     return {
         "dsps": num_macs,
         "bram_kb": (128 * 784 + 784 + 128 * 10 + 128) * 1 / 1024,  # weight+vec storage
@@ -94,7 +106,9 @@ def main():
     print("\n--- FPGA Estimates (INT8) ---\n")
 
     mac_configs = [1, 4, 8, 16, 32, 64, 128]
-    # Realistic FPGA clock speeds for different device tiers
+    # FIXME: FPGA clock speeds are hardcoded typical values, not measured.
+    # Real achievable Fmax depends on the specific design, utilization,
+    # and place-and-route results. Use synthesis_stats() for actual Fmax.
     fpga_clocks = {
         "iCE40 (budget)":      25,   # MHz - Lattice iCE40
         "ECP5 (mid)":          100,  # MHz - Lattice ECP5
@@ -133,6 +147,9 @@ def main():
     print("  kernel launch overhead (~5-10 us), not compute. GPUs shine on")
     print("  large batches. These are rough estimates for this tiny model.\n")
 
+    # FIXME: GPU latency numbers are rough published estimates, not measured
+    # on actual hardware. Real latency varies with driver version, CUDA
+    # toolkit, kernel launch overhead, and system configuration.
     gpus = [
         # (name, single_inference_us, note)
         ("GTX 1650 (Turing)",       "~20-50 us",     "launch overhead dominates"),
@@ -153,18 +170,21 @@ def main():
     # =================================================================
     print("\n--- Power Efficiency ---\n")
 
-    # Typical power draws (watts)
+    # FIXME: All power draw values below are rough estimates based on
+    # published TDP ratings and typical board-level measurements. Actual
+    # power consumption varies with workload, voltage regulation efficiency,
+    # ambient temperature, and specific device stepping.
     platforms = [
         # (name, power_watts, time_us, batched, note)
-        ("Your CPU (single)",    15.0,  cpu_time_us,      False, "~15W package TDP estimate"),
+        ("Your CPU (single)",    15.0,  cpu_time_us,      False, "~15W package TDP estimate"),  # FIXME: CPU TDP is assumed, not measured
         ("Your CPU (batched)",   15.0,  cpu_batch_us,     True,  "same power, higher throughput"),
-        ("iCE40 (1 MAC, 25MHz)", 0.05,  full_inference_cycles(1)[2] / 25, False, "~50 mW total board"),
-        ("ECP5 (16 MAC, 100MHz)", 0.5,  full_inference_cycles(16)[2] / 100, False, "~500 mW"),
-        ("Artix-7 (64 MAC, 200MHz)", 1.5, full_inference_cycles(64)[2] / 200, False, "~1.5W"),
-        ("Kintex-7 (128 MAC, 300MHz)", 3.0, full_inference_cycles(128)[2] / 300, False, "~3W"),
-        ("RTX 4090 (single)",   350.0, 30.0,             False, "~350W TDP"),
-        ("RTX 4090 (batch=256)", 350.0, 0.1,             True,  "amortized per image"),
-        ("A100 (batch=256)",    300.0, 0.05,              True,  "amortized per image"),
+        ("iCE40 (1 MAC, 25MHz)", 0.05,  full_inference_cycles(1)[2] / 25, False, "~50 mW total board"),  # FIXME: estimated power draw
+        ("ECP5 (16 MAC, 100MHz)", 0.5,  full_inference_cycles(16)[2] / 100, False, "~500 mW"),  # FIXME: estimated power draw
+        ("Artix-7 (64 MAC, 200MHz)", 1.5, full_inference_cycles(64)[2] / 200, False, "~1.5W"),  # FIXME: estimated power draw
+        ("Kintex-7 (128 MAC, 300MHz)", 3.0, full_inference_cycles(128)[2] / 300, False, "~3W"),  # FIXME: estimated power draw
+        ("RTX 4090 (single)",   350.0, 30.0,             False, "~350W TDP"),  # FIXME: GPU TDP estimate, latency is a guess
+        ("RTX 4090 (batch=256)", 350.0, 0.1,             True,  "amortized per image"),  # FIXME: GPU TDP estimate, latency is a guess
+        ("A100 (batch=256)",    300.0, 0.05,              True,  "amortized per image"),  # FIXME: GPU TDP estimate, latency is a guess
     ]
 
     total_ops = total_macs * 2  # mul + add = 2 ops per MAC
@@ -204,12 +224,16 @@ def main():
     print("  " + "-" * 80)
 
     for name, macs, desc in models:
-        # CPU: assume ~14 GOPS measured (scales linearly for compute-bound)
+        # FIXME: CPU scaling assumes linear throughput extrapolation from
+        # measured GOPS, which breaks down for cache-bound or memory-bound models
         cpu_us = macs * 2 / (cpu_gops * 1e9) * 1e6 if macs > 200_000 else cpu_time_us
-        # FPGA 64 MAC @ 200 MHz: 2 ops per cycle per MAC = 25.6 GOPS
+        # FIXME: FPGA GOPS estimate assumes perfect MAC utilization at 200 MHz
+        # with no memory stalls or pipeline bubbles
         fpga_gops = 64 * 2 * 200e6 / 1e9  # 25.6 GOPS
         fpga_us = macs * 2 / (fpga_gops * 1e9) * 1e6
-        # A100: ~312 INT8 TOPS peak, ~30% utilization on small models
+        # FIXME: A100 utilization of 30% is a rough guess for small models;
+        # actual utilization depends on batch size, kernel launch overhead,
+        # and memory access patterns
         a100_tops = 312 * 0.3  # effective TOPS
         a100_us = macs * 2 / (a100_tops * 1e12) * 1e6
 

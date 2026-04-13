@@ -13,6 +13,7 @@ from tinygrad.uop.ops import Ops
 from tinygrad.viz.serve import uop_to_json
 
 from compiler import compile_top_module, show_hardware, synthesis_stats
+from compiler.backend import HDLRenderer, _get_uops, uops_to_kernel_ir, _count_cycles_from_root
 from compiler.top_module import simulate_top
 from compiler.visualize import analyze_schedule
 
@@ -118,6 +119,195 @@ def _top_payload(top, synth_dir: Path) -> dict:
         "synth_svg": svg,
         "synth_stats": synth,
     }
+
+
+def _flamegraph_payload(schedule, pipeline_view, top, kernel_specs,
+                        tinygrad_wall: float, sim_cycles: int, sim_wall: float) -> dict:
+    """Build flame graph data for both native (tinygrad) and tg2hdl execution.
+
+    Returns a dict with 'native' and 'tg2hdl' keys, each containing a
+    hierarchical flame graph structure suitable for rendering.
+    """
+    compute_items = [si for si in schedule if si.ast.op == Ops.SINK]
+    renderer = HDLRenderer()
+
+    # --- tg2hdl flame graph: per-kernel cycle breakdown ---
+    kernel_cycles = []
+    for exec_k, orig_k in enumerate(pipeline_view.execution_kernel_map):
+        si = compute_items[orig_k]
+        uops = _get_uops(si.ast, renderer)
+        kernel_ir, _ = uops_to_kernel_ir(uops)
+        # FIXME: Cycle count is from an analytical model that assumes perfect
+        # pipelining with no memory stalls or pipeline bubbles. The real
+        # hardware FSM may differ slightly due to startup/shutdown overhead.
+        cycles = _count_cycles_from_root(kernel_ir.loop_tree)
+        meta = [str(m.name if hasattr(m, "name") else m) for m in si.metadata]
+        kernel_cycles.append({
+            "name": f"Kernel {exec_k}" + (f" ({', '.join(meta)})" if meta else ""),
+            "exec_index": exec_k,
+            "source_index": orig_k,
+            "cycles": cycles,
+            "type": "compute",
+        })
+
+    # Compute copy overhead from buffer depths
+    copy_entries = []
+    for src_k, groups in top._copy_groups.items():
+        for gi, group in enumerate(groups):
+            src_buf = group[0][1]
+            depth = top.buf_depths.get((src_k, src_buf), 0)
+            dsts = [f"K{dst_k}.buf{dst_buf}" for _, _, dst_k, dst_buf in group]
+            copy_entries.append({
+                "name": f"Copy K{src_k}.buf{src_buf} -> {', '.join(dsts)}",
+                "cycles": depth,
+                "after_kernel": src_k,
+                "type": "copy",
+            })
+
+    # Build tg2hdl hierarchical structure: root -> [kernel0, copy0, kernel1, ...]
+    tg2hdl_children = []
+    total_analytical_cycles = 0
+    for entry in kernel_cycles:
+        tg2hdl_children.append({
+            "name": entry["name"],
+            "value": entry["cycles"],
+            "type": "compute",
+        })
+        total_analytical_cycles += entry["cycles"]
+        # Add copy groups that follow this kernel
+        for ce in copy_entries:
+            if ce["after_kernel"] == entry["exec_index"]:
+                tg2hdl_children.append({
+                    "name": ce["name"],
+                    "value": ce["cycles"],
+                    "type": "copy",
+                })
+                total_analytical_cycles += ce["cycles"]
+
+    # Account for FSM overhead (difference between actual sim cycles and analytical)
+    fsm_overhead = max(0, sim_cycles - total_analytical_cycles)
+    if fsm_overhead > 0:
+        # FIXME: FSM overhead is computed as the residual between the observed
+        # simulation cycle count and the sum of analytical per-kernel + copy
+        # cycles. This lumps together start/done handshake, state transitions,
+        # and any pipeline stalls into a single bucket.
+        tg2hdl_children.append({
+            "name": "FSM overhead (start/done, state transitions)",
+            "value": fsm_overhead,
+            "type": "overhead",
+        })
+
+    tg2hdl_flame = {
+        "name": f"tg2hdl Total ({sim_cycles} cycles, {sim_wall:.3f}s wall)",
+        "value": sim_cycles,
+        "children": tg2hdl_children,
+    }
+
+    # --- Native (tinygrad) flame graph: per-schedule-item timing ---
+    # We time each schedule item individually for breakdown
+    native_children = []
+    for idx, si in enumerate(schedule):
+        if si.ast.op == Ops.SINK:
+            meta = [str(m.name if hasattr(m, "name") else m) for m in getattr(si, "metadata", ())]
+            label = f"Compute K{idx}" + (f" ({', '.join(meta)})" if meta else "")
+            item_type = "compute"
+        elif si.ast.op == Ops.COPY:
+            label = f"Copy {idx}"
+            item_type = "copy"
+        else:
+            label = f"Op {idx} ({si.ast.op.name})"
+            item_type = "other"
+        native_children.append({
+            "name": label,
+            "type": item_type,
+        })
+
+    # FIXME: Per-item timing for the native path is not available because
+    # tinygrad's run_schedule executes the entire schedule atomically.
+    # We distribute the total wall time proportionally based on estimated
+    # compute cost (buffer sizes) as a rough approximation.
+    total_elements = 0
+    child_weights = []
+    for idx, si in enumerate(schedule):
+        bufs = getattr(si, "bufs", [])
+        weight = sum(getattr(b, "nbytes", 0) for b in bufs if b is not None) or 1
+        child_weights.append(weight)
+        total_elements += weight
+
+    for i, child in enumerate(native_children):
+        fraction = child_weights[i] / total_elements if total_elements > 0 else 1.0 / len(native_children)
+        child["value_ms"] = round(tinygrad_wall * 1000 * fraction, 4)
+
+    native_flame = {
+        "name": f"tinygrad Total ({tinygrad_wall * 1000:.3f} ms)",
+        "value_ms": round(tinygrad_wall * 1000, 4),
+        "children": native_children,
+    }
+
+    return {
+        "native": native_flame,
+        "tg2hdl": tg2hdl_flame,
+    }
+
+
+# -- Estimates & Assumptions payload for report notes --
+
+_ESTIMATES_AND_ASSUMPTIONS = [
+    {
+        "id": "analytical_cycle_model",
+        "scope": "tg2hdl",
+        "title": "Analytical cycle model",
+        "description": (
+            "Per-kernel cycle counts in the flame graph are computed from a "
+            "simplified analytical model (outer x (inner + 2) + 1) that assumes "
+            "perfect pipelining and no memory stalls. Real hardware may differ "
+            "due to arbitration delays and pipeline bubbles."
+        ),
+    },
+    {
+        "id": "fsm_overhead_residual",
+        "scope": "tg2hdl",
+        "title": "FSM overhead is a residual estimate",
+        "description": (
+            "The 'FSM overhead' entry in the tg2hdl flame graph is the "
+            "difference between the actual simulated cycle count and the sum "
+            "of analytical kernel + copy cycles. It lumps together start/done "
+            "handshake, state transitions, and pipeline stalls."
+        ),
+    },
+    {
+        "id": "native_timing_proportional",
+        "scope": "native",
+        "title": "Native per-item timing is proportionally estimated",
+        "description": (
+            "tinygrad's run_schedule executes the entire schedule atomically, "
+            "so per-item timing is not directly available. The native flame "
+            "graph distributes total wall time proportionally based on buffer "
+            "sizes as a rough approximation."
+        ),
+    },
+    {
+        "id": "copy_cycles_from_depth",
+        "scope": "tg2hdl",
+        "title": "Copy cycle counts from buffer depth",
+        "description": (
+            "Inter-kernel copy cycle counts are derived from the source buffer "
+            "depth (one element per cycle). This assumes the copy FSM runs at "
+            "one element per clock cycle with no stalls."
+        ),
+    },
+    {
+        "id": "sim_wall_not_fpga_time",
+        "scope": "tg2hdl",
+        "title": "Simulation wall time is not FPGA execution time",
+        "description": (
+            "The tg2hdl 'wall time' is the Python wall-clock duration of the "
+            "Amaranth simulator, not a prediction of how long the design would "
+            "run on real FPGA hardware. For FPGA runtime, multiply cycle count "
+            "by the clock period (1/Fmax)."
+        ),
+    },
+]
 
 
 def _format_seconds(value: float | None) -> str:
@@ -421,8 +611,101 @@ def _render_html(report: dict) -> str:
       font-family: "IBM Plex Mono", monospace;
       font-size: 12px;
     }}
+    .flame-container {{
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 18px;
+    }}
+    .flame-chart {{
+      min-height: 340px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #ffffff;
+      overflow: hidden;
+      position: relative;
+    }}
+    .flame-chart .flame-title {{
+      padding: 10px 14px;
+      font-weight: 700;
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      border-bottom: 1px solid var(--line);
+      background: var(--panel2);
+    }}
+    .flame-bar {{
+      display: flex;
+      align-items: center;
+      padding: 0 8px;
+      font-size: 11px;
+      font-weight: 600;
+      color: #182126;
+      border-radius: 2px;
+      cursor: pointer;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      min-height: 26px;
+      margin: 2px 4px;
+      transition: filter 120ms ease;
+    }}
+    .flame-bar:hover {{
+      filter: brightness(0.92);
+    }}
+    .flame-bar.type-compute {{ background: #c8e6c9; }}
+    .flame-bar.type-copy {{ background: #bbdefb; }}
+    .flame-bar.type-overhead {{ background: #fff9c4; }}
+    .flame-bar.type-other {{ background: #e0e0e0; }}
+    .flame-bar.type-root {{ background: #f5f5f5; border: 1px solid var(--line); }}
+    .flame-tooltip {{
+      position: fixed;
+      padding: 8px 12px;
+      border-radius: 6px;
+      background: #101317;
+      color: #eef3f6;
+      font-size: 12px;
+      line-height: 1.4;
+      pointer-events: none;
+      z-index: 100;
+      max-width: 400px;
+      display: none;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.3);
+    }}
+    .estimate-card {{
+      padding: 14px 18px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fffde7;
+      margin-bottom: 10px;
+    }}
+    .estimate-card .est-title {{
+      font-weight: 700;
+      font-size: 14px;
+      margin-bottom: 4px;
+    }}
+    .estimate-card .est-scope {{
+      display: inline-block;
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      padding: 2px 6px;
+      border-radius: 3px;
+      background: #fff3e0;
+      color: var(--accent);
+      border: 1px solid #ffe0b2;
+      margin-bottom: 6px;
+    }}
+    .estimate-card .est-desc {{
+      font-size: 13px;
+      color: var(--ink);
+      line-height: 1.55;
+    }}
     @media (max-width: 980px) {{
       .summary-grid {{
+        grid-template-columns: 1fr;
+      }}
+      .flame-container {{
         grid-template-columns: 1fr;
       }}
     }}
@@ -471,6 +754,8 @@ def _render_html(report: dict) -> str:
         <button class="tab" data-target="tinygrad">Tinygrad Kernels</button>
         <button class="tab" data-target="kernelir">KernelIR</button>
         <button class="tab" data-target="synth">Amaranth Synth</button>
+        <button class="tab" data-target="flamegraph">Flame Graph</button>
+        <button class="tab" data-target="estimates">Estimates &amp; Assumptions</button>
         <button class="tab" data-target="methodology">Methodology</button>
       </div>
     </section>
@@ -537,6 +822,35 @@ def _render_html(report: dict) -> str:
     </section>
     <section class="panel" id="synth">
       <div class="kernel-list" id="synth-kernels"></div>
+    </section>
+    <section class="panel" id="flamegraph">
+      <div class="card">
+        <div class="section-head">
+          <h2>Execution Flame Graph</h2>
+          <div class="badge">Profiling</div>
+        </div>
+        <p class="muted">Flame graph breakdown of execution time for both native tinygrad and tg2hdl hardware simulation. Bar width is proportional to time/cycles spent. Hover for details. <strong>Note:</strong> bars marked with ⚠ use estimated values — see the Estimates &amp; Assumptions tab for details.</p>
+        <div class="flame-container">
+          <div class="flame-chart" id="flame-tg2hdl">
+            <div class="flame-title">tg2hdl (cycles)</div>
+            <div class="flame-bars"></div>
+          </div>
+          <div class="flame-chart" id="flame-native">
+            <div class="flame-title">Native tinygrad (wall time)</div>
+            <div class="flame-bars"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+    <section class="panel" id="estimates">
+      <div class="card">
+        <div class="section-head">
+          <h2>Estimates &amp; Assumptions</h2>
+          <div class="badge">Transparency</div>
+        </div>
+        <p class="muted">This report contains values that are estimated, modeled, or approximated rather than directly measured. Each entry below describes what is estimated and why. Corresponding <code>FIXME</code> comments exist in the source code.</p>
+        <div id="estimates-list"></div>
+      </div>
     </section>
     <section class="panel" id="methodology">
       <div class="card methodology">
@@ -771,11 +1085,83 @@ def _render_html(report: dict) -> str:
       }});
     }});
 
+    function renderFlameGraph(containerId, data, valueKey) {{
+      const container = document.querySelector(`#${{containerId}} .flame-bars`);
+      if (!container || !data) return;
+      const tooltip = document.getElementById('flame-tooltip');
+      const totalValue = data[valueKey] || 1;
+
+      function renderBar(node, depth, parentWidth) {{
+        const val = node[valueKey] || 0;
+        const pct = totalValue > 0 ? (val / totalValue * 100) : 0;
+        const widthPct = Math.max(pct, 2);
+
+        const bar = document.createElement('div');
+        bar.className = `flame-bar type-${{node.type || 'root'}}`;
+        bar.style.width = `calc(${{widthPct}}% - 8px)`;
+        bar.style.marginLeft = `${{depth * 12 + 4}}px`;
+
+        const label = node.children ? node.name : `${{node.name}}`;
+        const valueLabel = valueKey === 'value'
+          ? `${{val.toLocaleString()}} cycles (${{pct.toFixed(1)}}%)`
+          : `${{val.toFixed(3)}} ms (${{pct.toFixed(1)}}%)`;
+        bar.textContent = `${{label}} — ${{valueLabel}}`;
+
+        const isEstimated = (node.type === 'overhead') ||
+          (valueKey === 'value_ms' && !node.children) ||
+          (node.type === 'compute' && !node.children);
+        if (isEstimated) bar.textContent = '⚠ ' + bar.textContent;
+
+        bar.addEventListener('mouseenter', (e) => {{
+          tooltip.style.display = 'block';
+          tooltip.innerHTML = `<strong>${{node.name}}</strong><br>${{valueLabel}}`
+            + (isEstimated ? '<br><em style="color:#ffcc80">⚠ This value is estimated — see Estimates tab</em>' : '');
+        }});
+        bar.addEventListener('mousemove', (e) => {{
+          tooltip.style.left = (e.clientX + 12) + 'px';
+          tooltip.style.top = (e.clientY - 10) + 'px';
+        }});
+        bar.addEventListener('mouseleave', () => {{
+          tooltip.style.display = 'none';
+        }});
+
+        container.appendChild(bar);
+
+        if (node.children) {{
+          node.children.forEach(child => renderBar(child, depth + 1, widthPct));
+        }}
+      }}
+
+      renderBar(data, 0, 100);
+    }}
+
+    function populateFlameGraph() {{
+      if (!REPORT.flamegraph) return;
+      renderFlameGraph('flame-tg2hdl', REPORT.flamegraph.tg2hdl, 'value');
+      renderFlameGraph('flame-native', REPORT.flamegraph.native, 'value_ms');
+    }}
+
+    function populateEstimates() {{
+      if (!REPORT.estimates) return;
+      const root = document.getElementById('estimates-list');
+      REPORT.estimates.forEach(est => {{
+        const card = document.createElement('div');
+        card.className = 'estimate-card';
+        card.innerHTML = `<span class="est-scope">${{est.scope}}</span>`
+          + `<div class="est-title">${{est.title}}</div>`
+          + `<div class="est-desc">${{est.description}}</div>`;
+        root.appendChild(card);
+      }});
+    }}
+
     populateOverview();
     populateTinygrad();
     populateKernelIR();
     populateSynth();
+    populateFlameGraph();
+    populateEstimates();
   </script>
+  <div class="flame-tooltip" id="flame-tooltip"></div>
 </body>
 </html>
 """
@@ -822,6 +1208,14 @@ def benchmark(tensor, *extra_outputs, schedule_outputs=None, out_dir: str = "tg2
         "graphs": _graph_payload(pipeline_view),
         "top_synth": _top_payload(top, out_path / "synth"),
         "kernels": _kernel_payload(schedule, pipeline_view, kernel_specs, out_path / "synth"),
+        "flamegraph": _flamegraph_payload(
+            schedule, pipeline_view, top, kernel_specs,
+            tinygrad_wall, sim_cycles, sim_wall,
+        ),
+        "estimates": [
+            {"scope": e["scope"], "title": e["title"], "description": e["description"]}
+            for e in _ESTIMATES_AND_ASSUMPTIONS
+        ],
     }
 
     html_path = out_path / "index.html"

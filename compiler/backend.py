@@ -472,6 +472,11 @@ def _count_cycles_from_root(root):
       - Scalar kernel:          2  (IDLE → SCALAR → IDLE)
       - Single-level loop:      bound + 1
       - Two-level loop (GEMV):  outer × (inner + 2) + 1
+
+    FIXME: This is a simplified analytical model that assumes perfect
+    pipelining and no memory stalls. Real hardware may have additional
+    latency from memory arbitration, pipeline bubbles, and FSM overhead
+    not captured here (e.g., prologue/epilogue states, wave grouping).
     """
     levels = []
     level = root.body
